@@ -1,0 +1,550 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net - Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSuperAdmin() {
+      return isSignedIn() && (
+        (request.auth.token.email == 'spacecompanies119@gmail.com' && request.auth.token.email_verified == true) ||
+        (exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'SUPER_ADMIN')
+      );
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        isSuperAdmin() ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN' ||
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'SUPER_ADMIN'))
+      );
+    }
+
+    // 1. Users Collection
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isSignedIn() && request.auth.uid == userId && (
+        incoming().role == 'CUSTOMER' || isAdmin()
+      ) && incoming().id == userId;
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (request.auth.uid == userId &&
+         incoming().id == existing().id &&
+         incoming().role == existing().role &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'phone', 'avatar', 'updatedAt']))
+      );
+      allow delete: if isAdmin();
+    }
+
+    // 2. Admins Registry (Server-side authoritative only)
+    match /admins/{adminId} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    // 3. Seller Applications
+    match /sellerApplications/{applicationId} {
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid && incoming().status == 'pending';
+      allow update, delete: if isAdmin();
+    }
+
+    // 4. Stores Collection
+    match /stores/{storeId} {
+      allow get: if true;
+      allow list: if true;
+      allow create: if isSignedIn() && (
+        isAdmin() ||
+        (incoming().sellerId == request.auth.uid &&
+         incoming().status == 'pending' &&
+         incoming().isVerified == false &&
+         (!('commissionRate' in incoming()) || incoming().commissionRate >= 10))
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (resource.data.sellerId == request.auth.uid &&
+         incoming().sellerId == existing().sellerId &&
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'name', 'description', 'phone', 'whatsapp', 'email', 'city', 'district',
+           'address', 'openingHours', 'deliveryAvailable', 'deliveryFee', 'minOrder',
+           'logo', 'cover', 'updatedAt'
+         ]))
+      );
+      allow delete: if isAdmin();
+    }
+
+    // 5. Products Collection
+    match /products/{productId} {
+      allow get: if true;
+      allow list: if true;
+      allow create: if isSignedIn() && (
+        isAdmin() ||
+        (incoming().sellerId == request.auth.uid &&
+         incoming().price is number && incoming().price >= 0 &&
+         incoming().stock is number && incoming().stock >= 0)
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (resource.data.sellerId == request.auth.uid &&
+         incoming().sellerId == existing().sellerId &&
+         incoming().storeId == existing().storeId &&
+         incoming().price is number && incoming().price >= 0 &&
+         incoming().stock is number && incoming().stock >= 0 &&
+         (incoming().inventoryHistory == null || incoming().inventoryHistory is list) &&
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'title', 'description', 'price', 'oldPrice', 'discount', 'images', 'thumbnail',
+           'category', 'categories', 'stock', 'sizes', 'colors', 'addons', 'status',
+           'isOffer', 'features', 'specs', 'inventoryHistory', 'updatedAt'
+         ]))
+      );
+      allow delete: if isSignedIn() && (resource.data.sellerId == request.auth.uid || isAdmin());
+    }
+
+    // 6. Orders Collection
+    match /orders/{orderId} {
+      allow get: if isSignedIn() && (
+        resource.data.customerId == request.auth.uid ||
+        (resource.data.sellerIds != null && (request.auth.uid in resource.data.sellerIds)) ||
+        isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        resource.data.customerId == request.auth.uid ||
+        (resource.data.sellerIds != null && (request.auth.uid in resource.data.sellerIds)) ||
+        isAdmin()
+      );
+      // Direct client or guest creation is STRICTLY DENIED for ALL clients (guest, customer, seller).
+      // All orders MUST be created exclusively via trusted server backend.
+      allow create: if false;
+      allow update: if isSignedIn() && (
+          isAdmin() ||
+          // Customer can only add delivery notes or cancel their own pending order
+          (resource.data.customerId == request.auth.uid &&
+           incoming().customerId == existing().customerId &&
+           incoming().total == existing().total &&
+           incoming().subtotal == existing().subtotal &&
+           incoming().shipping == existing().shipping &&
+           incoming().paymentMethod == existing().paymentMethod &&
+           incoming().paymentStatus == existing().paymentStatus &&
+           incoming().sellerIds == existing().sellerIds &&
+           incoming().vendorStoreIds == existing().vendorStoreIds &&
+           incoming().vendorOrders == existing().vendorOrders &&
+           (incoming().diff(existing()).affectedKeys().hasOnly(['notes', 'updatedAt']) ||
+            (incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt']) &&
+             existing().status == 'pending' &&
+             incoming().status == 'cancelled'))) ||
+          // Seller can update order status, status history, and delivery tracking code for single-vendor orders, but CANNOT modify vendorOrders or financial fields
+          (resource.data.sellerIds != null && resource.data.sellerIds.size() == 1 && (request.auth.uid in resource.data.sellerIds) &&
+           incoming().customerId == existing().customerId &&
+           incoming().total == existing().total &&
+           incoming().subtotal == existing().subtotal &&
+           incoming().shipping == existing().shipping &&
+           incoming().paymentMethod == existing().paymentMethod &&
+           incoming().paymentStatus == existing().paymentStatus &&
+           incoming().sellerIds == existing().sellerIds &&
+           incoming().vendorStoreIds == existing().vendorStoreIds &&
+           incoming().vendorOrders == existing().vendorOrders &&
+           (incoming().statusHistory == null || incoming().statusHistory is list) &&
+           incoming().diff(existing()).affectedKeys().hasOnly([
+             'status', 'statusHistory', 'deliveryTrackingCode', 'updatedAt'
+           ]) &&
+           // Forward-only state transition
+           (
+             (existing().status == 'pending' && (incoming().status == 'confirmed' || incoming().status == 'cancelled')) ||
+             (existing().status == 'confirmed' && incoming().status == 'preparing') ||
+             (existing().status == 'preparing' && incoming().status == 'ready') ||
+             (existing().status == 'ready' && incoming().status == 'out_for_delivery') ||
+             (existing().status == 'out_for_delivery' && incoming().status == 'delivered') ||
+             (existing().status == incoming().status)
+           ))
+      );
+      // Financial record immutability: Orders cannot be deleted
+      allow delete: if false;
+    }
+
+    // 7. Manual Mobile Money Payment Verification Submissions
+    match /paymentSubmissions/{submissionId} {
+      allow get: if isSignedIn() && (resource.data.customerId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.customerId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() &&
+        incoming().customerId == request.auth.uid &&
+        incoming().status == 'PAYMENT_REFERENCE_SUBMITTED' &&
+        incoming().referenceNumber is string &&
+        incoming().referenceNumber.size() >= 4 &&
+        incoming().orderId is string &&
+        exists(/databases/$(database)/documents/orders/$(incoming().orderId)) &&
+        get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.customerId == request.auth.uid &&
+        incoming().amount == get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.total;
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // 7b. Payment References (Anti-Replay Unique Index)
+    match /paymentReferences/{normalizedRef} {
+      allow get: if isSignedIn();
+      allow list: if isAdmin();
+      allow create: if isSignedIn() &&
+        incoming().customerId == request.auth.uid &&
+        incoming().referenceNumber is string &&
+        incoming().referenceNumber.size() >= 4 &&
+        incoming().orderId is string &&
+        exists(/databases/$(database)/documents/orders/$(incoming().orderId)) &&
+        get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.customerId == request.auth.uid;
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // 8. Service Bookings Collection
+    match /bookings/{bookingId} {
+      allow get: if isSignedIn() && (
+        resource.data.customerId == request.auth.uid ||
+        resource.data.providerId == request.auth.uid ||
+        isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        resource.data.customerId == request.auth.uid ||
+        resource.data.providerId == request.auth.uid ||
+        isAdmin()
+      );
+      allow create: if isSignedIn() && incoming().customerId == request.auth.uid;
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (resource.data.customerId == request.auth.uid &&
+         incoming().customerId == existing().customerId &&
+         incoming().providerId == existing().providerId &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt'])) ||
+        (resource.data.providerId == request.auth.uid &&
+         incoming().providerId == existing().providerId &&
+         incoming().customerId == existing().customerId &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'time', 'date', 'notes', 'updatedAt']))
+      );
+      allow delete: if isAdmin();
+    }
+
+    // 9. Customer Product & Store Reviews
+    match /reviews/{reviewId} {
+      allow get: if true;
+      allow list: if true;
+      allow create: if isSignedIn() &&
+        (incoming().customerId == request.auth.uid || incoming().userId == request.auth.uid) &&
+        incoming().rating is number &&
+        incoming().rating >= 1 &&
+        incoming().rating <= 5 &&
+        incoming().comment is string &&
+        incoming().comment.size() <= 2000;
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        ((resource.data.customerId == request.auth.uid || resource.data.userId == request.auth.uid) &&
+         (incoming().customerId == existing().customerId || incoming().userId == existing().userId) &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['rating', 'comment', 'updatedAt'])) ||
+        // Seller reply to customer review: Must be the verified seller of this product/review
+        (resource.data.sellerId != null && resource.data.sellerId == request.auth.uid &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['sellerReply', 'updatedAt']))
+      );
+      allow delete: if isSignedIn() && (
+        resource.data.customerId == request.auth.uid ||
+        resource.data.userId == request.auth.uid ||
+        isAdmin()
+      );
+    }
+
+    // 10. Notifications Collection (Spoofing prevention: sensitive notifications restricted to server/admin)
+    match /notifications/{notificationId} {
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && (
+        isAdmin() ||
+        incoming().userId == request.auth.uid ||
+        (
+          incoming().type in ['booking', 'review', 'message', 'delivery'] &&
+          incoming().senderId == request.auth.uid &&
+          incoming().userId is string &&
+          incoming().userId != ''
+        )
+      );
+      allow update: if isSignedIn() && (
+        (resource.data.userId == request.auth.uid &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['read'])) ||
+        isAdmin()
+      );
+      allow delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // 11. Payout Requests Collection
+    match /payoutRequests/{payoutId} {
+      allow get: if isSignedIn() && (resource.data.sellerId == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.sellerId == request.auth.uid || isAdmin());
+      // Payout creation must be performed via server transaction API (/api/payouts/create) or admin
+      allow create: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // 12. Audit Logs Collection (Immutable: No updates or deletions permitted)
+    match /auditLogs/{logId} {
+      allow get: if isAdmin();
+      allow list: if isAdmin();
+      allow create: if isAdmin();
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // 13. Delivery Assignments Collection
+    match /deliveryAssignments/{assignmentId} {
+      allow get: if isSignedIn() && (
+        resource.data.sellerId == request.auth.uid ||
+        (resource.data.customerId != null && resource.data.customerId == request.auth.uid) ||
+        (resource.data.driverId != null && resource.data.driverId == request.auth.uid) ||
+        isAdmin()
+      );
+      allow list: if isSignedIn() && (
+        resource.data.sellerId == request.auth.uid ||
+        (resource.data.customerId != null && resource.data.customerId == request.auth.uid) ||
+        (resource.data.driverId != null && resource.data.driverId == request.auth.uid) ||
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        isAdmin() ||
+        (incoming().sellerId == request.auth.uid &&
+         incoming().orderId is string &&
+         exists(/databases/$(database)/documents/orders/$(incoming().orderId)) &&
+         (request.auth.uid in get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.sellerIds))
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (resource.data.sellerId == request.auth.uid &&
+         incoming().sellerId == existing().sellerId &&
+         incoming().orderId == existing().orderId &&
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'driverId', 'assignedDriver', 'driverPhone', 'vehicleInfo', 'deliveryType',
+           'status', 'timestamps', 'notes', 'updatedAt', 'proof'
+         ]) &&
+         (incoming().status in ['pending', 'assigned', 'preparing', 'ready', 'picked_up', 'out_for_delivery', 'delivered', 'failed', 'cancelled'])) ||
+        (resource.data.driverId != null && resource.data.driverId == request.auth.uid &&
+         incoming().driverId == existing().driverId &&
+         incoming().sellerId == existing().sellerId &&
+         incoming().orderId == existing().orderId &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'timestamps', 'notes', 'updatedAt', 'proof']) &&
+         (incoming().status in ['pending', 'assigned', 'preparing', 'ready', 'picked_up', 'out_for_delivery', 'delivered', 'failed', 'cancelled']))
+      );
+      allow delete: if isAdmin();
+    }
+
+    // 14. Saved Customer Addresses Collection
+    match /addresses/{addressId} {
+      allow get, list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow update: if isSignedIn() && (
+        (resource.data.userId == request.auth.uid && incoming().userId == request.auth.uid) ||
+        isAdmin()
+      );
+      allow delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // 15. Conversations Collection
+    match /conversations/{conversationId} {
+      allow get, list: if isSignedIn() && (
+        (resource.data.participantIds != null && (request.auth.uid in resource.data.participantIds)) ||
+        isAdmin()
+      );
+      allow create: if isSignedIn() && (
+        incoming().participantIds != null && (request.auth.uid in incoming().participantIds)
+      );
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (resource.data.participantIds != null && (request.auth.uid in resource.data.participantIds) &&
+         incoming().participantIds == existing().participantIds &&
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'lastMessage', 'lastMessageAt', 'lastSenderId', 'unreadCount', 'updatedAt'
+         ]))
+      );
+      allow delete: if isAdmin();
+    }
+
+    // 16. Chat Messages Collection (Strict privacy: Only participants can read messages)
+    match /messages/{messageId} {
+      allow get, list: if isSignedIn() && (
+        resource.data.senderId == request.auth.uid ||
+        (resource.data.conversationId != null &&
+         exists(/databases/$(database)/documents/conversations/$(resource.data.conversationId)) &&
+         (request.auth.uid in get(/databases/$(database)/documents/conversations/$(resource.data.conversationId)).data.participantIds)) ||
+        isAdmin()
+      );
+      allow create: if isSignedIn() &&
+        incoming().senderId == request.auth.uid &&
+        incoming().text is string &&
+        incoming().text.size() > 0 &&
+        incoming().text.size() <= 2000 &&
+        (!exists(/databases/$(database)/documents/conversations/$(incoming().conversationId)) ||
+         request.auth.uid in get(/databases/$(database)/documents/conversations/$(incoming().conversationId)).data.participantIds ||
+         isAdmin());
+      allow update, delete: if isAdmin();
+    }
+
+    // 17. Delivery Drivers Fleet (Restricted to driver, assigned seller, or admin)
+    match /drivers/{driverId} {
+      allow get, list: if isSignedIn() && (
+        isAdmin() ||
+        request.auth.uid == driverId ||
+        (resource.data.sellerId != null && resource.data.sellerId == request.auth.uid)
+      );
+      allow write: if isAdmin();
+    }
+
+    // 18. Fleet Vehicles (Restricted to associated seller, driver, or admin)
+    match /vehicles/{vehicleId} {
+      allow get, list: if isSignedIn() && (
+        isAdmin() ||
+        (resource.data.sellerId != null && resource.data.sellerId == request.auth.uid) ||
+        (resource.data.driverId != null && resource.data.driverId == request.auth.uid)
+      );
+      allow write: if isAdmin();
+    }
+
+    // 19. Platform Settings Collection (Super Admin controlled only)
+    match /platformSettings/{settingId} {
+      allow get: if true;
+      allow list: if true;
+      allow write: if isSuperAdmin();
+    }
+
+    // 20. Seller Subscription Plans (Public read, admin write)
+    match /sellerPlans/{planId} {
+      allow get, list: if true;
+      allow write: if isAdmin();
+    }
+
+    // 21. Seller Subscriptions (Activation strictly admin/server-controlled)
+    match /subscriptions/{subscriptionId} {
+      allow get, list: if isSignedIn() && (resource.data.sellerId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && incoming().sellerId == request.auth.uid && (
+        incoming().status in ['PENDING_PAYMENT', 'PENDING_REVIEW']
+      );
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.sellerId == request.auth.uid &&
+        incoming().sellerId == existing().sellerId &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Compatibility alias for sellerSubscriptions
+    match /sellerSubscriptions/{subscriptionId} {
+      allow get, list: if isSignedIn() && (resource.data.sellerId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && incoming().sellerId == request.auth.uid && (
+        incoming().status in ['PENDING_PAYMENT', 'PENDING_REVIEW']
+      );
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.sellerId == request.auth.uid &&
+        incoming().sellerId == existing().sellerId &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    // 22. Commission Policies (Super Admin controlled only)
+    match /commissionPolicies/{policyId} {
+      allow get, list: if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+
+    // 23. Featured Listings (Public read, admin write)
+    match /featuredListings/{listingId} {
+      allow get, list: if true;
+      allow write: if isAdmin();
+    }
+
+    // 24. Promotion Requests
+    match /promotionRequests/{requestId} {
+      allow get, list: if isSignedIn() && (resource.data.sellerId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && incoming().sellerId == request.auth.uid && (incoming().status in ['PENDING_REVIEW', 'PENDING_PAYMENT']);
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        resource.data.sellerId == request.auth.uid &&
+        incoming().sellerId == existing().sellerId &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    // 25. Ad Campaigns (Activation strictly admin-controlled)
+    match /campaigns/{campaignId} {
+      allow get, list: if true;
+      allow create: if isSignedIn() && (incoming().sellerId == request.auth.uid || incoming().advertiserId == request.auth.uid) && (incoming().status in ['DRAFT', 'PENDING_REVIEW']);
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        (resource.data.sellerId == request.auth.uid || resource.data.advertiserId == request.auth.uid) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Compatibility alias for adCampaigns
+    match /adCampaigns/{campaignId} {
+      allow get, list: if true;
+      allow create: if isSignedIn() && (incoming().sellerId == request.auth.uid || incoming().advertiserId == request.auth.uid) && (incoming().status in ['DRAFT', 'PENDING_REVIEW']);
+      allow update: if isAdmin() || (
+        isSignedIn() &&
+        (resource.data.sellerId == request.auth.uid || resource.data.advertiserId == request.auth.uid) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt'])
+      );
+      allow delete: if isAdmin();
+    }
+
+    // 26. Coupons Engine (Public/User read for validation, admin write)
+    match /coupons/{couponId} {
+      allow get, list: if true;
+      allow write: if isAdmin();
+    }
+
+    // 27. Refund Requests Collection
+    // Financial transactions must be created exclusively via trusted server gateway (/api/refunds/create) or platform Admin
+    match /refundRequests/{requestId} {
+      allow get, list: if isSignedIn() && (
+        resource.data.customerId == request.auth.uid ||
+        resource.data.sellerId == request.auth.uid ||
+        isAdmin()
+      );
+      // Direct client creation strictly DENIED; Admin or trusted backend (Admin SDK) only
+      allow create: if isAdmin();
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // 28. Analytics Events (Public tracking with validated bounds, admin view)
+    match /analyticsEvents/{eventId} {
+      allow get, list: if isAdmin();
+      allow create: if incoming().type in [
+        'PRODUCT_VIEW', 'STORE_VIEW', 'SERVICE_VIEW', 'RESTAURANT_VIEW',
+        'SEARCH_QUERY', 'AD_IMPRESSION', 'AD_CLICK', 'PROMOTION_VIEW', 'PROMOTION_CLICK', 'CATEGORY_VIEW'
+      ] &&
+      incoming().timestamp is string &&
+      incoming().targetId is string &&
+      (!('revenue' in incoming()) || incoming().revenue == null) &&
+      (!('amount' in incoming()) || incoming().amount == null) &&
+      (!('admin' in incoming()) || incoming().admin == null);
+      allow update, delete: if isAdmin();
+    }
+  }
+}

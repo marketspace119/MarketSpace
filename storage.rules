@@ -1,0 +1,58 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'spacecompanies119@gmail.com' ||
+        request.auth.token.admin == true
+      );
+    }
+
+    function isImage() {
+      return request.resource != null &&
+             (request.resource.contentType == 'image/jpeg' ||
+              request.resource.contentType == 'image/png' ||
+              request.resource.contentType == 'image/webp' ||
+              request.resource.contentType == 'image/gif') &&
+             request.resource.size < 5 * 1024 * 1024;
+    }
+
+    // Default deny
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+
+    // User avatars
+    match /users/{userId}/{fileName} {
+      allow read: if true;
+      allow write: if isSignedIn() && (request.auth.uid == userId || isAdmin()) && isImage();
+      allow delete: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+    }
+
+    // Seller isolated storage (products, store assets, banners: sellers/{sellerId}/...)
+    match /sellers/{sellerId}/{allPaths=**} {
+      allow read: if true;
+      allow write: if isSignedIn() && (request.auth.uid == sellerId || isAdmin()) && isImage();
+      allow delete: if isSignedIn() && (request.auth.uid == sellerId || isAdmin());
+    }
+
+    // Store assets (admin controlled direct upload fallback)
+    match /stores/{storeId}/{fileName} {
+      allow read: if true;
+      allow write: if isSignedIn() && isAdmin() && isImage();
+      allow delete: if isSignedIn() && isAdmin();
+    }
+
+    // Product images (admin controlled only)
+    match /products/{productId}/{fileName} {
+      allow read: if true;
+      allow write: if isSignedIn() && isAdmin() && isImage();
+      allow delete: if isSignedIn() && isAdmin();
+    }
+  }
+}

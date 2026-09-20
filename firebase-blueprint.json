@@ -1,0 +1,230 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile with role, status, and metadata",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID" },
+        "email": { "type": "string", "format": "email", "description": "User email address" },
+        "name": { "type": "string", "maxLength": 120, "description": "Full display name" },
+        "phone": { "type": "string", "maxLength": 30, "description": "Phone number" },
+        "role": { "type": "string", "enum": ["CUSTOMER", "SELLER", "RESTAURANT", "SERVICE_PROVIDER", "ADMIN", "SUPER_ADMIN"], "description": "RBAC user role" },
+        "status": { "type": "string", "enum": ["active", "suspended", "pending"], "description": "Account status" },
+        "avatar": { "type": "string", "maxLength": 500, "description": "Profile picture URL" },
+        "storeId": { "type": "string", "maxLength": 120, "description": "Owned store ID if seller" },
+        "isVerified": { "type": "boolean", "description": "Whether user identity is verified" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Account creation timestamp" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Account update timestamp" }
+      },
+      "required": ["uid", "email", "name", "role", "createdAt"]
+    },
+    "Admin": {
+      "title": "Admin",
+      "description": "Admin registry document used for server-authoritative role verification in security rules",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Admin Firebase Auth UID" },
+        "email": { "type": "string", "format": "email", "description": "Admin email" },
+        "role": { "type": "string", "enum": ["ADMIN", "SUPER_ADMIN"], "description": "Admin level" },
+        "grantedAt": { "type": "string", "format": "date-time", "description": "Grant timestamp" }
+      },
+      "required": ["uid", "email", "role"]
+    },
+    "SellerApplication": {
+      "title": "SellerApplication",
+      "description": "Vendor registration request submitted by a customer to open a store",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 120, "description": "Application ID" },
+        "userId": { "type": "string", "maxLength": 120, "description": "Applicant UID" },
+        "sellerType": { "type": "string", "enum": ["store", "restaurant", "service", "classified"], "description": "Requested seller type" },
+        "businessName": { "type": "string", "maxLength": 150, "description": "Commercial or shop name" },
+        "phone": { "type": "string", "maxLength": 30, "description": "Contact phone" },
+        "location": { "type": "string", "maxLength": 150, "description": "City or commercial district" },
+        "description": { "type": "string", "maxLength": 1000, "description": "Business description and products" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected", "suspended"], "description": "Application status" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Submission timestamp" },
+        "reviewedAt": { "type": "string", "format": "date-time", "description": "Review timestamp" },
+        "reviewedBy": { "type": "string", "maxLength": 120, "description": "Admin UID who reviewed" }
+      },
+      "required": ["id", "userId", "sellerType", "businessName", "phone", "status", "createdAt"]
+    },
+    "Store": {
+      "title": "Store",
+      "description": "Approved multi-vendor store, restaurant, or service provider establishment",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 120, "description": "Store ID" },
+        "slug": { "type": "string", "maxLength": 120, "description": "URL slug" },
+        "name": { "type": "string", "maxLength": 150, "description": "Store name" },
+        "sellerId": { "type": "string", "maxLength": 120, "description": "Owner seller user UID" },
+        "sellerType": { "type": "string", "enum": ["store", "restaurant", "service", "classified"], "description": "Store category type" },
+        "logo": { "type": "string", "maxLength": 500, "description": "Logo URL" },
+        "cover": { "type": "string", "maxLength": 500, "description": "Banner cover URL" },
+        "description": { "type": "object", "description": "Localized store description" },
+        "phone": { "type": "string", "maxLength": 30, "description": "Phone number" },
+        "whatsapp": { "type": "string", "maxLength": 30, "description": "WhatsApp number" },
+        "email": { "type": "string", "format": "email", "description": "Store email" },
+        "city": { "type": "string", "maxLength": 60, "description": "City" },
+        "district": { "type": "string", "maxLength": 60, "description": "District" },
+        "openingHours": { "type": "string", "maxLength": 120, "description": "Opening hours" },
+        "deliveryAvailable": { "type": "boolean", "description": "Whether delivery is offered" },
+        "deliveryFee": { "type": "number", "description": "Base delivery fee" },
+        "minOrder": { "type": "number", "description": "Minimum order amount" },
+        "isVerified": { "type": "boolean", "description": "Verified badge granted by platform" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected", "suspended"], "description": "Store operational status" },
+        "commissionRate": { "type": "number", "description": "Platform commission rate percentage (0-50%)" },
+        "rating": { "type": "number", "description": "Store average rating" },
+        "reviewsCount": { "type": "number", "description": "Count of reviews" },
+        "followersCount": { "type": "number", "description": "Count of followers" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" }
+      },
+      "required": ["id", "slug", "name", "sellerId", "sellerType", "status", "createdAt"]
+    },
+    "Product": {
+      "title": "Product",
+      "description": "Multi-vendor catalog item, food menu item, or service listing",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 120, "description": "Product ID" },
+        "slug": { "type": "string", "maxLength": 150, "description": "Product URL slug" },
+        "sellerId": { "type": "string", "maxLength": 120, "description": "Seller UID who owns product" },
+        "storeId": { "type": "string", "maxLength": 120, "description": "Store ID where product is listed" },
+        "title": { "type": "object", "description": "Localized product title" },
+        "description": { "type": "object", "description": "Localized product description" },
+        "price": { "type": "number", "description": "Authoritative unit price" },
+        "oldPrice": { "type": "number", "description": "Original price before discount" },
+        "currency": { "type": "string", "maxLength": 10, "description": "Currency code e.g. USD" },
+        "images": { "type": "array", "description": "Array of image URLs" },
+        "thumbnail": { "type": "string", "maxLength": 500, "description": "Thumbnail image URL" },
+        "type": { "type": "string", "maxLength": 40, "description": "Product category grouping" },
+        "category": { "type": "string", "maxLength": 80, "description": "Category identifier" },
+        "stock": { "type": "number", "description": "Available inventory units" },
+        "rating": { "type": "number", "description": "Average review score" },
+        "reviewsCount": { "type": "number", "description": "Total reviews count" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected", "hidden"], "description": "Moderation status" },
+        "isOffer": { "type": "boolean", "description": "Whether item is on discount" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Listing creation date" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Listing update date" }
+      },
+      "required": ["id", "sellerId", "storeId", "price", "stock", "createdAt"]
+    },
+    "Order": {
+      "title": "Order",
+      "description": "Authoritative customer order with multi-vendor sub-orders",
+      "type": "object",
+      "properties": {
+        "orderId": { "type": "string", "maxLength": 120, "description": "Order unique identifier" },
+        "customerId": { "type": "string", "maxLength": 120, "description": "Purchasing customer UID" },
+        "customerName": { "type": "string", "maxLength": 120, "description": "Customer name" },
+        "phone": { "type": "string", "maxLength": 30, "description": "Customer phone" },
+        "email": { "type": "string", "format": "email", "description": "Customer email" },
+        "city": { "type": "string", "maxLength": 60, "description": "Delivery city" },
+        "address": { "type": "string", "maxLength": 250, "description": "Delivery street address" },
+        "paymentMethod": { "type": "string", "maxLength": 40, "description": "Selected payment method" },
+        "subtotal": { "type": "number", "description": "Total items cost calculated server-side" },
+        "shipping": { "type": "number", "description": "Total delivery cost" },
+        "tax": { "type": "number", "description": "Tax" },
+        "total": { "type": "number", "description": "Grand total payable" },
+        "status": { "type": "string", "enum": ["pending", "processing", "shipped", "delivered", "completed", "cancelled"], "description": "Master order status" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Order creation date" }
+      },
+      "required": ["orderId", "customerName", "phone", "city", "address", "subtotal", "total", "status", "createdAt"]
+    },
+    "Booking": {
+      "title": "Booking",
+      "description": "Appointment booking between customer and service provider",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 120, "description": "Booking ID" },
+        "bookingCode": { "type": "string", "maxLength": 30, "description": "Human readable code" },
+        "serviceId": { "type": "string", "maxLength": 120, "description": "Service ID" },
+        "serviceTitle": { "type": "string", "maxLength": 150, "description": "Service title" },
+        "storeId": { "type": "string", "maxLength": 120, "description": "Store ID of provider" },
+        "sellerId": { "type": "string", "maxLength": 120, "description": "Provider UID" },
+        "customerId": { "type": "string", "maxLength": 120, "description": "Customer UID" },
+        "customerName": { "type": "string", "maxLength": 120, "description": "Customer name" },
+        "customerPhone": { "type": "string", "maxLength": 30, "description": "Customer phone" },
+        "date": { "type": "string", "maxLength": 30, "description": "Scheduled date" },
+        "time": { "type": "string", "maxLength": 30, "description": "Scheduled time" },
+        "location": { "type": "string", "maxLength": 200, "description": "Service location" },
+        "status": { "type": "string", "enum": ["requested", "accepted", "scheduled", "in_progress", "completed", "cancelled"], "description": "Booking status" },
+        "price": { "type": "number", "description": "Agreed price" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Booking date" }
+      },
+      "required": ["id", "serviceId", "sellerId", "customerId", "customerName", "customerPhone", "status", "createdAt"]
+    },
+    "Review": {
+      "title": "Review",
+      "description": "User review and rating for products, stores, restaurants, or services",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 120, "description": "Review ID" },
+        "targetType": { "type": "string", "enum": ["product", "store", "restaurant", "service"], "description": "Target entity type" },
+        "targetId": { "type": "string", "maxLength": 120, "description": "Target ID" },
+        "userId": { "type": "string", "maxLength": 120, "description": "Author UID" },
+        "userName": { "type": "string", "maxLength": 120, "description": "Author display name" },
+        "rating": { "type": "number", "description": "Rating 1 to 5" },
+        "comment": { "type": "string", "maxLength": 1000, "description": "Review text" },
+        "isVerifiedPurchase": { "type": "boolean", "description": "Verified buyer badge" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Review timestamp" }
+      },
+      "required": ["id", "targetType", "targetId", "userId", "rating", "comment", "createdAt"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "In-app notifications for users, vendors, and admins",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 120, "description": "Notification ID" },
+        "userId": { "type": "string", "maxLength": 120, "description": "Recipient UID" },
+        "type": { "type": "string", "enum": ["order", "booking", "review", "system", "approval"], "description": "Type of event" },
+        "title": { "type": "object", "description": "Localized title" },
+        "message": { "type": "object", "description": "Localized message" },
+        "read": { "type": "boolean", "description": "Read flag" },
+        "link": { "type": "string", "maxLength": 300, "description": "In-app target link" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Notification timestamp" }
+      },
+      "required": ["id", "userId", "type", "read", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile collection partitioned by Firebase Auth UID"
+    },
+    "/admins/{adminId}": {
+      "schema": "Admin",
+      "description": "Admin registry collection for role authorization gates"
+    },
+    "/sellerApplications/{applicationId}": {
+      "schema": "SellerApplication",
+      "description": "Seller applications submitted by users"
+    },
+    "/stores/{storeId}": {
+      "schema": "Store",
+      "description": "Multi-vendor store records"
+    },
+    "/products/{productId}": {
+      "schema": "Product",
+      "description": "Multi-vendor catalog products"
+    },
+    "/orders/{orderId}": {
+      "schema": "Order",
+      "description": "Customer orders with authoritative pricing"
+    },
+    "/bookings/{bookingId}": {
+      "schema": "Booking",
+      "description": "Service bookings"
+    },
+    "/reviews/{reviewId}": {
+      "schema": "Review",
+      "description": "Reviews for products, stores, restaurants, and services"
+    },
+    "/notifications/{notificationId}": {
+      "schema": "Notification",
+      "description": "User notifications"
+    }
+  }
+}
