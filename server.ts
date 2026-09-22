@@ -2,9 +2,19 @@ import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { processOrderGateway, processSubOrderUpdateGateway } from './server/orderGateway';
-import { processPayoutGateway } from './server/payoutGateway';
+import { processPayoutGateway, getSellerFinancialSummaryGateway } from './server/payoutGateway';
 import { processRefundGateway } from './server/refundGateway';
+import { processPaymentReferenceSubmissionGateway, processPaymentReviewGateway } from './server/paymentGateway';
+import { processUserRoleUpdateGateway } from './server/userGateway';
 import { createRateLimiter } from './server/rateLimiter';
+import { requireAuthenticatedCaller, requireVerifiedPlatformAdmin, verifyFirebaseBearerToken } from './server/firebaseAdmin';
+import {
+  handleBusinessAssistant,
+  handleSellerAssistant,
+  handleCustomerAssistant,
+  handleSmartSearch,
+  handleReportSummarization,
+} from './server/ai/aiService';
 
 async function startServer() {
   const app = express();
@@ -115,6 +125,298 @@ async function startServer() {
       return res.status(statusCode).json({
         success: false,
         error: safeErrorMessage,
+      });
+    }
+  });
+
+  // 6. Authoritative Seller Financial Summary Endpoint (Single Source of Truth for Balance)
+  app.get('/api/seller/financial-summary', financialRateLimiter, async (req, res) => {
+    try {
+      const sellerId = (req.query.sellerId as string) || '';
+      const authHeader = req.headers.authorization;
+      const summary = await getSellerFinancialSummaryGateway(sellerId, authHeader);
+      return res.status(200).json({
+        success: true,
+        summary,
+      });
+    } catch (err: any) {
+      console.error('[API /api/seller/financial-summary] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to retrieve financial summary',
+      });
+    }
+  });
+
+  function mapPaymentErrorToStatusCode(err: any): { statusCode: number; message: string } {
+    if (err.statusCode && typeof err.statusCode === 'number') {
+      return { statusCode: err.statusCode, message: err.message };
+    }
+    const msg = err.message || '';
+    if (msg.includes('Authentication') || msg.includes('token') && (msg.includes('missing') || msg.includes('Invalid') || msg.includes('expired'))) {
+      return { statusCode: 401, message: msg };
+    }
+    if (msg.includes('Forbidden') || msg.includes('غير مصرح') || msg.includes('privileges required') || msg.includes('لا يخصك') || msg.includes('email_verified')) {
+      return { statusCode: 403, message: msg };
+    }
+    if (msg.includes('غير موجود') || msg.includes('not found') || msg.includes('Not Found')) {
+      return { statusCode: 404, message: msg };
+    }
+    if (
+      msg.includes('تم تقديمه مسبقاً') ||
+      msg.includes('already') ||
+      msg.includes('مسبقاً') ||
+      msg.includes('duplicate') ||
+      msg.includes('قيد المعالجة حالياً') ||
+      msg.includes('conflict') ||
+      msg.includes('Replay') ||
+      msg.includes('terminal')
+    ) {
+      return { statusCode: 409, message: msg };
+    }
+    if (
+      msg.includes('Database') ||
+      msg.includes('temporarily unavailable') ||
+      msg.includes('Firestore unavailable') ||
+      msg.includes('Firestore transaction failed') ||
+      msg.includes('credentials') ||
+      msg.includes('PERMISSION_DENIED') ||
+      msg.includes('Fail-Closed')
+    ) {
+      return { statusCode: 503, message: 'Payment service temporarily unavailable. Please try again later.' };
+    }
+    return { statusCode: 400, message: msg || 'Failed to process payment request' };
+  }
+
+  // 7. Authoritative Mobile Payment Reference Submission (Anti-Replay Unique Check)
+  app.post('/api/payments/submit-reference', financialRateLimiter, async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processPaymentReferenceSubmissionGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/payments/submit-reference] Error:', err.message);
+      const { statusCode, message } = mapPaymentErrorToStatusCode(err);
+      return res.status(statusCode).json({
+        success: false,
+        error: message,
+      });
+    }
+  });
+
+  // 8. Authoritative Mobile Payment Review & Order Payment Status Confirmation (Atomic)
+  app.post('/api/payments/review', financialRateLimiter, async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processPaymentReviewGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/payments/review] Error:', err.message);
+      const { statusCode, message } = mapPaymentErrorToStatusCode(err);
+      return res.status(statusCode).json({
+        success: false,
+        error: message,
+      });
+    }
+  });
+
+  // 9. Authoritative User Role & Privilege Management (Super Admin only)
+  app.post('/api/users/update-role', financialRateLimiter, async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processUserRoleUpdateGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/users/update-role] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to update user role',
+      });
+    }
+  });
+
+  // AI-Specific Rate Limiters
+  const aiRateLimiter = createRateLimiter({
+    windowMs: 60 * 1000,
+    max: 20,
+    message: 'AI assistant rate limit exceeded. Please wait a minute before sending more queries.',
+  });
+
+  const aiSearchRateLimiter = createRateLimiter({
+    windowMs: 60 * 1000,
+    max: 40,
+    message: 'Search query rate limit exceeded. Please slow down and try again later.',
+  });
+
+  // 10. AI Assistant Endpoint (Role-Bounded, Tenant-Isolated, Read-Only)
+  app.post('/api/ai/assistant', aiRateLimiter, async (req, res) => {
+    try {
+      const { mode, prompt, storeId, orderId, actionType } = req.body || {};
+      const authHeader = req.headers.authorization;
+
+      if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
+        return res.status(400).json({ success: false, error: 'Prompt is required' });
+      }
+
+      if (prompt.length > 2000) {
+        return res.status(400).json({
+          success: false,
+          error: 'Prompt exceeds maximum allowed length of 2000 characters',
+        });
+      }
+
+      // Check for prompt demanding direct autonomous financial execution
+      const financialActionRegex = /\b(issue refund|execute refund|create refund|send payout|process payout|confirm payment|approve payment|increase balance|change role|elevate role|delete account)\b/i;
+      if (financialActionRegex.test(prompt)) {
+        return res.status(200).json({
+          success: true,
+          response: 'Autonomous AI financial mutations and role elevation are disabled by platform security policy. Financial operations must be performed manually through verified administrative workflows.',
+          scope: 'DENIED_FINANCIAL_ACTION',
+        });
+      }
+
+      const caller = await requireAuthenticatedCaller(authHeader);
+
+      if (mode === 'business') {
+        const result = await handleBusinessAssistant({ caller, prompt });
+        return res.status(200).json({ success: true, ...result });
+      } else if (mode === 'seller') {
+        const result = await handleSellerAssistant({
+          caller,
+          prompt,
+          storeId,
+          actionType: actionType || 'summary',
+        });
+        return res.status(200).json({ success: true, ...result });
+      } else if (mode === 'customer') {
+        const result = await handleCustomerAssistant({ caller, prompt, orderId });
+        return res.status(200).json({ success: true, ...result });
+      } else {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid assistant mode. Must be "business", "seller", or "customer".',
+        });
+      }
+    } catch (err: any) {
+      console.error('[API /api/ai/assistant] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden') || err.message?.includes('not authorized') || err.message?.includes('not have permission');
+      const isAuth = err.message?.includes('Authentication');
+      const isNotFound = err.message?.includes('not found');
+      const statusCode = isForbidden ? 403 : isAuth ? 401 : isNotFound ? 404 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to process AI query',
+      });
+    }
+  });
+
+  // 11. AI Smart Search Endpoint
+  app.post('/api/ai/search', aiSearchRateLimiter, async (req, res) => {
+    try {
+      const { query, limit } = req.body || {};
+      const authHeader = req.headers.authorization;
+
+      if (!query || typeof query !== 'string' || !query.trim()) {
+        return res.status(400).json({ success: false, error: 'Search query is required' });
+      }
+
+      if (query.length > 500) {
+        return res.status(400).json({ success: false, error: 'Search query too long' });
+      }
+
+      let caller = null;
+      if (authHeader) {
+        try {
+          const decoded = await verifyFirebaseBearerToken(authHeader);
+          if (decoded && decoded.uid) {
+            caller = {
+              uid: decoded.uid,
+              email: decoded.email,
+              emailVerified: decoded.email_verified === true,
+              isPlatformAdmin: false,
+              isSuperAdmin: false,
+              token: decoded,
+            };
+          }
+        } catch {
+          // Guest search is allowed
+        }
+      }
+
+      const result = await handleSmartSearch({
+        query,
+        caller,
+        limit: Number(limit) || 10,
+      });
+
+      return res.status(200).json({ success: true, ...result });
+    } catch (err: any) {
+      console.error('[API /api/ai/search] Error:', err.message);
+      return res.status(400).json({
+        success: false,
+        error: err.message || 'Failed to execute smart search',
+      });
+    }
+  });
+
+  // 12. AI Report Summarization Endpoint (Platform Admins only)
+  app.post('/api/ai/report', aiRateLimiter, async (req, res) => {
+    try {
+      const { reportType, timeRange } = req.body || {};
+      const authHeader = req.headers.authorization;
+      const caller = await requireVerifiedPlatformAdmin(authHeader);
+
+      const result = await handleReportSummarization({
+        caller,
+        reportType: reportType || 'operational',
+        timeRange,
+      });
+
+      return res.status(200).json({ success: true, ...result });
+    } catch (err: any) {
+      console.error('[API /api/ai/report] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to generate report summary',
+      });
+    }
+  });
+
+  // 13. AI Copywriting Generator Endpoint (Sellers and Admins)
+  app.post('/api/ai/copywriting', aiRateLimiter, async (req, res) => {
+    try {
+      const { prompt, storeId } = req.body || {};
+      const authHeader = req.headers.authorization;
+      const caller = await requireAuthenticatedCaller(authHeader);
+
+      const result = await handleSellerAssistant({
+        caller,
+        prompt: prompt || 'Generate a compelling e-commerce product description',
+        storeId,
+        actionType: 'product_copy',
+      });
+
+      return res.status(200).json({ success: true, copy: result.response });
+    } catch (err: any) {
+      console.error('[API /api/ai/copywriting] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to generate product copy',
       });
     }
   });

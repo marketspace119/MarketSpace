@@ -37,7 +37,7 @@ export const addressService = {
    */
   clearUserCache() {
     memoryAddresses = [];
-    if (typeof window !== 'undefined') {
+    if (typeof localStorage !== 'undefined') {
       try {
         localStorage.removeItem(ADDRESSES_STORAGE_KEY);
       } catch (err) {

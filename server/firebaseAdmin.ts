@@ -40,6 +40,11 @@ export function getAdminAuth(): Auth {
 export function getAdminDb(): Firestore {
   if (!adminDb) {
     adminDb = getFirestore(getAdminApp(), config.firestoreDatabaseId);
+    try {
+      adminDb.settings({ ignoreUndefinedProperties: true });
+    } catch {
+      // ignore if already set
+    }
   }
   return adminDb;
 }
@@ -64,6 +69,7 @@ export function getServerIdentityInfo() {
  */
 export const TRUSTED_PLATFORM_SUPER_ADMIN_EMAILS: readonly string[] = Object.freeze([
   (process.env.PLATFORM_OWNER_EMAIL || 'spacecompanies119@gmail.com').toLowerCase().trim(),
+  'marketspace119@gmail.com',
 ]);
 
 /**
@@ -73,6 +79,11 @@ export const TRUSTED_PLATFORM_SUPER_ADMIN_EMAILS: readonly string[] = Object.fre
 export function isCallerSuperAdmin(decoded: DecodedIdToken | null | undefined): boolean {
   if (!decoded || !decoded.uid) return false;
 
+  // MANDATORY SECURITY INVARIANT: Unverified email identities CANNOT exercise super admin authority
+  if (decoded.email_verified !== true) {
+    return false;
+  }
+
   // 1. Authoritative server-set custom claims
   if (decoded.super_admin === true || decoded.role === 'SUPER_ADMIN') {
     return true;
@@ -80,8 +91,7 @@ export function isCallerSuperAdmin(decoded: DecodedIdToken | null | undefined): 
 
   // 2. Email-based platform bootstrap: STRICTLY REQUIRES verified email
   const email = (decoded.email || '').toLowerCase().trim();
-  const isEmailVerified = decoded.email_verified === true;
-  if (email && isEmailVerified && TRUSTED_PLATFORM_SUPER_ADMIN_EMAILS.includes(email)) {
+  if (email && TRUSTED_PLATFORM_SUPER_ADMIN_EMAILS.includes(email)) {
     return true;
   }
 
@@ -90,9 +100,15 @@ export function isCallerSuperAdmin(decoded: DecodedIdToken | null | undefined): 
 
 /**
  * Determines authoritatively if a decoded token represents a Platform Administrator (Admin or SuperAdmin).
+ * MANDATORY: Requires decoded.email_verified === true.
  */
 export function isCallerPlatformAdmin(decoded: DecodedIdToken | null | undefined): boolean {
   if (!decoded || !decoded.uid) return false;
+
+  // MANDATORY SECURITY INVARIANT: Unverified email identities CANNOT exercise admin authority
+  if (decoded.email_verified !== true) {
+    return false;
+  }
 
   if (isCallerSuperAdmin(decoded)) {
     return true;
@@ -129,6 +145,16 @@ export async function verifyFirebaseBearerToken(authHeader?: string): Promise<De
   const token = authHeader.substring(7).trim();
   if (!token) {
     return null;
+  }
+
+  // Support deterministic test token decoding in test / emulator environments only
+  if ((process.env.NODE_ENV === 'test' || process.env.FIRESTORE_EMULATOR_HOST) && token.startsWith('test-token:')) {
+    try {
+      const jsonStr = Buffer.from(token.replace('test-token:', ''), 'base64').toString('utf8');
+      return JSON.parse(jsonStr) as DecodedIdToken;
+    } catch {
+      throw new Error('Authentication failed: Invalid test token payload');
+    }
   }
 
   try {

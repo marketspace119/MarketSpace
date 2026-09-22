@@ -86,24 +86,16 @@ export class MemoryRateLimitStore implements RateLimitStore {
 
 /**
  * Distributed Firestore-backed RateLimitStore
- * Provides shared state across distributed instances (Cloud Run, auto-scaling replicas)
- * Uses window bucketing to prevent document contention and hot-spots.
+ * Provides shared state across distributed instances (Cloud Run, auto-scaling replicas).
+ * Algorithm: Fixed Window Counter with Deterministic Window Bucketing (window = Math.floor(now / windowMs)).
+ * SECURITY POLICY: Fail-Closed. If Firestore is unavailable or rejects access, operations fail closed (503).
+ * In-memory fallback is strictly forbidden for security boundaries.
  */
 export class DistributedFirestoreRateLimitStore implements RateLimitStore {
-  private fallbackMemory = new MemoryRateLimitStore();
-  private hasPermissionError = false;
-
   async consume(key: string, limit: number, windowMs: number): Promise<RateLimitResult> {
-    if (this.hasPermissionError) {
-      return this.fallbackMemory.consume(key, limit, windowMs);
-    }
-
-    let adminDb;
-    try {
-      adminDb = getAdminDb();
-    } catch {
-      // Fallback to in-memory store if adminDb is unconfigured or in offline test environment
-      return this.fallbackMemory.consume(key, limit, windowMs);
+    const adminDb = getAdminDb();
+    if (!adminDb) {
+      throw new Error('Distributed rate limiter unavailable: Firestore Admin DB not initialized (Fail-Closed)');
     }
 
     const now = Date.now();
@@ -161,18 +153,10 @@ export class DistributedFirestoreRateLimitStore implements RateLimitStore {
           resetTime,
           retryAfter: 0,
         };
-      });
+      }, { maxAttempts: 1 });
     } catch (err: any) {
-      if (
-        err?.code === 7 ||
-        err?.message?.includes('PERMISSION_DENIED') ||
-        err?.message?.includes('insufficient permissions') ||
-        err?.message?.includes('Could not load the default credentials')
-      ) {
-        this.hasPermissionError = true;
-      }
-      console.warn('[RateLimiter:DistributedFallback] Firestore limiter error, falling back to local memory:', err.message);
-      return this.fallbackMemory.consume(key, limit, windowMs);
+      console.error('[RateLimiter:Distributed] Firestore transaction failed (Fail-Closed):', err?.message || err);
+      throw new Error(`Distributed rate limiter unavailable: ${err?.message || 'Transaction error'} (Fail-Closed)`);
     }
   }
 }
@@ -198,8 +182,23 @@ export function createRateLimiter(options: {
     const store = options.store || activeStore;
     const ip = req.ip || req.socket.remoteAddress || 'unknown';
     const authHeader = req.headers.authorization;
-    const clientKey = authHeader ? `auth_${authHeader.slice(-16)}` : `ip_${ip}`;
-    const endpointKey = `${req.method}_${req.baseUrl || req.path}_${clientKey}`;
+
+    // Rate Limit Identity: Use verified UID when available, or hash of bearer token, fallback to client IP
+    let identityKey: string;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const tokenString = authHeader.substring(7).trim();
+      try {
+        // Attempt quick non-blocking verification or token hashing
+        const tokenHash = crypto.createHash('sha256').update(tokenString).digest('hex').slice(0, 16);
+        identityKey = `auth_${tokenHash}`;
+      } catch {
+        identityKey = `ip_${ip}`;
+      }
+    } else {
+      identityKey = `ip_${ip}`;
+    }
+
+    const endpointKey = `${req.method}_${req.baseUrl || req.path}_${identityKey}`;
 
     try {
       const result = await store.consume(endpointKey, options.max, options.windowMs);
@@ -219,12 +218,14 @@ export function createRateLimiter(options: {
 
       next();
     } catch (err: any) {
-      console.error('[RateLimiter:Error] Security control failure in rate limiter:', err);
+      console.error('[RateLimiter:Error] Security control failure in rate limiter (Fail-Closed):', err?.message || err);
       // Fail-Closed: Infrastructure or security control failure must never silently bypass protection
+      res.setHeader('Retry-After', 60);
       return res.status(503).json({
         success: false,
         error: 'Security control failure: Rate limiter service temporarily unavailable.',
         code: 'RATE_LIMITER_UNAVAILABLE',
+        retryAfter: 60,
       });
     }
   };

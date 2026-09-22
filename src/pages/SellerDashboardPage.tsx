@@ -113,6 +113,13 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
   // Payout Modal
   const [isPayoutModalOpen, setIsPayoutModalOpen] = useState(false);
   const [isSubmittingPayout, setIsSubmittingPayout] = useState(false);
+  const [financialSummary, setFinancialSummary] = useState<{
+    totalEarned: number;
+    totalRefunds: number;
+    totalReservedOrPaid: number;
+    availableBalance: number;
+    netRevenue: number;
+  } | null>(null);
   const [payoutFormData, setPayoutFormData] = useState({
     amount: 50.0,
     paymentMethod: 'zaad' as const,
@@ -160,6 +167,13 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
       // Load payouts
       const sellerPayouts = payoutService.getPayoutRequestsBySeller(user.id);
       setPayouts(sellerPayouts);
+
+      // FIN-01 / FIN-02: Authoritative Server Financial Summary
+      payoutService.getFinancialSummary(user.id).then(summary => {
+        setFinancialSummary(summary);
+      }).catch(err => {
+        console.warn('Authoritative financial summary fetch:', err?.message);
+      });
     } else {
       setStore(null);
       setProducts([]);
@@ -167,6 +181,7 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
       setBookings([]);
       setReviews([]);
       setPayouts([]);
+      setFinancialSummary(null);
     }
   }, [user]);
 
@@ -267,12 +282,18 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
     );
   }
 
-  // Financial calculations
-  const totalRevenue = orders.reduce((sum, o) => sum + (o.vendorSubOrder.sellerRevenue || 0), 0);
-  const totalWithdrawn = payouts
-    .filter(p => p.status === 'processed' || p.status === 'approved')
-    .reduce((sum, p) => sum + p.amount, 0);
-  const availableBalance = Math.max(0, totalRevenue - totalWithdrawn);
+  // Financial calculations (FIN-01: Single Source of Truth via Authoritative Server Summary)
+  const totalRevenue = financialSummary
+    ? financialSummary.totalEarned
+    : orders.reduce((sum, o) => sum + (o.vendorSubOrder.sellerRevenue || 0), 0);
+  const totalWithdrawn = financialSummary
+    ? financialSummary.totalReservedOrPaid
+    : payouts
+        .filter(p => p.status === 'processed' || p.status === 'approved' || p.status === 'paid')
+        .reduce((sum, p) => sum + p.amount, 0);
+  const availableBalance = financialSummary
+    ? financialSummary.availableBalance
+    : Math.max(0, totalRevenue - totalWithdrawn);
   const totalOrdersCount = orders.length;
   const activeProductsCount = products.filter(p => p.isPublished && p.status === 'published').length;
   const lowStockProducts = products.filter(p => (p.stock || 0) <= (p.lowStockThreshold ?? 5));
@@ -490,6 +511,7 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
 
       setPayouts([newPayout, ...payouts]);
       setIsPayoutModalOpen(false);
+      payoutService.getFinancialSummary(user.id).then(s => setFinancialSummary(s)).catch(() => {});
       alert('تم تقديم طلب السحب بنجاح، وستتم معالجته خلال 24 ساعة.');
     } catch (err: any) {
       alert(err.message || 'فشل تقديم طلب السحب');

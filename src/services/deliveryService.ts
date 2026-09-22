@@ -617,13 +617,21 @@ export const deliveryService = {
     if (!isAdmin) {
       if (isSeller) {
         const allowedForSeller = ['PREPARING', 'READY', 'CANCELLED'];
-        if (prev.deliveryType === 'SELLER_DELIVERY' || prev.deliveryType === 'seller_delivery') {
-          allowedForSeller.push('OUT_FOR_DELIVERY', 'DELIVERED', 'FAILED');
+        if (
+          prev.deliveryType === 'SELLER_DELIVERY' ||
+          prev.deliveryType === 'seller_delivery'
+        ) {
+          allowedForSeller.push('OUT_FOR_DELIVERY', 'PICKED_UP', 'DELIVERED', 'FAILED');
         }
         if (!allowedForSeller.includes(targetNorm)) {
           throw new Error(`Sellers cannot transition directly to ${targetNorm} under platform fulfillment`);
         }
       }
+    }
+
+    // Terminal state protection: deliveries once DELIVERED or CANCELLED cannot be reopened
+    if ((currentNorm === 'DELIVERED' || currentNorm === 'CANCELLED') && targetNorm !== currentNorm) {
+      throw new Error(`Terminal delivery status '${currentNorm}' is immutable and cannot be transitioned to '${targetNorm}'`);
     }
 
     // Prevent impossible jumps (e.g. PENDING directly to DELIVERED)

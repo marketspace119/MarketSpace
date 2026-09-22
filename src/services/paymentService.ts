@@ -1,8 +1,6 @@
-import { doc, getDoc, setDoc, updateDoc, collection, getDocs, query, where } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType, cleanForFirestore } from '../lib/firebase';
+import { collection, getDocs, query, where } from 'firebase/firestore';
+import { db, auth } from '../lib/firebase';
 import { orderService } from './orderService';
-import { auditLogService } from './auditLogService';
-import { UserRole } from '../types';
 
 export type PaymentMethodType = 'cash_on_delivery' | 'evc_plus' | 'zaad' | 'sahall' | 'card';
 
@@ -196,103 +194,80 @@ export const paymentService = {
   },
 
   /**
-   * Phase 21: Customer submits mobile money reference
-   * Sets state strictly to PAYMENT_REFERENCE_SUBMITTED (Customer cannot set CONFIRMED)
+   * Phase 21: Customer submits mobile money reference via Trusted Backend Gateway (/api/payments/submit-reference)
+   * The server derives customerId from verified Firebase ID token and executes an atomic Admin SDK transaction.
    */
   async submitPaymentReference(params: {
     orderId: string;
-    customerId: string;
+    customerId?: string;
     method: 'evc_plus' | 'zaad' | 'sahall';
-    amount: number;
+    amount?: number;
     referenceNumber: string;
     senderPhone: string;
+    idToken?: string;
   }): Promise<MobilePaymentSubmission> {
-    const cleanRef = params.referenceNumber.trim();
+    const cleanRef = (params.referenceNumber || '').trim();
     if (!cleanRef || cleanRef.length < 4) {
       throw new Error('رقم الإشعار / المرجع غير صالح. يجب أن يحتوي على 4 خانات على الأقل.');
     }
 
-    // HIGH-07: Verify Order Existence, Ownership & Amount Consistency
+    // Client-side fail-fast pre-validation (authoritatively re-checked on backend gateway)
     const order = orderService.getOrderById(params.orderId, undefined, 'ADMIN');
     if (!order) {
-      throw new Error(`الطلب رقم ${params.orderId} غير موجود.`);
+      throw new Error(`الطلب رقم ${params.orderId} غير موجود (Order not found).`);
     }
-    if (order.customerId !== params.customerId) {
-      throw new Error('غير مصرح: لا يمكنك تقديم إشعار دفع لطلب لا يخصك.');
+    if (params.customerId && order.customerId && order.customerId !== params.customerId) {
+      throw new Error('غير مصرح: لا يمكنك تقديم إشعار دفع لطلب لا يخصك (Forbidden / Unauthorized ownership mismatch).');
     }
-    if (Math.abs(order.total - params.amount) > 0.01) {
+    if (params.amount !== undefined && Math.abs(order.total - params.amount) > 0.01) {
       throw new Error(`المبلغ المدخل ($${params.amount}) غير متطابق مع إجمالي الطلب ($${order.total}).`);
     }
 
-    // PART 18: Atomic Unique Normalized Reference Lock
-    const normalizedRef = cleanRef.toUpperCase().replace(/\s+/g, '');
-
-    // Check for duplicate reference across existing active submissions
-    const existingList = await this.getAllSubmissions();
-    const isDuplicate = existingList.some(
-      s => s.referenceNumber.toUpperCase().replace(/\s+/g, '') === normalizedRef && s.status !== 'REJECTED'
-    );
-    if (isDuplicate) {
-      throw new Error('رقم الإشعار / المرجع هذا تم تقديمه مسبقاً في عملية دفع أخرى ولا يمكن إعادة استخدامه.');
-    }
-
-    // Atomic durable verification via unique primary key document
-    try {
-      const refDoc = await getDoc(doc(db, 'paymentReferences', normalizedRef));
-      if (refDoc.exists()) {
-        const data = refDoc.data();
-        if (data?.status !== 'REJECTED') {
-          throw new Error('رقم الإشعار / المرجع هذا تم تقديمه مسبقاً في عملية دفع أخرى ولا يمكن إعادة استخدامه.');
-        }
+    let token = params.idToken;
+    if (!token && auth?.currentUser) {
+      try {
+        token = await auth.currentUser.getIdToken();
+      } catch (e) {
+        console.warn('[PaymentService] Could not get currentUser ID token:', e);
       }
-    } catch (err: any) {
-      if (err.message && err.message.includes('تم تقديمه مسبقاً')) throw err;
-      console.warn('[PaymentService] paymentReferences check offline/skipped in test:', err.message);
     }
 
-    const submissionId = `sub_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-    const submission: MobilePaymentSubmission = {
-      id: submissionId,
-      orderId: params.orderId,
-      customerId: params.customerId,
-      method: params.method,
-      amount: order.total, // Enforce authoritative order total
-      referenceNumber: cleanRef,
-      senderPhone: params.senderPhone.trim(),
-      status: 'PAYMENT_REFERENCE_SUBMITTED',
-      createdAt: new Date().toISOString(),
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
     };
-
-    // Clean payload for Firestore write (Authoritative persistence required)
-    try {
-      await setDoc(doc(db, SUBMISSIONS_COLLECTION, submissionId), cleanForFirestore(submission));
-    } catch (e: any) {
-      console.error('[PaymentService] Cloud submission persistence failed:', e.message);
-      handleFirestoreError(e, OperationType.CREATE, `${SUBMISSIONS_COLLECTION}/${submissionId}`);
-      throw new Error(`فشل حفظ إشعار الدفع في قاعدة البيانات المعتمدة (Fail-Closed): ${e.message || 'Database error'}`);
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
     }
 
-    try {
-      await setDoc(doc(db, 'paymentReferences', normalizedRef), cleanForFirestore({
-        submissionId,
-        referenceNumber: cleanRef,
-        normalizedRef,
+    const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || 'http://127.0.0.1:3000');
+    const res = await fetch(`${baseUrl}/api/payments/submit-reference`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
         orderId: params.orderId,
-        customerId: params.customerId,
-        status: 'PAYMENT_REFERENCE_SUBMITTED',
-        createdAt: new Date().toISOString(),
-      }));
-    } catch (e: any) {
-      console.error('[PaymentService] Failed to record unique normalized payment reference in cloud:', e.message);
-      handleFirestoreError(e, OperationType.CREATE, `paymentReferences/${normalizedRef}`);
-      throw new Error(`فشل تسجيل الرقم المرجعي في قاعدة البيانات المعتمدة: ${e.message || 'Database error'}`);
+        method: params.method,
+        referenceNumber: cleanRef,
+        senderPhone: params.senderPhone,
+        ...(params.amount !== undefined ? { amount: params.amount } : {}),
+        ...(params.customerId ? { customerId: params.customerId } : {}),
+      }),
+    });
+
+    const resData = await res.json().catch(() => ({}));
+    if (!res.ok || !resData.success || !resData.submission) {
+      throw new Error(resData.error || `فشل تقديم إشعار الدفع عبر البوابة الموثوقة (HTTP ${res.status})`);
     }
 
+    const submission: MobilePaymentSubmission = resData.submission;
+
+    // Display-only local cache (Never authoritative; display cache only)
     try {
-      const stored = localStorage.getItem('marketspace_payment_submissions_v1');
-      const list: MobilePaymentSubmission[] = stored ? JSON.parse(stored) : [];
-      list.unshift(submission);
-      localStorage.setItem('marketspace_payment_submissions_v1', JSON.stringify(list));
+      if (typeof localStorage !== 'undefined') {
+        const stored = localStorage.getItem('marketspace_payment_submissions_v1');
+        const list: MobilePaymentSubmission[] = stored ? JSON.parse(stored) : [];
+        list.unshift(submission);
+        localStorage.setItem('marketspace_payment_submissions_v1', JSON.stringify(list));
+      }
     } catch (e) {
       console.warn('Local payment submission cache error', e);
     }
@@ -316,7 +291,9 @@ export const paymentService = {
           snap.forEach(d => list.push(d.data() as MobilePaymentSubmission));
           list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
           try {
-            localStorage.setItem('marketspace_payment_submissions_v1', JSON.stringify(list));
+            if (typeof localStorage !== 'undefined') {
+              localStorage.setItem('marketspace_payment_submissions_v1', JSON.stringify(list));
+            }
           } catch {}
           return list;
         }
@@ -326,13 +303,15 @@ export const paymentService = {
     }
 
     try {
-      const stored = localStorage.getItem('marketspace_payment_submissions_v1');
-      if (stored) {
-        return JSON.parse(stored);
+      if (typeof localStorage !== 'undefined') {
+        const stored = localStorage.getItem('marketspace_payment_submissions_v1');
+        if (stored) {
+          return JSON.parse(stored);
+        }
       }
     } catch {}
 
-    // Seed baseline mobile payment submission
+    // Seed baseline mobile payment submission for preview display
     const seed: MobilePaymentSubmission[] = [
       {
         id: 'sub_seed_01',
@@ -364,117 +343,69 @@ export const paymentService = {
   },
 
   /**
-   * Phase 21: Only platform Admin can verify and mark CONFIRMED or REJECTED
+   * Phase 21: Only platform Admin can verify and mark CONFIRMED or REJECTED.
+   * Authoritatively processed via Trusted Backend Gateway (/api/payments/review).
+   * Runs in an atomic Firestore transaction via Admin SDK.
    */
   async reviewPaymentSubmission(
     submissionId: string,
     decision: 'CONFIRMED' | 'REJECTED',
-    adminUserId: string,
-    userRole: string,
-    notes?: string
+    adminUserId?: string,
+    userRole?: string,
+    notes?: string,
+    idToken?: string
   ): Promise<boolean> {
-    const isAdmin = userRole === 'ADMIN' || userRole === 'SUPER_ADMIN';
-    if (!isAdmin) {
-      throw new Error('Forbidden: Only platform administrators can review payment submissions');
-    }
-
-    let orderIdTarget = '';
-    let methodTarget = '';
-    let amountTarget = 0;
-
-    // Check local storage first to extract details in case Firestore doc doesn't exist or is local
-    try {
-      const stored = localStorage.getItem('marketspace_payment_submissions_v1');
-      if (stored) {
-        const list: MobilePaymentSubmission[] = JSON.parse(stored);
-        const item = list.find(s => s.id === submissionId);
-        if (item) {
-          orderIdTarget = item.orderId;
-          methodTarget = item.method;
-          amountTarget = item.amount;
-        }
-      }
-    } catch {}
-
-    const subDocRef = doc(db, SUBMISSIONS_COLLECTION, submissionId);
-    let snap;
-    try {
-      snap = await getDoc(subDocRef);
-    } catch (err: any) {
-      console.error('[PaymentService] Failed to read submission from Firestore:', err);
-      handleFirestoreError(err, OperationType.GET, `${SUBMISSIONS_COLLECTION}/${submissionId}`);
-      throw new Error(`فشل قراءة إشعار الدفع من قاعدة البيانات (Fail-Closed): ${err?.message || 'Database error'}`);
-    }
-
-    if (!snap || !snap.exists()) {
-      throw new Error(`إشعار الدفع ${submissionId} غير موجود في قاعدة البيانات المعتمدة.`);
-    }
-
-    const data = snap.data() as MobilePaymentSubmission;
-    orderIdTarget = data.orderId || orderIdTarget;
-    methodTarget = data.method || methodTarget;
-    amountTarget = data.amount || amountTarget;
-
-    try {
-      await updateDoc(subDocRef, cleanForFirestore({
-        status: decision,
-        reviewedBy: adminUserId,
-        reviewedAt: new Date().toISOString(),
-        notes: notes || '',
-      }));
-    } catch (err: any) {
-      console.error('[PaymentService] Cloud update failed for review decision:', err?.message);
-      handleFirestoreError(err, OperationType.UPDATE, `${SUBMISSIONS_COLLECTION}/${submissionId}`);
-      throw new Error(`فشل تحديث حالة إشعار الدفع في قاعدة البيانات (Fail-Closed): ${err?.message || 'Database error'}`);
-    }
-
-    if (decision === 'CONFIRMED' && orderIdTarget) {
+    let token = idToken;
+    if (!token && auth?.currentUser) {
       try {
-        await orderService.confirmPaymentStatus(orderIdTarget, userRole);
-      } catch (err: any) {
-        console.error('[PaymentService] Order status confirmation failed, rolling back submission status:', err);
-        // Rollback submission status to prevent split state (payment submission CONFIRMED while order unpaid)
-        try {
-          await updateDoc(subDocRef, cleanForFirestore({
-            status: 'PAYMENT_REFERENCE_SUBMITTED',
-            reviewedBy: '',
-            reviewedAt: '',
-            notes: `Rollback: Order status update failed (${err?.message || 'Error'})`,
-          }));
-        } catch (rollbackErr) {
-          console.error('[PaymentService] Critical: Rollback also failed:', rollbackErr);
-        }
-        throw new Error(`فشل تأكيد حالة دفع الطلب، وتم إلغاء اعتماد إشعار الدفع لحماية الاتساق المالي: ${err?.message || 'Database error'}`);
+        token = await auth.currentUser.getIdToken();
+      } catch (e) {
+        console.warn('[PaymentService] Could not get currentUser ID token:', e);
       }
     }
 
-    // Update local cache
-    try {
-      const stored = localStorage.getItem('marketspace_payment_submissions_v1');
-      if (stored) {
-        const list: MobilePaymentSubmission[] = JSON.parse(stored);
-        const idx = list.findIndex(s => s.id === submissionId);
-        if (idx !== -1) {
-          list[idx].status = decision;
-          list[idx].reviewedBy = adminUserId;
-          list[idx].reviewedAt = new Date().toISOString();
-          list[idx].notes = notes || '';
-          localStorage.setItem('marketspace_payment_submissions_v1', JSON.stringify(list));
-        }
-      }
-    } catch {}
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
 
-    // Record audit log
-    await auditLogService.logAction({
-      actorId: adminUserId,
-      actorRole: userRole as UserRole,
-      action: `PAYMENT_${decision}`,
-      targetType: 'payment',
-      targetId: submissionId,
-      targetName: `Mobile Payment (${methodTarget.toUpperCase()}) for Order #${orderIdTarget}`,
-      metadata: { decision, amount: amountTarget, notes },
+    const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || 'http://127.0.0.1:3000');
+    const res = await fetch(`${baseUrl}/api/payments/review`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        submissionId,
+        decision,
+        notes,
+      }),
     });
 
+    const resData = await res.json().catch(() => ({}));
+    if (!res.ok || !resData.success) {
+      // Fail-closed: Never update local state or mark confirmed on server failure
+      throw new Error(resData.error || `فشل اعتماد إشعار الدفع عبر البوابة الموثوقة (HTTP ${res.status})`);
+    }
+
+    // Update display cache ONLY AFTER server authoritative transaction succeeds
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const stored = localStorage.getItem('marketspace_payment_submissions_v1');
+        if (stored) {
+          const list: MobilePaymentSubmission[] = JSON.parse(stored);
+          const idx = list.findIndex(s => s.id === submissionId);
+          if (idx !== -1) {
+            list[idx].status = decision;
+            list[idx].reviewedBy = resData.result?.reviewedBy || adminUserId || '';
+            list[idx].reviewedAt = resData.result?.reviewedAt || new Date().toISOString();
+            list[idx].notes = notes || '';
+            localStorage.setItem('marketspace_payment_submissions_v1', JSON.stringify(list));
+          }
+        }
+      }
+    } catch {}
+
     return true;
-  }
+  },
 };

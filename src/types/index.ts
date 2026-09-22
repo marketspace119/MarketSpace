@@ -522,6 +522,12 @@ export interface AuditLog {
     | 'featured';
   targetId: string;
   targetName?: string;
+  resourceType?: string;
+  resourceId?: string;
+  requestId?: string;
+  beforeState?: Record<string, unknown> | null;
+  afterState?: Record<string, unknown> | null;
+  reason?: string;
   timestamp: string;
   metadata?: Record<string, unknown>;
 }

@@ -421,7 +421,7 @@ export const notificationService = {
 
   clearUserCache(): void {
     memoryNotifications = [];
-    if (typeof window !== 'undefined') {
+    if (typeof localStorage !== 'undefined') {
       try {
         localStorage.removeItem(NOTIFICATIONS_STORAGE_KEY);
       } catch {

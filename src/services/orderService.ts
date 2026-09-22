@@ -44,7 +44,7 @@ export const orderService = {
    */
   clearUserCache() {
     memoryOrders = [];
-    if (typeof window !== 'undefined') {
+    if (typeof localStorage !== 'undefined') {
       try {
         localStorage.removeItem(ORDERS_STORAGE_KEY);
       } catch (err) {
@@ -443,18 +443,38 @@ export const orderService = {
     const index = orders.findIndex(o => o.orderId === orderId);
     if (index === -1) return false;
 
-    // Authoritative update: Await Firestore write first
-    try {
-      await updateDoc(doc(db, ORDERS_COLLECTION, orderId), {
-        paymentStatus: 'paid',
-        updatedAt: new Date().toISOString(),
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `${ORDERS_COLLECTION}/${orderId}`);
-      throw err;
+    // Authoritative update: Must pass through Trusted Backend Gateway (/api/payments/review)
+    let token = '';
+    if (auth?.currentUser) {
+      try {
+        token = await auth.currentUser.getIdToken();
+      } catch (e) {}
     }
 
-    // Only mutate memory and local cache AFTER durable Firestore success
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || 'http://127.0.0.1:3000');
+    const res = await fetch(`${baseUrl}/api/payments/review`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        orderId,
+        decision: 'CONFIRMED',
+        notes: 'Admin confirmed payment status via Order Management',
+      }),
+    });
+
+    const resData = await res.json().catch(() => ({}));
+    if (!res.ok || !resData.success) {
+      throw new Error(resData.error || `فشل تأكيد حالة دفع الطلب عبر البوابة الموثوقة (HTTP ${res.status})`);
+    }
+
+    // Only mutate memory and local cache AFTER durable backend transaction succeeds
     orders[index].paymentStatus = 'paid';
     persistLocal(orders);
 

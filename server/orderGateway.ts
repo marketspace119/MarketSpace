@@ -518,7 +518,8 @@ export async function processOrderGateway(
 
   try {
     const result = await adminDb.runTransaction(async (transaction) => {
-      // Step A: Durable idempotency verification inside transaction
+      // Step 1: All Transactional Reads FIRST
+      // 1a. Durable idempotency read
       if (idempotencyDocKey) {
         const idempRef = adminDb.collection('idempotency_keys').doc(idempotencyDocKey);
         const idempDoc = await transaction.get(idempRef);
@@ -531,7 +532,8 @@ export async function processOrderGateway(
         }
       }
 
-      // Step B: Stock verification and atomic decrement
+      // 1b. Product stock reads
+      const productDocsToUpdate: Array<{ ref: FirebaseFirestore.DocumentReference; newStock: number }> = [];
       for (const it of verifiedOrderItems) {
         if (it.product.stock !== undefined) {
           const prodRef = adminDb.collection('products').doc(it.product.id);
@@ -542,38 +544,69 @@ export async function processOrderGateway(
               if (currentStock < it.quantity) {
                 throw new Error(`Insufficient stock for product "${it.product.title?.en || it.product.id}"`);
               }
-              transaction.update(prodRef, {
-                stock: currentStock - it.quantity,
-                updatedAt: now,
+              productDocsToUpdate.push({
+                ref: prodRef,
+                newStock: currentStock - it.quantity,
               });
             }
           }
         }
       }
 
-      // Step C: Authoritative Order Write
-      transaction.set(orderRef, cleanOrderPayload);
-
-      // Step D: Authoritative Coupon Usage Write
+      // 1c. Coupon read & atomic invariant verification inside transaction
+      let couponDocToUpdate: { ref: FirebaseFirestore.DocumentReference; newCount: number; newCustUsage: Record<string, number> } | null = null;
       if (verifiedCouponDocId) {
         const couponRef = adminDb.collection('coupons').doc(verifiedCouponDocId);
         const couponDoc = await transaction.get(couponRef);
         if (couponDoc.exists) {
           const cData = couponDoc.data() || {};
+          if (cData.active === false) {
+            throw new Error(`Coupon '${verifiedCouponCode}' is inactive`);
+          }
           const currentCount = Number(cData.usedCount) || 0;
+          if (typeof cData.usageLimit === 'number' && cData.usageLimit > 0 && currentCount >= cData.usageLimit) {
+            throw new Error(`Coupon '${verifiedCouponCode}' usage limit has been reached`);
+          }
           const currentCustUsage = { ...(cData.customerUsage || {}) };
+          if (verifiedCustomerId && typeof cData.perCustomerLimit === 'number' && cData.perCustomerLimit > 0) {
+            const customerUses = currentCustUsage[verifiedCustomerId] || 0;
+            if (customerUses >= cData.perCustomerLimit) {
+              throw new Error(`Coupon '${verifiedCouponCode}' per-customer usage limit exceeded`);
+            }
+          }
           if (verifiedCustomerId) {
             currentCustUsage[verifiedCustomerId] = (currentCustUsage[verifiedCustomerId] || 0) + 1;
           }
-          transaction.update(couponRef, {
-            usedCount: currentCount + 1,
-            customerUsage: currentCustUsage,
-            updatedAt: now,
-          });
+          couponDocToUpdate = {
+            ref: couponRef,
+            newCount: currentCount + 1,
+            newCustUsage: currentCustUsage,
+          };
         }
       }
 
-      // Step E: Authoritative Durable Idempotency Write
+      // Step 2: All Transactional Writes SECOND
+      // 2a. Update product stocks
+      for (const p of productDocsToUpdate) {
+        transaction.update(p.ref, {
+          stock: p.newStock,
+          updatedAt: now,
+        });
+      }
+
+      // 2b. Update coupon usage
+      if (couponDocToUpdate) {
+        transaction.update(couponDocToUpdate.ref, {
+          usedCount: couponDocToUpdate.newCount,
+          customerUsage: couponDocToUpdate.newCustUsage,
+          updatedAt: now,
+        });
+      }
+
+      // 2c. Write authoritative order
+      transaction.set(orderRef, cleanOrderPayload);
+
+      // 2d. Write durable idempotency key record
       if (idempotencyDocKey) {
         const idempRef = adminDb.collection('idempotency_keys').doc(idempotencyDocKey);
         transaction.set(idempRef, {
@@ -704,7 +737,13 @@ export async function processSubOrderUpdateGateway(
   const allDelivered = updatedVendorOrders.every((s: any) => s.status === 'delivered' || s.status === 'completed');
   if (allDelivered) {
     nextOrderStatus = 'delivered';
-  } else if (updatedVendorOrders.some((s: any) => s.status === 'preparing' || s.status === 'in_progress' || s.status === 'shipped')) {
+  } else if (updatedVendorOrders.some((s: any) =>
+    s.status === 'preparing' ||
+    s.status === 'in_progress' ||
+    s.status === 'ready' ||
+    s.status === 'shipped' ||
+    s.status === 'out_for_delivery'
+  )) {
     nextOrderStatus = 'processing';
   }
 

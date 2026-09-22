@@ -3,7 +3,7 @@ import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { AuditLog, UserRole } from '../types';
 
 const AUDIT_LOGS_STORAGE_KEY = 'marketspace_audit_logs_v1';
-const AUDIT_LOGS_COLLECTION = 'auditLogs';
+const AUDIT_LOGS_COLLECTION = 'audit_logs';
 
 let memoryAuditLogs: AuditLog[] = [];
 

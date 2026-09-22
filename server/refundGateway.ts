@@ -168,7 +168,6 @@ export async function processRefundGateway(
       const newRefund: RefundRequest = {
         id: refundId,
         orderId,
-        subOrderId: subOrderId || undefined,
         customerId: callerUid,
         customerName,
         customerPhone,
@@ -176,11 +175,15 @@ export async function processRefundGateway(
         storeId: authoritativeStoreId,
         amount: requestedAmount,
         reason,
-        notes: notes?.trim() || undefined,
+        notes: notes?.trim() || '',
         status: 'REFUND_REQUESTED',
         createdAt: now,
         updatedAt: now,
       };
+
+      if (subOrderId) {
+        newRefund.subOrderId = subOrderId;
+      }
 
       // Write lock update
       transaction.set(refundLockRef, {

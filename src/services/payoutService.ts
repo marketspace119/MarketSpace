@@ -125,6 +125,26 @@ export const payoutService = {
     return initPayouts().map(normalizePayout);
   },
 
+  /**
+   * Authoritatively fetches seller financial summary from the single source of truth server API.
+   * FIN-01 / FIN-02: Prevents client-side balance drift and unbounded reads.
+   */
+  async getFinancialSummary(sellerId: string): Promise<any> {
+    const currentUser = auth.currentUser;
+    const token = currentUser ? await currentUser.getIdToken() : '';
+    const res = await fetch(`/api/seller/financial-summary?sellerId=${encodeURIComponent(sellerId)}`, {
+      headers: {
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+    });
+
+    const data = await res.json();
+    if (!res.ok || !data.success || !data.summary) {
+      throw new Error(data.error || 'Failed to fetch authoritative financial summary');
+    }
+    return data.summary;
+  },
+
   async createPayoutRequest(
     data: Omit<PayoutRequest, 'id' | 'requestedAt' | 'status' | 'settlementType'>
   ): Promise<PayoutRequest> {
@@ -138,77 +158,8 @@ export const payoutService = {
       throw new Error('Account number is required');
     }
 
-    // HIGH-03: Authoritative Balance Verification (Strict Fail-Closed)
-    // 1. Calculate total earned from paid, non-cancelled orders for this seller
-    let totalEarned = 0;
-    try {
-      const ordersRef = collection(db, 'orders');
-      const ordersQuery = query(ordersRef, where('sellerIds', 'array-contains', data.sellerId));
-      const ordersSnap = await getDocs(ordersQuery);
-      if (!ordersSnap.empty) {
-        ordersSnap.forEach(docSnap => {
-          const orderData = docSnap.data();
-          if (orderData.paymentStatus === 'paid' && orderData.status !== 'cancelled') {
-            if (Array.isArray(orderData.vendorOrders)) {
-              orderData.vendorOrders.forEach((vo: any) => {
-                if (vo.sellerId === data.sellerId) {
-                  totalEarned += (vo.sellerRevenue ?? (vo.subtotal - (vo.commissionAmount || 0)));
-                }
-              });
-            }
-          }
-        });
-      }
-    } catch (err) {
-      console.error('Authoritative orders read failure:', err);
-      throw new Error('فشل في قراءة بيانات الطلبات الموثوقة من قاعدة البيانات. تم إلغاء طلب السحب تلقائياً (Fail-Closed).');
-    }
-
-    // 2. Subtract completed/approved refunds for this seller
-    let totalRefunds = 0;
-    try {
-      const refundsRef = collection(db, 'refundRequests');
-      const refundsQuery = query(refundsRef, where('sellerId', '==', data.sellerId));
-      const refundsSnap = await getDocs(refundsQuery);
-      if (!refundsSnap.empty) {
-        refundsSnap.forEach(docSnap => {
-          const refData = docSnap.data();
-          if (['REFUNDED', 'REFUND_APPROVED', 'REFUND_REQUESTED', 'pending'].includes(refData.status)) {
-            totalRefunds += (Number(refData.amount) || 0);
-          }
-        });
-      }
-    } catch (err) {
-      console.error('Authoritative refunds read failure:', err);
-      throw new Error('فشل في قراءة سجلات الاسترداد الموثوقة من قاعدة البيانات. تم إلغاء طلب السحب تلقائياً (Fail-Closed).');
-    }
-
-    // 3. Calculate total already requested or settled for this seller
-    let totalReservedOrPaid = 0;
-    try {
-      const payoutsRef = collection(db, PAYOUTS_COLLECTION);
-      const payoutsQuery = query(payoutsRef, where('sellerId', '==', data.sellerId));
-      const payoutsSnap = await getDocs(payoutsQuery);
-      if (!payoutsSnap.empty) {
-        payoutsSnap.forEach(docSnap => {
-          const p = docSnap.data() as PayoutRequest;
-          if (p.status === 'pending' || p.status === 'approved' || p.status === 'processed' || p.status === 'paid') {
-            totalReservedOrPaid += (p.amount || 0);
-          }
-        });
-      }
-    } catch (err) {
-      console.error('Authoritative payouts read failure:', err);
-      throw new Error('فشل في قراءة سجلات السحب السابقة من قاعدة البيانات. تم إلغاء طلب السحب تلقائياً (Fail-Closed).');
-    }
-
-    const netEarned = Math.max(0, totalEarned - totalRefunds);
-    const availableBalance = Math.max(0, netEarned - totalReservedOrPaid);
-    if (data.amount > availableBalance) {
-      throw new Error(`مبلغ السحب المطلوب ($${data.amount.toFixed(2)}) يتجاوز الرصيد الصافي القابل للسحب المتاح ($${availableBalance.toFixed(2)})`);
-    }
-
-    // Production: Delegate strictly to secure server gateway with authenticated token
+    // Production / Authoritative: Delegate directly to secure server gateway with authenticated token
+    // The server calculates the balance authoritatively within its lock/transaction (FIN-01, FIN-02)
     const currentUser = auth.currentUser;
     if (!currentUser) {
       throw new Error('UNAUTHENTICATED: Authentication required to request a payout (يجب تسجيل الدخول لطلب سحب الأرباح)');
@@ -284,18 +235,17 @@ export const payoutService = {
       processedAt: params.newStatus === 'paid' || params.newStatus === 'approved' ? now : prev.processedAt,
     };
 
-    // HIGH-04: Durable Firestore write with clean payload.
+    // SEC-02: Durable Firestore write strictly Fail-Closed.
+    // NEVER swallow PERMISSION_DENIED or any database authorization errors!
     try {
       await setDoc(doc(db, PAYOUTS_COLLECTION, params.payoutId), cleanForFirestore(updated), { merge: true });
     } catch (err: any) {
-      console.warn('[PayoutService] Firestore update note:', err?.message);
-      if (!err?.message?.includes('permission') && !err?.message?.includes('PERMISSION_DENIED')) {
-        handleFirestoreError(err, OperationType.UPDATE, `${PAYOUTS_COLLECTION}/${params.payoutId}`);
-        throw err;
-      }
+      console.error('[PayoutService:Error] Authoritative Firestore payout write failed (Fail-Closed):', err?.message);
+      handleFirestoreError(err, OperationType.UPDATE, `${PAYOUTS_COLLECTION}/${params.payoutId}`);
+      throw err;
     }
 
-    // Update local state
+    // Update local display cache ONLY after authoritative write succeeds
     payouts[index] = updated;
     persistLocal(payouts);
 

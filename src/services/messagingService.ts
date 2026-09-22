@@ -397,7 +397,7 @@ export const messagingService = {
   clearUserCache(): void {
     memoryConversations = [];
     memoryMessages = {};
-    if (typeof window !== 'undefined') {
+    if (typeof localStorage !== 'undefined') {
       try {
         localStorage.removeItem(CONVERSATIONS_STORAGE_KEY);
       } catch {

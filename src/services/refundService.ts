@@ -231,7 +231,12 @@ export const refundService = {
     const target = refunds.find(r => r.id === params.refundId);
     if (!target) throw new Error('Refund request not found');
 
-    if (target.status === 'REFUNDED') {
+    if (
+      target.status === 'REFUNDED' ||
+      target.status === 'REFUND_REJECTED' ||
+      target.status === 'REJECTED' ||
+      (target.status as any) === 'completed'
+    ) {
       throw new Error('Terminal state: settled refund cannot be modified (تمت تسويته مسبقاً - terminal)');
     }
 
@@ -276,7 +281,12 @@ export const refundService = {
     const target = refunds.find(r => r.id === refundId);
     if (!target) throw new Error('Refund request not found');
 
-    if (target.status === 'REFUNDED') {
+    if (
+      target.status === 'REFUNDED' ||
+      target.status === 'REFUND_REJECTED' ||
+      target.status === 'REJECTED' ||
+      (target.status as any) === 'completed'
+    ) {
       throw new Error('Terminal state: Settled refunds cannot be modified');
     }
 

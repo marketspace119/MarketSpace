@@ -115,7 +115,10 @@ export const platformSettingsService = {
     persistLocal(updated);
 
     try {
-      await setDoc(doc(db, SETTINGS_COLLECTION, DEFAULT_SETTINGS_DOC), updated, { merge: true });
+      await Promise.race([
+        setDoc(doc(db, SETTINGS_COLLECTION, DEFAULT_SETTINGS_DOC), updated, { merge: true }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore write timeout')), 600)),
+      ]);
     } catch (err) {
       console.warn('Failed to save settings to Firestore:', err);
     }

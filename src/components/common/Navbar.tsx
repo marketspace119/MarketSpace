@@ -26,8 +26,10 @@ import {
   Package,
   Bell,
   MapPin,
+  Bot,
 } from 'lucide-react';
 import { MarketSpaceLogo } from './MarketSpaceLogo';
+import { AIAssistantModal } from './AIAssistantModal';
 import { useLanguage } from '../../i18n/LanguageContext';
 import { useTheme } from '../../context/ThemeContext';
 import { useFavorites } from '../../context/FavoritesContext';

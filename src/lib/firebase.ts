@@ -1,13 +1,32 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth } from 'firebase/auth';
-import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
-import { getStorage } from 'firebase/storage';
+import { getAuth, connectAuthEmulator } from 'firebase/auth';
+import { getFirestore, connectFirestoreEmulator, doc, getDocFromServer } from 'firebase/firestore';
+import { getStorage, connectStorageEmulator } from 'firebase/storage';
 import firebaseConfig from '../../firebase-applet-config.json';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const storage = getStorage(app);
+
+// Seamlessly connect client SDK to local emulators during testing and local verification
+if (typeof process !== 'undefined' && process.env?.FIRESTORE_EMULATOR_HOST) {
+  const [fHost, fPort] = process.env.FIRESTORE_EMULATOR_HOST.split(':');
+  try {
+    connectFirestoreEmulator(db, fHost, parseInt(fPort || '8080', 10));
+  } catch {}
+}
+if (typeof process !== 'undefined' && process.env?.FIREBASE_STORAGE_EMULATOR_HOST) {
+  const [sHost, sPort] = process.env.FIREBASE_STORAGE_EMULATOR_HOST.split(':');
+  try {
+    connectStorageEmulator(storage, sHost, parseInt(sPort || '9199', 10));
+  } catch {}
+}
+if (typeof process !== 'undefined' && process.env?.FIREBASE_AUTH_EMULATOR_HOST) {
+  try {
+    connectAuthEmulator(auth, `http://${process.env.FIREBASE_AUTH_EMULATOR_HOST}`);
+  } catch {}
+}
 
 export enum OperationType {
   CREATE = 'create',
