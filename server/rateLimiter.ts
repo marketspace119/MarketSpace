@@ -1,6 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
-import { getAdminDb } from './firebaseAdmin';
+import { getAdminDb, verifyFirebaseBearerToken } from './firebaseAdmin';
 
 export interface RateLimitResult {
   allowed: boolean;
@@ -183,15 +183,20 @@ export function createRateLimiter(options: {
     const ip = req.ip || req.socket.remoteAddress || 'unknown';
     const authHeader = req.headers.authorization;
 
-    // Rate Limit Identity: Use verified UID when available, or hash of bearer token, fallback to client IP
+    // Rate Limit Identity: Use verified UID when caller is genuinely authenticated with Firebase Auth.
+    // Unverified or arbitrary fake Bearer tokens MUST NOT create a new identity key (prevents rate limit bypass).
+    // If token verification fails or no token is provided, strictly bind identity to client IP.
     let identityKey: string;
     if (authHeader && authHeader.startsWith('Bearer ')) {
-      const tokenString = authHeader.substring(7).trim();
       try {
-        // Attempt quick non-blocking verification or token hashing
-        const tokenHash = crypto.createHash('sha256').update(tokenString).digest('hex').slice(0, 16);
-        identityKey = `auth_${tokenHash}`;
+        const decoded = await verifyFirebaseBearerToken(authHeader);
+        if (decoded && decoded.uid) {
+          identityKey = `user_${decoded.uid}`;
+        } else {
+          identityKey = `ip_${ip}`;
+        }
       } catch {
+        // Token invalid or fake: Fallback strictly to client IP identity so rotating fake Bearer tokens cannot bypass guest quota
         identityKey = `ip_${ip}`;
       }
     } else {

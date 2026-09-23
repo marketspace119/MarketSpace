@@ -21,14 +21,14 @@ service cloud.firestore {
     }
 
     function isSuperAdmin() {
-      return isSignedIn() && (
-        (('email' in request.auth.token &&
-          (request.auth.token.email == 'spacecompanies119@gmail.com' ||
-           request.auth.token.email == 'marketspace119@gmail.com')) &&
-         ('email_verified' in request.auth.token && request.auth.token.email_verified == true)) ||
-        (exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
-         get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'SUPER_ADMIN')
-      );
+      return isSignedIn() &&
+        ('email_verified' in request.auth.token && request.auth.token.email_verified == true) && (
+          (('email' in request.auth.token &&
+            (request.auth.token.email == 'spacecompanies119@gmail.com' ||
+             request.auth.token.email == 'marketspace119@gmail.com'))) ||
+          (exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+           get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'SUPER_ADMIN')
+        );
     }
 
     function isAdmin() {
@@ -110,7 +110,8 @@ service cloud.firestore {
          (!('commissionRate' in incoming()) || incoming().commissionRate >= 10))
       );
       allow update: if isSignedIn() && (
-        isAdmin() ||
+        isSuperAdmin() ||
+        (isAdmin() && incoming().sellerId == existing().sellerId) ||
         (resource.data.sellerId == request.auth.uid &&
          incoming().sellerId == existing().sellerId &&
          incoming().diff(existing()).affectedKeys().hasOnly([
@@ -130,7 +131,11 @@ service cloud.firestore {
         isAdmin() ||
         (incoming().sellerId == request.auth.uid &&
          incoming().price is number && incoming().price >= 0 &&
-         incoming().stock is number && incoming().stock >= 0)
+         incoming().stock is number && incoming().stock >= 0 &&
+         (incoming().status in ['active', 'draft', 'pending', 'ACTIVE', 'DRAFT', 'PENDING']) &&
+         (!('salesCount' in incoming()) || incoming().salesCount == 0) &&
+         (!('rating' in incoming()) || incoming().rating == 0) &&
+         (!('reviewCount' in incoming()) || incoming().reviewCount == 0))
       );
       allow update: if isSignedIn() && (
         isAdmin() ||
@@ -258,18 +263,26 @@ service cloud.firestore {
          ('sellerId' in resource.data && resource.data.sellerId == request.auth.uid)) ||
         isAdmin()
       );
-      allow create: if isSignedIn() && incoming().customerId == request.auth.uid;
+      allow create: if isSignedIn() &&
+        incoming().customerId == request.auth.uid &&
+        (incoming().status in ['requested', 'pending']) &&
+        incoming().price is number && incoming().price >= 0 &&
+        incoming().sellerId is string &&
+        incoming().serviceId is string;
       allow update: if isSignedIn() && (
         isAdmin() ||
         (resource.data.customerId == request.auth.uid &&
          incoming().customerId == existing().customerId &&
-         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt'])) ||
+         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt']) &&
+         incoming().status == 'cancelled') ||
         (('providerId' in resource.data && resource.data.providerId == request.auth.uid) &&
          incoming().customerId == existing().customerId &&
-         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'time', 'date', 'notes', 'updatedAt'])) ||
+         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'time', 'date', 'notes', 'updatedAt']) &&
+         (incoming().status in ['accepted', 'scheduled', 'in_progress', 'completed', 'cancelled'])) ||
         (('sellerId' in resource.data && resource.data.sellerId == request.auth.uid) &&
          incoming().customerId == existing().customerId &&
-         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'time', 'date', 'notes', 'updatedAt']))
+         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'time', 'date', 'notes', 'updatedAt']) &&
+         (incoming().status in ['accepted', 'scheduled', 'in_progress', 'completed', 'cancelled']))
       );
       allow delete: if isAdmin();
     }
@@ -279,7 +292,10 @@ service cloud.firestore {
       allow get: if true;
       allow list: if true;
       allow create: if isSignedIn() &&
-        (incoming().customerId == request.auth.uid || incoming().userId == request.auth.uid) &&
+        (!('customerId' in incoming()) || incoming().customerId == request.auth.uid) &&
+        (!('userId' in incoming()) || incoming().userId == request.auth.uid) &&
+        (('customerId' in incoming()) || ('userId' in incoming())) &&
+        (!('isVerifiedPurchase' in incoming()) || incoming().isVerifiedPurchase == false || isAdmin()) &&
         incoming().rating is number &&
         incoming().rating >= 1 &&
         incoming().rating <= 5 &&
@@ -288,7 +304,9 @@ service cloud.firestore {
       allow update: if isSignedIn() && (
         isAdmin() ||
         ((resource.data.customerId == request.auth.uid || resource.data.userId == request.auth.uid) &&
-         (incoming().customerId == existing().customerId || incoming().userId == existing().userId) &&
+         (!('customerId' in incoming()) || incoming().customerId == existing().customerId) &&
+         (!('userId' in incoming()) || incoming().userId == existing().userId) &&
+         (!('isVerifiedPurchase' in incoming()) || incoming().isVerifiedPurchase == existing().isVerifiedPurchase) &&
          incoming().diff(existing()).affectedKeys().hasOnly(['rating', 'comment', 'updatedAt'])) ||
         // Seller reply to customer review: Must be the verified seller of this product/review
         (('sellerId' in resource.data && resource.data.sellerId == request.auth.uid) &&
@@ -368,24 +386,35 @@ service cloud.firestore {
         (incoming().sellerId == request.auth.uid &&
          incoming().orderId is string &&
          exists(/databases/$(database)/documents/orders/$(incoming().orderId)) &&
-         (request.auth.uid in get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.sellerIds))
+         (request.auth.uid in get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.sellerIds) &&
+         (!('customerId' in incoming()) || incoming().customerId == get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.customerId) &&
+         (incoming().status in ['pending', 'assigned', 'preparing', 'ready', 'PENDING', 'ASSIGNED', 'PREPARING', 'READY']))
       );
       allow update: if isSignedIn() && (
         isAdmin() ||
-        (resource.data.sellerId == request.auth.uid &&
-         incoming().sellerId == existing().sellerId &&
-         incoming().orderId == existing().orderId &&
-         incoming().diff(existing()).affectedKeys().hasOnly([
-           'driverId', 'assignedDriver', 'driverPhone', 'vehicleInfo', 'deliveryType',
-           'status', 'timestamps', 'notes', 'updatedAt', 'proof'
-         ]) &&
-         (incoming().status in ['pending', 'assigned', 'preparing', 'ready', 'picked_up', 'out_for_delivery', 'delivered', 'failed', 'cancelled'])) ||
-        (('driverId' in resource.data && resource.data.driverId == request.auth.uid) &&
-         incoming().driverId == existing().driverId &&
-         incoming().sellerId == existing().sellerId &&
-         incoming().orderId == existing().orderId &&
-         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'timestamps', 'notes', 'updatedAt', 'proof']) &&
-         (incoming().status in ['pending', 'assigned', 'preparing', 'ready', 'picked_up', 'out_for_delivery', 'delivered', 'failed', 'cancelled']))
+        (!(existing().status in ['delivered', 'cancelled', 'DELIVERED', 'CANCELLED']) &&
+         ((resource.data.sellerId == request.auth.uid &&
+           incoming().sellerId == existing().sellerId &&
+           incoming().orderId == existing().orderId &&
+           (!('customerId' in existing()) || incoming().customerId == existing().customerId) &&
+           incoming().diff(existing()).affectedKeys().hasOnly([
+             'driverId', 'assignedDriver', 'driverPhone', 'vehicleInfo', 'deliveryType',
+             'status', 'timestamps', 'notes', 'updatedAt', 'proof'
+           ]) &&
+           (incoming().status in [
+             'pending', 'assigned', 'preparing', 'ready', 'picked_up', 'out_for_delivery', 'delivered', 'failed', 'cancelled',
+             'PENDING', 'ASSIGNED', 'PREPARING', 'READY', 'PICKED_UP', 'OUT_FOR_DELIVERY', 'DELIVERED', 'FAILED', 'CANCELLED'
+           ])) ||
+          (('driverId' in resource.data && resource.data.driverId == request.auth.uid) &&
+           incoming().driverId == existing().driverId &&
+           incoming().sellerId == existing().sellerId &&
+           incoming().orderId == existing().orderId &&
+           (!('customerId' in existing()) || incoming().customerId == existing().customerId) &&
+           incoming().diff(existing()).affectedKeys().hasOnly(['status', 'timestamps', 'notes', 'updatedAt', 'proof']) &&
+           (incoming().status in [
+             'pending', 'assigned', 'preparing', 'ready', 'picked_up', 'out_for_delivery', 'delivered', 'failed', 'cancelled',
+             'PENDING', 'ASSIGNED', 'PREPARING', 'READY', 'PICKED_UP', 'OUT_FOR_DELIVERY', 'DELIVERED', 'FAILED', 'CANCELLED'
+           ]))))
       );
       allow delete: if isAdmin();
     }
@@ -532,7 +561,11 @@ service cloud.firestore {
     // 25. Ad Campaigns (Activation strictly admin-controlled)
     match /campaigns/{campaignId} {
       allow get, list: if true;
-      allow create: if isSignedIn() && (incoming().sellerId == request.auth.uid || incoming().advertiserId == request.auth.uid) && (incoming().status in ['DRAFT', 'PENDING_REVIEW']);
+      allow create: if isSignedIn() &&
+        (incoming().sellerId == request.auth.uid || incoming().advertiserId == request.auth.uid) &&
+        (incoming().status in ['DRAFT', 'PENDING_REVIEW']) &&
+        (!('spent' in incoming()) || incoming().spent == 0) &&
+        (!('paymentStatus' in incoming()) || incoming().paymentStatus in ['UNPAID', 'PENDING', 'pending', 'unpaid']);
       allow update: if isAdmin() || (
         isSignedIn() &&
         (resource.data.sellerId == request.auth.uid || resource.data.advertiserId == request.auth.uid) &&
@@ -544,7 +577,11 @@ service cloud.firestore {
     // Compatibility alias for adCampaigns
     match /adCampaigns/{campaignId} {
       allow get, list: if true;
-      allow create: if isSignedIn() && (incoming().sellerId == request.auth.uid || incoming().advertiserId == request.auth.uid) && (incoming().status in ['DRAFT', 'PENDING_REVIEW']);
+      allow create: if isSignedIn() &&
+        (incoming().sellerId == request.auth.uid || incoming().advertiserId == request.auth.uid) &&
+        (incoming().status in ['DRAFT', 'PENDING_REVIEW']) &&
+        (!('spent' in incoming()) || incoming().spent == 0) &&
+        (!('paymentStatus' in incoming()) || incoming().paymentStatus in ['UNPAID', 'PENDING', 'pending', 'unpaid']);
       allow update: if isAdmin() || (
         isSignedIn() &&
         (resource.data.sellerId == request.auth.uid || resource.data.advertiserId == request.auth.uid) &&
@@ -569,7 +606,11 @@ service cloud.firestore {
       );
       // Direct client creation strictly DENIED; Admin SDK gateway only
       allow create: if false;
-      allow update: if isSuperAdmin();
+      allow update: if isSuperAdmin() &&
+        incoming().orderId == existing().orderId &&
+        incoming().amount == existing().amount &&
+        incoming().customerId == existing().customerId &&
+        incoming().sellerId == existing().sellerId;
       allow delete: if false;
     }
 

@@ -9,8 +9,22 @@ const FREE_SHIPPING_STORE_THRESHOLD = 50.0;
 const DEFAULT_STORE_DELIVERY_FEE = 2.0;
 const DEFAULT_COMMISSION_RATE = 10.0;
 
-// Transient in-flight locking only to prevent simultaneous race conditions on the same instance
-const inFlightRequests = new Set<string>();
+// Transient in-flight locking with TTL to prevent simultaneous race conditions and deadlocks
+const IN_FLIGHT_LOCK_TTL_MS = 60 * 1000; // 60 seconds TTL
+const inFlightRequests = new Map<string, number>();
+
+function acquireInFlightLock(key: string): void {
+  const now = Date.now();
+  const existingTime = inFlightRequests.get(key);
+  if (existingTime && (now - existingTime) < IN_FLIGHT_LOCK_TTL_MS) {
+    throw new Error('A concurrent order request with this idempotency key is currently processing. Please wait.');
+  }
+  inFlightRequests.set(key, now);
+}
+
+function releaseInFlightLock(key: string): void {
+  inFlightRequests.delete(key);
+}
 
 export interface GatewayOrderRequest {
   items: Array<{
@@ -228,10 +242,7 @@ export async function processOrderGateway(
 
   // In-flight concurrent request deduplication
   if (idempotencyCompositeKey) {
-    if (inFlightRequests.has(idempotencyCompositeKey)) {
-      throw new Error('A concurrent order request with this idempotency key is currently processing. Please wait.');
-    }
-    inFlightRequests.add(idempotencyCompositeKey);
+    acquireInFlightLock(idempotencyCompositeKey);
   }
 
   // 3. Validate essential customer fields
@@ -435,9 +446,36 @@ export async function processOrderGateway(
     if (!isNotExpired) {
       throw new Error(`Coupon code '${payload.couponCode}' has expired`);
     }
-    const meetsMinOrder = !coupon.minOrderAmount || serverCalculatedSubtotal >= coupon.minOrderAmount;
+    // Scope verification: check seller, store, and category restrictions
+    let eligibleItems = verifiedOrderItems;
+    if (coupon.sellerId) {
+      eligibleItems = eligibleItems.filter(it => it.sellerId === coupon.sellerId || it.product.sellerId === coupon.sellerId);
+      if (eligibleItems.length === 0) {
+        throw new Error(`Coupon '${payload.couponCode}' is not applicable to any items in this order`);
+      }
+    }
+    if (coupon.storeId) {
+      eligibleItems = eligibleItems.filter(it => it.storeId === coupon.storeId);
+      if (eligibleItems.length === 0) {
+        throw new Error(`Coupon '${payload.couponCode}' is only valid for store #${coupon.storeId}`);
+      }
+    }
+    if (coupon.applicableCategory) {
+      eligibleItems = eligibleItems.filter(it => it.product.category === coupon.applicableCategory);
+      if (eligibleItems.length === 0) {
+        throw new Error(`Coupon '${payload.couponCode}' is only valid for category '${coupon.applicableCategory}'`);
+      }
+    }
+
+    const eligibleSubtotal = eligibleItems.reduce((sum, it) => {
+      const base = Number(it.product.price) || 0;
+      const addons = it.selectedAddons?.reduce((aSum, a) => aSum + (Number(a.price) || 0), 0) || 0;
+      return sum + (base + addons) * it.quantity;
+    }, 0);
+
+    const meetsMinOrder = !coupon.minOrderAmount || eligibleSubtotal >= coupon.minOrderAmount;
     if (!meetsMinOrder) {
-      throw new Error(`Minimum order amount of $${coupon.minOrderAmount} required for coupon '${payload.couponCode}'`);
+      throw new Error(`Minimum eligible order amount of $${coupon.minOrderAmount} required for coupon '${payload.couponCode}'`);
     }
     if (typeof coupon.usageLimit === 'number' && coupon.usageLimit > 0) {
       const usedCount = Number(coupon.usedCount) || 0;
@@ -454,7 +492,7 @@ export async function processOrderGateway(
 
     let discount = 0;
     if (coupon.discountType === 'percentage') {
-      discount = (serverCalculatedSubtotal * (Number(coupon.discountValue) || 0)) / 100;
+      discount = (eligibleSubtotal * (Number(coupon.discountValue) || 0)) / 100;
       if (coupon.maxDiscountAmount && discount > coupon.maxDiscountAmount) {
         discount = coupon.maxDiscountAmount;
       }
@@ -462,9 +500,19 @@ export async function processOrderGateway(
       discount = Number(coupon.discountValue) || 0;
     }
 
-    serverCalculatedDiscount = Math.min(serverCalculatedSubtotal, Number(discount.toFixed(2)));
+    serverCalculatedDiscount = Math.min(eligibleSubtotal, Number(discount.toFixed(2)));
     verifiedCouponCode = coupon.code;
     verifiedCouponDocId = (coupon as any)._docId;
+
+    if (coupon.storeId || coupon.sellerId) {
+      const targetVendorOrder = vendorOrders.find(
+        vo => (coupon.storeId && vo.storeId === coupon.storeId) || (coupon.sellerId && vo.sellerId === coupon.sellerId)
+      );
+      if (targetVendorOrder) {
+        targetVendorOrder.discount = serverCalculatedDiscount;
+        targetVendorOrder.total = Math.max(0, Number((targetVendorOrder.subtotal + targetVendorOrder.deliveryFee - serverCalculatedDiscount).toFixed(2)));
+      }
+    }
   }
 
   // 7. Server-Side Final Grand Total
@@ -614,6 +662,7 @@ export async function processOrderGateway(
           orderId: finalOrder.orderId,
           order: cleanOrderPayload,
           createdAt: now,
+          expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
         });
       }
 
@@ -638,7 +687,7 @@ export async function processOrderGateway(
     );
   } finally {
     if (idempotencyCompositeKey) {
-      inFlightRequests.delete(idempotencyCompositeKey);
+      releaseInFlightLock(idempotencyCompositeKey);
     }
   }
 }
@@ -735,8 +784,11 @@ export async function processSubOrderUpdateGateway(
 
   let nextOrderStatus = orderData.status;
   const allDelivered = updatedVendorOrders.every((s: any) => s.status === 'delivered' || s.status === 'completed');
+  const allCancelled = updatedVendorOrders.length > 0 && updatedVendorOrders.every((s: any) => s.status === 'cancelled');
   if (allDelivered) {
     nextOrderStatus = 'delivered';
+  } else if (allCancelled) {
+    nextOrderStatus = 'cancelled';
   } else if (updatedVendorOrders.some((s: any) =>
     s.status === 'preparing' ||
     s.status === 'in_progress' ||

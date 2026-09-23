@@ -134,9 +134,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
           if (userDocSnap.exists()) {
             const data = userDocSnap.data() as User;
-            // Elevate if present in admin collection or platform owner email
+            // Elevate if present in admin collection or platform owner email (STRICT REQUIREMENT: email_verified === true)
             let effectiveRole = data.role;
-            if (adminDocSnap.exists() || fbUser.email === 'spacecompanies119@gmail.com') {
+            const isVerifiedOwner = fbUser.emailVerified === true &&
+              (fbUser.email === 'spacecompanies119@gmail.com' || fbUser.email === 'marketspace119@gmail.com');
+            if (adminDocSnap.exists() || isVerifiedOwner) {
               effectiveRole = 'SUPER_ADMIN';
             }
             const updatedUser: User = {
@@ -152,7 +154,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           } else {
             // Initial user record creation in Firestore
             let initialRole: UserRole = 'CUSTOMER';
-            if (adminDocSnap.exists() || fbUser.email === 'spacecompanies119@gmail.com') {
+            const isVerifiedOwner = fbUser.emailVerified === true &&
+              (fbUser.email === 'spacecompanies119@gmail.com' || fbUser.email === 'marketspace119@gmail.com');
+            if (adminDocSnap.exists() || isVerifiedOwner) {
               initialRole = 'SUPER_ADMIN';
             }
             const newUser: User = {

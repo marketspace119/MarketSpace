@@ -126,8 +126,16 @@ export async function handleSellerAssistant(params: {
   let storeName = 'Seller Store';
 
   if (adminDb) {
-    const storesSnap = await adminDb.collection('stores').where('sellerId', '==', caller.uid).get();
-    const ownedStores = storesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    let ownedStores: any[] = [];
+    try {
+      const storesSnap = await adminDb.collection('stores').where('sellerId', '==', caller.uid).get();
+      ownedStores = storesSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+    } catch (e: any) {
+      console.warn('[AISellerAssistant] Stores read warning:', e?.message || e);
+      if (!caller.isPlatformAdmin) {
+        throw new Error('Forbidden: You do not have permission to access data for this store.');
+      }
+    }
 
     if (ownedStores.length === 0 && !caller.isPlatformAdmin) {
       throw new Error('Forbidden: You do not have an active seller store registered on MarketSpace.');
@@ -233,12 +241,20 @@ export async function handleCustomerAssistant(params: {
 
   // If customer is inquiring about a specific order, verify ownership
   if (orderId && adminDb) {
-    const orderDoc = await adminDb.collection('orders').doc(orderId).get();
-    if (!orderDoc.exists) {
-      throw new Error(`Order ${orderId} not found.`);
+    let rawOrder: any = null;
+    try {
+      const orderDoc = await adminDb.collection('orders').doc(orderId).get();
+      if (!orderDoc.exists) {
+        throw new Error(`Order ${orderId} not found.`);
+      }
+      rawOrder = orderDoc.data();
+    } catch (e: any) {
+      if (e.message?.includes('not found')) {
+        throw e;
+      }
+      throw new Error('Forbidden: You are not authorized to view details for this order.');
     }
 
-    const rawOrder = orderDoc.data();
     if (rawOrder?.customerId !== caller.uid && !caller.isPlatformAdmin) {
       await logAIAction({
         actorId: caller.uid,
@@ -315,6 +331,7 @@ export async function handleSmartSearch(params: {
   products: any[];
 }> {
   const { query: rawQuery, limit = 10 } = params;
+  const safeLimit = Math.min(50, Math.max(1, Number(limit) || 10));
   const cleanQuery = sanitizeUserPrompt(rawQuery, 200);
 
   if (!cleanQuery) {
@@ -377,7 +394,7 @@ Analyze this shopping query. Return JSON format with fields:
           const lk = k.toLowerCase();
           return titleStr.includes(lk) || descStr.includes(lk) || catStr.includes(lk);
         });
-      }).slice(0, limit).map(p => minimizeProductForAI(p));
+      }).slice(0, safeLimit).map(p => minimizeProductForAI(p));
     } catch (e: any) {
       console.warn('[AISmartSearch] Product query warning:', e?.message || e);
     }

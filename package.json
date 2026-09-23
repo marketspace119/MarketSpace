@@ -14,7 +14,8 @@
     "test:integration": "firebase emulators:exec --only firestore,storage \"tsx tests/integration_suite.ts\"",
     "test:security": "tsx tests/security_financial_audit.ts",
     "test:adversarial": "firebase emulators:exec --only firestore,storage \"tsx tests/security_adversarial_suite.ts\"",
-    "test:incremental": "firebase emulators:exec --only firestore,storage \"tsx tests/incremental_security_regression_suite.ts\""
+    "test:incremental": "firebase emulators:exec --only firestore,storage \"tsx tests/incremental_security_regression_suite.ts\"",
+    "test:ai": "tsx tests/ai_security_suite.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

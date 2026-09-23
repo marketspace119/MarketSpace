@@ -56,7 +56,7 @@ export function getServerIdentityInfo() {
   return {
     projectId: config.projectId,
     firestoreDatabaseId: config.firestoreDatabaseId,
-    serviceAccountEmail: process.env.AUTHORIZED_SERVICE_ACCOUNT_EMAIL || 'ais-sandbox@ais-europe-west2-770ff5a4ade84.iam.gserviceaccount.com',
+    serviceAccountEmail: process.env.AUTHORIZED_SERVICE_ACCOUNT_EMAIL || `ais-sandbox@${config.projectId}.iam.gserviceaccount.com`,
     cloudRunService: process.env.K_SERVICE || 'unknown',
     cloudRunRevision: process.env.K_REVISION || 'unknown',
     nodeEnv: process.env.NODE_ENV || 'development',

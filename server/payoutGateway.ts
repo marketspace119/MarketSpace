@@ -171,8 +171,22 @@ export interface CreatePayoutGatewayRequest {
   notes?: string;
 }
 
-// In-flight mutex per sellerId to prevent simultaneous double-withdrawal race conditions
-const inFlightSellerPayouts = new Set<string>();
+// In-flight mutex per sellerId with TTL to prevent simultaneous double-withdrawal race conditions and deadlocks
+const IN_FLIGHT_PAYOUT_TTL_MS = 60 * 1000; // 60 seconds TTL
+const inFlightSellerPayouts = new Map<string, number>();
+
+function acquireSellerPayoutLock(sellerId: string): void {
+  const now = Date.now();
+  const existingTime = inFlightSellerPayouts.get(sellerId);
+  if (existingTime && (now - existingTime) < IN_FLIGHT_PAYOUT_TTL_MS) {
+    throw new Error('A payout request for this seller account is currently being processed. Please wait.');
+  }
+  inFlightSellerPayouts.set(sellerId, now);
+}
+
+function releaseSellerPayoutLock(sellerId: string): void {
+  inFlightSellerPayouts.delete(sellerId);
+}
 
 export async function processPayoutGateway(
   payload: CreatePayoutGatewayRequest,
@@ -219,10 +233,7 @@ export async function processPayoutGateway(
   const sellerId = payload.sellerId;
 
   // Concurrency Guard: Block concurrent requests for the same seller
-  if (inFlightSellerPayouts.has(sellerId)) {
-    throw new Error('A payout request for this seller account is currently being processed. Please wait.');
-  }
-  inFlightSellerPayouts.add(sellerId);
+  acquireSellerPayoutLock(sellerId);
 
   try {
     const adminDb = getAdminDb();
@@ -343,6 +354,10 @@ export async function processPayoutGateway(
 
       const newReserved = Number((totalReservedOrPaid + amount).toFixed(2));
 
+      const maskedAccount = cleanAccountNumber.length > 4
+        ? `${'*'.repeat(Math.min(cleanAccountNumber.length - 4, 8))}${cleanAccountNumber.slice(-4)}`
+        : `****${cleanAccountNumber.slice(-2)}`;
+
       const newPayout: PayoutRequest = {
         id: payoutId,
         sellerId,
@@ -352,7 +367,7 @@ export async function processPayoutGateway(
         amount,
         paymentMethod: payload.paymentMethod,
         settlementType: 'MANUAL_SETTLEMENT',
-        accountNumber: cleanAccountNumber,
+        accountNumber: maskedAccount,
         accountName: cleanAccountName,
         status: 'pending',
         requestedAt: now,
@@ -383,6 +398,6 @@ export async function processPayoutGateway(
     console.error(`[PayoutGateway:Error] Failed to process payout for seller ${sellerId}:`, err?.message || err);
     throw err;
   } finally {
-    inFlightSellerPayouts.delete(sellerId);
+    releaseSellerPayoutLock(sellerId);
   }
 }

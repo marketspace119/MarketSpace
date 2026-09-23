@@ -4,6 +4,7 @@ export interface SubmitPaymentReferencePayload {
   orderId: string;
   method: 'evc_plus' | 'zaad' | 'sahall';
   amount?: number;
+  currency?: string;
   referenceNumber: string;
   senderPhone: string;
   customerId?: string;
@@ -126,6 +127,17 @@ export async function processPaymentReferenceSubmissionGateway(
         }
       }
 
+      // Enforce currency integrity between client submission and authoritative order
+      const orderCurrency = (orderData.currency || 'USD').toUpperCase();
+      if (payload.currency) {
+        const clientCurrency = payload.currency.trim().toUpperCase();
+        if (clientCurrency !== orderCurrency) {
+          const err = new Error(`عملة إشعار الدفع (${clientCurrency}) لا تطابق عملة الطلب المعتمدة (${orderCurrency}).`);
+          (err as any).statusCode = 400;
+          throw err;
+        }
+      }
+
       // 3. Write: Create unique reservation
       transaction.set(refDocRef, {
         normalizedRef,
@@ -133,6 +145,7 @@ export async function processPaymentReferenceSubmissionGateway(
         orderId,
         customerId: caller.uid, // Authoritative UID derived strictly from token
         amount: orderData.total, // Authoritative amount derived strictly from order
+        currency: orderCurrency,
         method: payload.method,
         senderPhone: payload.senderPhone || '',
         status: 'PENDING',
@@ -148,6 +161,7 @@ export async function processPaymentReferenceSubmissionGateway(
         customerId: caller.uid, // Authoritative UID
         method: payload.method,
         amount: orderData.total, // Authoritative total
+        currency: orderCurrency,
         referenceNumber: cleanRef,
         senderPhone: payload.senderPhone || '',
         status: 'PAYMENT_REFERENCE_SUBMITTED', // Customer cannot set CONFIRMED
@@ -306,8 +320,11 @@ export async function processPaymentReviewGateway(
         throw err;
       }
 
-      if (subData.currency && orderData.currency && subData.currency.toUpperCase() !== orderData.currency.toUpperCase()) {
-        const err = new Error(`عملة إشعار الدفع (${subData.currency}) لا تطابق عملة الطلب (${orderData.currency}).`);
+      // Mandatory currency validation: Authoritative submission currency must match order currency
+      const subCurrency = (subData.currency || 'USD').toUpperCase();
+      const orderCurrency = (orderData.currency || 'USD').toUpperCase();
+      if (subCurrency !== orderCurrency) {
+        const err = new Error(`عملة إشعار الدفع (${subCurrency}) لا تطابق عملة الطلب المعتمدة (${orderCurrency}).`);
         (err as any).statusCode = 400;
         throw err;
       }
@@ -371,6 +388,8 @@ export async function processPaymentReviewGateway(
       transaction.update(orderDocRef, {
         paymentStatus: 'paid',
         status: orderData.status === 'pending' ? 'confirmed' : orderData.status,
+        paymentSubmissionId: submissionId || orderData.paymentSubmissionId || null,
+        paymentReferenceNumber: cleanRef || orderData.paymentReferenceNumber || null,
         ...(updatedVendorOrders ? { vendorOrders: updatedVendorOrders } : {}),
         updatedAt: now,
       });

@@ -23,6 +23,59 @@ async function startServer() {
   // Protect against huge payload attacks
   app.use(express.json({ limit: '100kb' }));
 
+  // CSRF / Origin Verification Middleware for Mutating Endpoints
+  app.use((req, res, next) => {
+    const mutatingMethods = ['POST', 'PUT', 'DELETE', 'PATCH'];
+    if (!mutatingMethods.includes(req.method)) {
+      return next();
+    }
+
+    const origin = req.headers.origin;
+    const host = req.headers.host;
+
+    if (origin) {
+      try {
+        const originUrl = new URL(origin);
+        const isSameHost = originUrl.host === host;
+        const isLocal = originUrl.hostname === 'localhost' || originUrl.hostname === '127.0.0.1';
+        const isAiStudio = originUrl.hostname.endsWith('.google.com') || originUrl.hostname.endsWith('.run.app');
+
+        if (!isSameHost && !isLocal && !isAiStudio) {
+          console.warn(`[CSRF Guard] Blocked cross-origin mutating request: Origin=${origin}, Host=${host}`);
+          return res.status(403).json({ success: false, error: 'Forbidden: Cross-origin request rejected' });
+        }
+      } catch {
+        return res.status(400).json({ success: false, error: 'Invalid origin header' });
+      }
+    }
+
+    next();
+  });
+
+  // Helper to safely map internal database/system errors to safe responses without leaking internals
+  function sanitizeGatewayError(err: any, fallbackMessage: string): { statusCode: number; safeMessage: string } {
+    const msg = err?.message || '';
+    const isAuth = msg.includes('Authentication') || (msg.includes('token') && (msg.includes('missing') || msg.includes('Invalid') || msg.includes('expired')));
+    const isForbidden = msg.includes('Forbidden') || msg.includes('not authorized') || msg.includes('do not have permission');
+    const isNotFound = msg.includes('not found');
+    const isDbOrInternal =
+      msg.includes('Database') ||
+      msg.includes('Firestore') ||
+      msg.includes('temporarily unavailable') ||
+      msg.includes('Fail-Closed') ||
+      msg.includes('credentials') ||
+      msg.includes('PERMISSION_DENIED') ||
+      msg.includes('ETIMEDOUT') ||
+      msg.includes('ECONNREFUSED');
+
+    if (isForbidden) return { statusCode: 403, safeMessage: msg };
+    if (isAuth) return { statusCode: 401, safeMessage: msg };
+    if (isNotFound) return { statusCode: 404, safeMessage: msg };
+    if (isDbOrInternal) return { statusCode: 503, safeMessage: 'Service temporarily unavailable. Please try again later.' };
+
+    return { statusCode: 400, safeMessage: msg || fallbackMessage };
+  }
+
   // 1. Health check endpoint
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -48,10 +101,10 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[API /api/orders/create] Error:', err.message);
-      const statusCode = err.message?.includes('Authentication failed') ? 401 : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to process order securely');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to process order securely',
+        error: safeMessage,
       });
     }
   });
@@ -65,12 +118,10 @@ async function startServer() {
       return res.status(200).json(result);
     } catch (err: any) {
       console.error('[API /api/orders/update-suborder] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to update sub-order');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to update sub-order',
+        error: safeMessage,
       });
     }
   });
@@ -87,13 +138,10 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[API /api/payouts/create] Error:', err.message);
-      const isAuthError =
-        err.message?.includes('Authentication') ||
-        err.message?.includes('Forbidden');
-      const statusCode = isAuthError ? (err.message?.includes('Forbidden') ? 403 : 401) : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to process payout request');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to process payout request',
+        error: safeMessage,
       });
     }
   });
@@ -110,21 +158,10 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[API /api/refunds/create] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const isDbOrUnavailable =
-        err.message?.includes('Database') ||
-        err.message?.includes('temporarily unavailable') ||
-        err.message?.includes('Firestore') ||
-        err.message?.includes('credentials') ||
-        err.message?.includes('PERMISSION_DENIED');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : isDbOrUnavailable ? 503 : 400;
-      const safeErrorMessage = isDbOrUnavailable
-        ? 'Refund service temporarily unavailable. Please try again.'
-        : (err.message || 'Failed to process refund request');
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to process refund request');
       return res.status(statusCode).json({
         success: false,
-        error: safeErrorMessage,
+        error: safeMessage,
       });
     }
   });
@@ -141,12 +178,10 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[API /api/seller/financial-summary] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to retrieve financial summary');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to retrieve financial summary',
+        error: safeMessage,
       });
     }
   });
@@ -284,6 +319,16 @@ async function startServer() {
         });
       }
 
+      if (actionType && !['summary', 'product_copy', 'performance', 'inventory_advice'].includes(actionType)) {
+        return res.status(400).json({ success: false, error: 'Invalid actionType' });
+      }
+      if (storeId && (typeof storeId !== 'string' || storeId.length > 100)) {
+        return res.status(400).json({ success: false, error: 'Invalid storeId' });
+      }
+      if (orderId && (typeof orderId !== 'string' || orderId.length > 100)) {
+        return res.status(400).json({ success: false, error: 'Invalid orderId' });
+      }
+
       const caller = await requireAuthenticatedCaller(authHeader);
 
       if (mode === 'business') {
@@ -293,12 +338,16 @@ async function startServer() {
         const result = await handleSellerAssistant({
           caller,
           prompt,
-          storeId,
+          storeId: storeId ? String(storeId).trim() : undefined,
           actionType: actionType || 'summary',
         });
         return res.status(200).json({ success: true, ...result });
       } else if (mode === 'customer') {
-        const result = await handleCustomerAssistant({ caller, prompt, orderId });
+        const result = await handleCustomerAssistant({
+          caller,
+          prompt,
+          orderId: orderId ? String(orderId).trim() : undefined,
+        });
         return res.status(200).json({ success: true, ...result });
       } else {
         return res.status(400).json({
@@ -352,10 +401,12 @@ async function startServer() {
         }
       }
 
+      const safeLimit = limit !== undefined ? Math.min(50, Math.max(1, Number(limit) || 10)) : 10;
+
       const result = await handleSmartSearch({
         query,
         caller,
-        limit: Number(limit) || 10,
+        limit: safeLimit,
       });
 
       return res.status(200).json({ success: true, ...result });

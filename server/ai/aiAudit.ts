@@ -17,9 +17,9 @@ export interface AIAuditParams {
  * Writes an authoritative append-only record to canonical 'audit_logs' collection.
  * Strictly guarantees that API keys, sensitive passwords, and PII are never persisted in logs.
  */
-export async function logAIAction(params: AIAuditParams): Promise<void> {
+export async function logAIAction(params: AIAuditParams): Promise<{ success: boolean; id?: string; error?: string }> {
   const adminDb = getAdminDb();
-  if (!adminDb) return;
+  if (!adminDb) return { success: false, error: 'Database unavailable' };
 
   try {
     const docRef = adminDb.collection('audit_logs').doc();
@@ -50,8 +50,11 @@ export async function logAIAction(params: AIAuditParams): Promise<void> {
       metadata: safeMetadata,
       timestamp: now,
     });
+
+    return { success: true, id: docRef.id };
   } catch (err: any) {
-    // Fail-safe logging: log error but do not crash user flow unless critical
+    // Observable failure logging
     console.error('[AIAudit:Error] Failed to persist AI audit log to Firestore:', err?.message || err);
+    return { success: false, error: err?.message || 'Failed to persist audit log' };
   }
 }

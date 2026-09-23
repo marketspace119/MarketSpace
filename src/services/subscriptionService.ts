@@ -261,7 +261,7 @@ export const subscriptionService = {
     const endDate = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
 
     const isFree = plan.tier === 'FREE' || plan.price === 0;
-    const initialStatus: SubscriptionStatus = isFree ? 'ACTIVE' : (params.paymentReference ? 'PENDING_REVIEW' : 'PENDING_PAYMENT');
+    const initialStatus: SubscriptionStatus = params.paymentReference ? 'PENDING_REVIEW' : 'PENDING_PAYMENT';
 
     const newSub: SellerSubscription = {
       id: `SUB-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,

@@ -531,15 +531,6 @@ export const deliveryService = {
       throw err;
     }
 
-    // Only update local memory after Firestore write succeeds
-    // Await authoritative Firestore update first (Fail-Closed)
-    try {
-      await setDoc(doc(db, DELIVERY_COLLECTION, params.assignmentId), updated, { merge: true });
-    } catch (err: any) {
-      handleFirestoreError(err, OperationType.UPDATE, `${DELIVERY_COLLECTION}/${params.assignmentId}`);
-      throw err;
-    }
-
     // Only commit to local memory after Firestore write succeeds
     assignments[index] = updated;
     persistAssignments(assignments);
