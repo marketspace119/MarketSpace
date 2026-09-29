@@ -260,13 +260,14 @@ export const paymentService = {
 
     const submission: MobilePaymentSubmission = resData.submission;
 
-    // Display-only local cache (Never authoritative; display cache only)
+    // Display-only local cache (User-scoped and never authoritative - F-22)
     try {
       if (typeof localStorage !== 'undefined') {
-        const stored = localStorage.getItem('marketspace_payment_submissions_v1');
+        const storageKey = `marketspace_payment_submissions_v2_${params.customerId || submission.customerId || 'anon'}`;
+        const stored = localStorage.getItem(storageKey);
         const list: MobilePaymentSubmission[] = stored ? JSON.parse(stored) : [];
         list.unshift(submission);
-        localStorage.setItem('marketspace_payment_submissions_v1', JSON.stringify(list));
+        localStorage.setItem(storageKey, JSON.stringify(list));
       }
     } catch (e) {
       console.warn('Local payment submission cache error', e);
@@ -276,6 +277,7 @@ export const paymentService = {
   },
 
   async getAllSubmissions(currentUserId?: string, isAdmin?: boolean): Promise<MobilePaymentSubmission[]> {
+    const storageKey = `marketspace_payment_submissions_v2_${currentUserId || 'anon'}`;
     try {
       let q;
       if (isAdmin) {
@@ -292,7 +294,7 @@ export const paymentService = {
           list.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
           try {
             if (typeof localStorage !== 'undefined') {
-              localStorage.setItem('marketspace_payment_submissions_v1', JSON.stringify(list));
+              localStorage.setItem(storageKey, JSON.stringify(list));
             }
           } catch {}
           return list;
@@ -304,42 +306,33 @@ export const paymentService = {
 
     try {
       if (typeof localStorage !== 'undefined') {
-        const stored = localStorage.getItem('marketspace_payment_submissions_v1');
+        const stored = localStorage.getItem(storageKey);
         if (stored) {
-          return JSON.parse(stored);
+          const parsed = JSON.parse(stored);
+          if (isAdmin) return parsed;
+          return parsed.filter((s: MobilePaymentSubmission) => s.customerId === currentUserId);
         }
       }
     } catch {}
 
-    // Seed baseline mobile payment submission for preview display
-    const seed: MobilePaymentSubmission[] = [
-      {
-        id: 'sub_seed_01',
-        orderId: 'ORD-2025-8819',
-        customerId: 'user_customer_01',
-        method: 'zaad',
-        amount: 85.0,
-        referenceNumber: 'ZAAD-4919028',
-        senderPhone: '+252 63 4919028',
-        status: 'PAYMENT_REFERENCE_SUBMITTED',
-        createdAt: new Date(Date.now() - 3600000 * 5).toISOString(),
-      },
-      {
-        id: 'sub_seed_02',
-        orderId: 'ORD-2025-7120',
-        customerId: 'user_customer_02',
-        method: 'evc_plus',
-        amount: 42.5,
-        referenceNumber: 'EVC-8821034',
-        senderPhone: '+252 61 5544332',
-        status: 'CONFIRMED',
-        createdAt: new Date(Date.now() - 3600000 * 28).toISOString(),
-        reviewedBy: 'user_admin_01',
-        reviewedAt: new Date(Date.now() - 3600000 * 27).toISOString(),
-        notes: 'تم التحقق من استلام المبلغ في الحساب التجاري',
-      },
-    ];
-    return seed;
+    // Financial UI Integrity: Do NOT fabricate synthetic mobile payment submissions with 'CONFIRMED' status.
+    // If cloud data is not available, return empty array to reflect authoritative reality (DATA UNAVAILABLE).
+    return [];
+  },
+
+  clearUserCache(): void {
+    if (typeof localStorage !== 'undefined') {
+      try {
+        const keysToRemove: string[] = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key && (key.startsWith('marketspace_payment_submissions_') || key === 'marketspace_payment_submissions_v1')) {
+            keysToRemove.push(key);
+          }
+        }
+        keysToRemove.forEach(k => localStorage.removeItem(k));
+      } catch {}
+    }
   },
 
   /**

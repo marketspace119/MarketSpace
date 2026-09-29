@@ -81,7 +81,7 @@ USER QUESTION (UNTRUSTED INPUT):
 Analyze the authorized data above and answer the user question objectively.`;
 
   const fallback = () => {
-    return `### Business Intelligence Summary\n\n- **Recent Orders Analyzed:** ${recentOrders.length} orders in scope.\n- **Catalog Health:** ${productStats.totalProducts} active catalog items monitored (${productStats.lowStockCount} low stock alerts).\n- **Operational Condition:** Fulfillment pipelines are active. No anomalous multi-vendor settlement discrepancies detected.`;
+    return `### Business Intelligence Summary\n\n- **Recent Orders Analyzed:** ${recentOrders.length} orders in scope.\n- **Catalog Health:** ${productStats.totalProducts} active catalog items monitored (${productStats.lowStockCount} low stock alerts).\n- **Operational Condition:** Operational telemetry unverified while remote model is unavailable. Please review authoritative database ledgers directly.`;
   };
 
   const rawOutput = await callGeminiSafely({
@@ -394,7 +394,7 @@ Analyze this shopping query. Return JSON format with fields:
           const lk = k.toLowerCase();
           return titleStr.includes(lk) || descStr.includes(lk) || catStr.includes(lk);
         });
-      }).slice(0, safeLimit).map(p => minimizeProductForAI(p));
+      }).slice(0, safeLimit).map(p => minimizeProductForAI(p, true));
     } catch (e: any) {
       console.warn('[AISmartSearch] Product query warning:', e?.message || e);
     }
@@ -439,35 +439,68 @@ export async function handleReportSummarization(params: {
   const adminDb = getAdminDb();
   let metrics: Record<string, any> = { reportType, timeRange };
 
+  // Section 4: Real time-range boundaries based on ISO timestamps
+  const nowMs = Date.now();
+  let rangeDurationMs = 30 * 24 * 60 * 60 * 1000; // default 30 days
+  if (timeRange === 'last_7_days') {
+    rangeDurationMs = 7 * 24 * 60 * 60 * 1000;
+  } else if (timeRange === 'last_30_days') {
+    rangeDurationMs = 30 * 24 * 60 * 60 * 1000;
+  } else if (timeRange === 'last_90_days') {
+    rangeDurationMs = 90 * 24 * 60 * 60 * 1000;
+  }
+  const cutoffTimeMs = nowMs - rangeDurationMs;
+  metrics.cutoffIso = new Date(cutoffTimeMs).toISOString();
+
   if (adminDb) {
     try {
       if (reportType === 'sales') {
-        const ordersSnap = await adminDb.collection('orders').limit(50).get();
-        const orders = ordersSnap.docs.map(d => d.data());
-        const totalSales = orders.filter(o => o.paymentStatus === 'paid').reduce((acc, o) => acc + (Number(o.total) || 0), 0);
-        metrics.totalVolume = totalSales;
-        metrics.orderCount = orders.length;
-        metrics.paidOrderCount = orders.filter(o => o.paymentStatus === 'paid').length;
+        const ordersSnap = await adminDb.collection('orders').limit(100).get();
+        const allOrders = ordersSnap.docs.map(d => d.data());
+        // Real time-range filtering
+        const inRangeOrders = allOrders.filter(o => {
+          const t = new Date(o.createdAt || o.date || 0).getTime();
+          return !isNaN(t) && t >= cutoffTimeMs;
+        });
+
+        const paidOrders = inRangeOrders.filter(o => o.paymentStatus === 'paid');
+        const totalSales = paidOrders.reduce((acc, o) => acc + (Number(o.total) || 0), 0);
+        metrics.totalVolume = Number(totalSales.toFixed(2));
+        metrics.orderCount = inRangeOrders.length;
+        metrics.paidOrderCount = paidOrders.length;
+        metrics.unpaidOrderCount = inRangeOrders.length - paidOrders.length;
+        metrics.averageOrderValue = paidOrders.length > 0 ? Number((totalSales / paidOrders.length).toFixed(2)) : 0;
       } else if (reportType === 'inventory') {
-        const prodSnap = await adminDb.collection('products').limit(50).get();
+        const prodSnap = await adminDb.collection('products').limit(100).get();
         const prods = prodSnap.docs.map(d => d.data());
         metrics.totalProducts = prods.length;
         metrics.outOfStock = prods.filter(p => Number(p.stock) === 0).length;
         metrics.lowStock = prods.filter(p => Number(p.stock) > 0 && Number(p.stock) < 5).length;
       } else {
-        metrics.status = 'All multi-vendor platform operational services operational.';
+        // Section 5: Truthful fallback without making unverified operational claims
+        metrics.status = 'Not evaluated';
+        metrics.verificationNotice = 'Unable to verify operational telemetry without live sensor integration';
       }
     } catch (e: any) {
       console.warn('[AIReportSummary] Metric fetch error:', e?.message || e);
+      metrics.fetchError = 'Unable to verify database metrics due to read error';
     }
   }
 
   const prompt = `DATA (AUTHORIZED METRICS FOR ${reportType.toUpperCase()} REPORT):
 ${JSON.stringify(metrics, null, 2)}
 
-Provide an executive, high-level summary of these metrics.`;
+Provide an executive, high-level summary of these metrics. If data is missing or marked "Not evaluated" or "Unable to verify", do NOT invent claims of platform health. State facts plainly.`;
 
-  const fallback = () => `### Executive ${reportType.toUpperCase()} Report Summary\n\n- **Period:** ${timeRange.replace(/_/g, ' ')}\n- **Key Findings:** Operations remain stable with high fulfillment accuracy. All platform health indicators pass threshold checks.`;
+  const fallback = () => {
+    if (metrics.orderCount !== undefined) {
+      if (metrics.orderCount === 0) {
+        return `### Executive ${reportType.toUpperCase()} Report Summary\n\n- **Period:** ${timeRange.replace(/_/g, ' ')}\n- **Order Volume:** Insufficient data (0 orders recorded in this time range).\n- **Verification State:** Computed from 0 authoritative records.`;
+      }
+      return `### Executive ${reportType.toUpperCase()} Report Summary\n\n- **Period:** ${timeRange.replace(/_/g, ' ')}\n- **Paid Volume:** $${metrics.totalVolume || 0} across ${metrics.paidOrderCount || 0} completed orders (${metrics.orderCount} total orders in range).\n- **Verification State:** Authoritatively computed from database records.`;
+    }
+    return `### Executive ${reportType.toUpperCase()} Report Summary\n\n- **Period:** ${timeRange.replace(/_/g, ' ')}\n- **Verification State:** Unable to verify operational status without live metric computation.\n- **Data Completeness:** Not evaluated.`;
+  };
 
   const rawOutput = await callGeminiSafely({
     systemInstruction: `${SYSTEM_INSTRUCTION_BASE}\nYou are an executive business analyst preparing a high-level report for marketplace leadership.`,

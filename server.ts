@@ -1,13 +1,15 @@
 import express from 'express';
 import path from 'path';
+import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import { processOrderGateway, processSubOrderUpdateGateway } from './server/orderGateway';
-import { processPayoutGateway, getSellerFinancialSummaryGateway } from './server/payoutGateway';
+import { processPayoutGateway, processPayoutReviewGateway, getSellerFinancialSummaryGateway } from './server/payoutGateway';
+import { processSubscriptionReviewGateway } from './server/subscriptionGateway';
 import { processRefundGateway } from './server/refundGateway';
 import { processPaymentReferenceSubmissionGateway, processPaymentReviewGateway } from './server/paymentGateway';
-import { processUserRoleUpdateGateway } from './server/userGateway';
+import { processUserRoleUpdateGateway, processUserStatusUpdateGateway } from './server/userGateway';
 import { createRateLimiter } from './server/rateLimiter';
-import { requireAuthenticatedCaller, requireVerifiedPlatformAdmin, verifyFirebaseBearerToken } from './server/firebaseAdmin';
+import { getAdminDb, requireAuthenticatedCaller, requireVerifiedPlatformAdmin, verifyFirebaseBearerToken } from './server/firebaseAdmin';
 import {
   handleBusinessAssistant,
   handleSellerAssistant,
@@ -15,10 +17,32 @@ import {
   handleSmartSearch,
   handleReportSummarization,
 } from './server/ai/aiService';
+import { validateAndExecuteToolPolicy } from './server/ai/toolPolicy';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+
+  // P2-RATE-02: Configure trusted proxy behavior intentionally (1 hop reverse proxy)
+  app.set('trust proxy', 1);
+
+  // F-43 & P2-SEC-01: Comprehensive HTTP Security Headers & Content Security Policy
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('X-XSS-Protection', '0');
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    const isProd = process.env.NODE_ENV === 'production';
+    const scriptSrc = isProd
+      ? "'self' 'unsafe-inline' https://apis.google.com"
+      : "'self' 'unsafe-inline' 'unsafe-eval' https://apis.google.com";
+    res.setHeader(
+      'Content-Security-Policy',
+      `default-src 'self'; script-src ${scriptSrc}; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self' https: wss:; frame-ancestors 'self' https://*.google.com;`
+    );
+    next();
+  });
 
   // Protect against huge payload attacks
   app.use(express.json({ limit: '100kb' }));
@@ -279,6 +303,195 @@ async function startServer() {
     }
   });
 
+  // 9b. Authoritative User Status Management (Platform Admin & Super Admin)
+  app.post('/api/users/update-status', financialRateLimiter, async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processUserStatusUpdateGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/users/update-status] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to update user status',
+      });
+    }
+  });
+
+  // 10. Authoritative Payout Review Endpoint (P1-RBAC-02)
+  app.post('/api/payouts/review', financialRateLimiter, async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processPayoutReviewGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/payouts/review] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden') || err.message?.includes('غير مصرح');
+      const isAuth = err.message?.includes('Authentication');
+      const isConflict = err.message?.includes('terminal');
+      const statusCode = err.statusCode || (isConflict ? 409 : isForbidden ? 403 : isAuth ? 401 : 400);
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to review payout request',
+      });
+    }
+  });
+
+  // 11. Authoritative Subscription Review Endpoint (P1-RBAC-01)
+  app.post('/api/subscriptions/review', financialRateLimiter, async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processSubscriptionReviewGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/subscriptions/review] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden') || err.message?.includes('غير مصرح');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = err.statusCode || (isForbidden ? 403 : isAuth ? 401 : 400);
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to review subscription',
+      });
+    }
+  });
+
+  // 12. Authoritative Security Audit Log Endpoint (P1-AUDIT-01 & P1-19)
+  app.post('/api/audit/log', financialRateLimiter, async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      const caller = await requireVerifiedPlatformAdmin(authHeader);
+      const { action, targetType, targetId, targetName, metadata } = req.body || {};
+
+      if (!action || typeof action !== 'string') {
+        return res.status(400).json({ success: false, error: 'Action is required' });
+      }
+      if (!targetType || !targetId) {
+        return res.status(400).json({ success: false, error: 'targetType and targetId are required' });
+      }
+
+      // P1-19: Restrict manual audit actions to an allowlist of administrative events
+      const ALLOWED_ADMIN_MANUAL_ACTIONS = [
+        'SETTINGS_VIEWED',
+        'SETTINGS_UPDATED',
+        'REPORT_EXPORTED',
+        'ADMIN_LOGIN',
+        'ADMIN_LOGOUT',
+        'SECURITY_REVIEW_PERFORMED',
+        'SYSTEM_DIAGNOSTIC_RUN',
+        'USER_INSPECTED',
+      ];
+
+      const cleanAction = action.trim();
+      if (!ALLOWED_ADMIN_MANUAL_ACTIONS.includes(cleanAction)) {
+        return res.status(400).json({
+          success: false,
+          error: `Invalid manual audit action "${cleanAction}". Financial and lifecycle mutations can only be recorded automatically by authoritative gateways.`,
+        });
+      }
+
+      const adminDb = getAdminDb();
+      const now = new Date().toISOString();
+      const logId = `audit_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const logEntry = {
+        id: logId,
+        actorId: caller.uid,
+        actorRole: caller.isSuperAdmin ? 'SUPER_ADMIN' : 'ADMIN',
+        actorEmail: caller.email || '',
+        action: cleanAction,
+        targetType,
+        targetId: String(targetId),
+        targetName: targetName ? String(targetName) : undefined,
+        timestamp: now,
+        metadata: metadata && typeof metadata === 'object' ? metadata : {},
+      };
+
+      await adminDb.collection('audit_logs').doc(logId).set(logEntry);
+      return res.status(200).json({ success: true, log: logEntry });
+    } catch (err: any) {
+      console.error('[API /api/audit/log] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to record audit log',
+      });
+    }
+  });
+
+  // 13. Protected Analytics Ingestion Endpoint (P1-ABUSE-01)
+  const analyticsRateLimiter = createRateLimiter({
+    windowMs: 60 * 1000,
+    max: 120,
+    allowGuest: true,
+    message: 'Analytics rate limit reached.',
+  });
+
+  const ALLOWED_ANALYTICS_EVENT_TYPES: readonly string[] = Object.freeze([
+    'PRODUCT_VIEW',
+    'STORE_VIEW',
+    'SERVICE_VIEW',
+    'RESTAURANT_VIEW',
+    'SEARCH_QUERY',
+    'AD_IMPRESSION',
+    'AD_CLICK',
+    'PROMOTION_VIEW',
+    'PROMOTION_CLICK',
+    'CATEGORY_VIEW',
+    'CHECKOUT_STARTED',
+    'ORDER_COMPLETED',
+  ]);
+
+  app.post('/api/analytics/event', analyticsRateLimiter, async (req, res) => {
+    try {
+      const { type, entityId, sellerId, metadata } = req.body || {};
+      const trimmedType = typeof type === 'string' ? type.trim() : '';
+
+      // P1-ABUSE-01: Strict Event Allowlist Enforcement
+      if (!trimmedType || !ALLOWED_ANALYTICS_EVENT_TYPES.includes(trimmedType)) {
+        return res.status(400).json({ success: false, error: 'Invalid or unauthorized event type' });
+      }
+
+      // Metadata size and boundary check (Prevent cost amplification & write abuse)
+      let sanitizedMetadata: Record<string, any> = {};
+      if (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) {
+        const entries = Object.entries(metadata).slice(0, 10); // Max 10 keys
+        for (const [k, v] of entries) {
+          if (typeof k === 'string' && k.length <= 50) {
+            const cleanVal = typeof v === 'string' ? v.slice(0, 200) : typeof v === 'number' || typeof v === 'boolean' ? v : null;
+            if (cleanVal !== null) {
+              sanitizedMetadata[k] = cleanVal;
+            }
+          }
+        }
+      }
+
+      const adminDb = getAdminDb();
+      const eventId = `evt_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const eventDoc = {
+        id: eventId,
+        type: trimmedType,
+        entityId: entityId ? String(entityId).slice(0, 100) : null,
+        sellerId: sellerId ? String(sellerId).slice(0, 100) : null,
+        metadata: sanitizedMetadata,
+        ip: (req as any).rateLimitIdentity || 'anonymous',
+        timestamp: new Date().toISOString(),
+      };
+
+      await adminDb.collection('analyticsEvents').doc(eventId).set(eventDoc);
+      return res.status(200).json({ success: true, eventId });
+    } catch (err: any) {
+      console.error('[API /api/analytics/event] Error:', err.message);
+      return res.status(400).json({ success: false, error: 'Failed to record analytics event' });
+    }
+  });
+
   // AI-Specific Rate Limiters
   const aiRateLimiter = createRateLimiter({
     windowMs: 60 * 1000,
@@ -383,22 +596,16 @@ async function startServer() {
       }
 
       let caller = null;
-      if (authHeader) {
-        try {
-          const decoded = await verifyFirebaseBearerToken(authHeader);
-          if (decoded && decoded.uid) {
-            caller = {
-              uid: decoded.uid,
-              email: decoded.email,
-              emailVerified: decoded.email_verified === true,
-              isPlatformAdmin: false,
-              isSuperAdmin: false,
-              token: decoded,
-            };
-          }
-        } catch {
-          // Guest search is allowed
-        }
+      if ((req as any).authenticatedUser) {
+        const decoded = (req as any).authenticatedUser;
+        caller = {
+          uid: decoded.uid,
+          email: decoded.email,
+          emailVerified: decoded.email_verified === true,
+          isPlatformAdmin: false,
+          isSuperAdmin: false,
+          token: decoded,
+        };
       }
 
       const safeLimit = limit !== undefined ? Math.min(50, Math.max(1, Number(limit) || 10)) : 10;
@@ -470,6 +677,46 @@ async function startServer() {
         error: err.message || 'Failed to generate product copy',
       });
     }
+  });
+
+  // 14. Dedicated AI Tool Policy Execution Endpoint (P1-21)
+  app.post('/api/ai/execute-tool', aiRateLimiter, async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      const caller = await requireAuthenticatedCaller(authHeader);
+      const { toolName, args } = req.body || {};
+
+      if (!toolName || typeof toolName !== 'string') {
+        return res.status(400).json({ success: false, error: 'toolName is required' });
+      }
+
+      const result = await validateAndExecuteToolPolicy(toolName, args || {}, caller);
+      return res.status(200).json({ success: true, result });
+    } catch (err: any) {
+      console.error('[API /api/ai/execute-tool] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to execute tool policy',
+      });
+    }
+  });
+
+  // Production error handling middleware: suppresses stack traces in production
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error('[MarketSpace Unhandled Error]:', err);
+    if (res.headersSent) {
+      return next(err);
+    }
+    const message = process.env.NODE_ENV === 'production'
+      ? 'Internal server error'
+      : (err?.message || 'Internal server error');
+    return res.status(err?.status || 500).json({
+      success: false,
+      error: message,
+    });
   });
 
   // 4. Vite middleware for development / Static files for production

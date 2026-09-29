@@ -112,16 +112,20 @@ export function minimizeOrderForAI(order: any, isCallerCustomer: boolean = false
 
 /**
  * Sanitizes and minimizes seller product data for AI ingestion.
+ * Mask internal stock and sales metrics for public or guest access (OPEN-27).
  */
-export function minimizeProductForAI(prod: any): Record<string, any> {
-  return {
+export function minimizeProductForAI(prod: any, isPublicOrGuest: boolean = false): Record<string, any> {
+  const result: Record<string, any> = {
     id: prod.id,
     title: typeof prod.title === 'object' ? prod.title.en || prod.title.ar : prod.title,
     category: prod.category,
     price: prod.price,
-    stock: prod.stock,
     rating: prod.rating,
-    salesCount: prod.salesCount || prod.orderCount || 0,
     isActive: prod.isActive ?? true,
   };
+  if (!isPublicOrGuest) {
+    result.stock = prod.stock;
+    result.salesCount = prod.salesCount || prod.orderCount || 0;
+  }
+  return result;
 }

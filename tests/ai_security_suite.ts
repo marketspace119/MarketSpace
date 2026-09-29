@@ -1,3 +1,6 @@
+process.env.NODE_ENV = 'test';
+process.env.ENABLE_TEST_TOKENS = 'true';
+
 import assert from 'assert';
 import fs from 'fs';
 import { initializeTestEnvironment, RulesTestEnvironment } from '@firebase/rules-unit-testing';

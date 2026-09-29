@@ -1,4 +1,4 @@
-import { doc, getDocs, collection, runTransaction, query, where, updateDoc } from 'firebase/firestore';
+import { doc, getDocs, collection, runTransaction, query, where, updateDoc, limit } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
 import { OrderDetails, VendorSubOrder, CartItem } from '../types';
 import { storeService } from './storeService';
@@ -28,11 +28,22 @@ function initOrders(): OrderDetails[] {
   }
 }
 
+function sanitizeOrderForLocalStorage(order: OrderDetails): OrderDetails {
+  return {
+    ...order,
+    phone: order.phone ? order.phone.replace(/(\+?\d{2,4})\d+(\d{2})/, '$1 •••• $2') : '',
+    email: order.email ? order.email.replace(/(.{2})(.*)(@.*)/, '$1•••$3') : undefined,
+    address: order.address ? (order.address.length > 25 ? `${order.address.slice(0, 25)}...` : order.address) : '',
+    notes: undefined,
+  };
+}
+
 function persistLocal(orders: OrderDetails[]) {
   memoryOrders = orders;
   if (typeof window === 'undefined') return;
   try {
-    localStorage.setItem(ORDERS_STORAGE_KEY, JSON.stringify(orders));
+    const sanitized = orders.map(sanitizeOrderForLocalStorage);
+    localStorage.setItem(ORDERS_STORAGE_KEY, JSON.stringify(sanitized));
   } catch (err) {
     console.error('Failed to save orders to storage', err);
   }
@@ -104,6 +115,7 @@ export const orderService = {
     items: CartItem[];
     customerId?: string;
     couponCode?: string;
+    idempotencyKey?: string;
   }): Promise<OrderDetails> {
     // 1. Input bounds and validation
     if (!params.items || params.items.length === 0) {
@@ -153,7 +165,7 @@ export const orderService = {
         notes: params.notes?.trim() || undefined,
         customerId: params.customerId || 'guest_user',
         couponCode: params.couponCode || undefined,
-        idempotencyKey: (params as any).idempotencyKey || `idemp_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+        idempotencyKey: params.idempotencyKey || `idemp_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
       }),
     });
 
@@ -164,13 +176,10 @@ export const orderService = {
 
     const finalOrder: OrderDetails = data.order;
 
-    // Record coupon usage if verified and applied
+    // P1-02: Server transaction already atomically recorded coupon usage in Firestore.
+    // Client-side recordUsage must NOT be invoked again to avoid duplicate count.
     if (finalOrder.couponCode) {
-      const allCoupons = couponService.getCoupons();
-      const matchedCoupon = allCoupons.find(c => c.code === finalOrder.couponCode);
-      if (matchedCoupon) {
-        await couponService.recordUsage(matchedCoupon.id, params.customerId);
-      }
+      couponService.syncLocalCouponUsage(finalOrder.couponCode, params.customerId);
     }
 
     // Track order completed analytics event
@@ -432,8 +441,17 @@ export const orderService = {
   /**
    * Only Admin can mark a payment as verified/paid in production.
    * Firestore is the single source of truth: local state is ONLY updated if Firestore write succeeds.
+   * Hardened contract matches backend gateway for submissions, COD settlement, and administrative override (P1-PAY-01).
    */
-  async confirmPaymentStatus(orderId: string, userRole: string): Promise<boolean> {
+  async confirmPaymentStatus(
+    orderId: string,
+    userRole: string,
+    options?: {
+      submissionId?: string;
+      action?: 'COD_SETTLEMENT' | 'SUPER_ADMIN_OVERRIDE';
+      notes?: string;
+    }
+  ): Promise<boolean> {
     const isAdmin = userRole === 'ADMIN' || userRole === 'SUPER_ADMIN';
     if (!isAdmin) {
       throw new Error('Forbidden: Only platform administrators can confirm order payments');
@@ -442,6 +460,44 @@ export const orderService = {
     const orders = initOrders();
     const index = orders.findIndex(o => o.orderId === orderId);
     if (index === -1) return false;
+    const order = orders[index];
+
+    // Determine payload parameters (P1-PAY-01)
+    let submissionId = options?.submissionId;
+    let action = options?.action;
+    let notes = options?.notes || 'Admin confirmed payment status via Order Management';
+
+    if (!submissionId && !action) {
+      const method = (order.paymentMethod || '').toLowerCase().trim();
+      if (method === 'cash_on_delivery' || method === 'cod') {
+        action = 'COD_SETTLEMENT';
+        notes = options?.notes || 'Admin confirmed cash on delivery settlement';
+      } else {
+        // Electronic payment: query for active paymentSubmission for this order
+        try {
+          const subQuery = query(
+            collection(db, 'paymentSubmissions'),
+            where('orderId', '==', orderId),
+            limit(1)
+          );
+          const subSnap = await getDocs(subQuery);
+          if (!subSnap.empty) {
+            submissionId = subSnap.docs[0].id;
+          }
+        } catch (subErr) {
+          console.warn('[OrderService:PaymentSubmissions] Notice querying paymentSubmissions:', subErr);
+        }
+
+        if (!submissionId) {
+          if (userRole === 'SUPER_ADMIN') {
+            action = 'SUPER_ADMIN_OVERRIDE';
+            notes = options?.notes || 'تجاوز إداري استثنائي موثق من المدير العام لتأكيد الدفع';
+          } else {
+            throw new Error('لا يوجد إشعار دفع مسجل لهذا الطلب. يتطلب تأكيد الدفع الإلكتروني إشعار دفع موثق أو تجاوزاً من المدير العام.');
+          }
+        }
+      }
+    }
 
     // Authoritative update: Must pass through Trusted Backend Gateway (/api/payments/review)
     let token = '';
@@ -464,8 +520,10 @@ export const orderService = {
       headers,
       body: JSON.stringify({
         orderId,
+        submissionId,
+        action,
         decision: 'CONFIRMED',
-        notes: 'Admin confirmed payment status via Order Management',
+        notes,
       }),
     });
 

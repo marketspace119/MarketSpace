@@ -7,29 +7,9 @@ import { orderService } from './orderService';
 const REFUNDS_STORAGE_KEY = 'marketspace_refund_requests_v1';
 const REFUNDS_COLLECTION = 'refundRequests';
 
-export const INITIAL_REFUNDS: RefundRequest[] = [
-  {
-    id: 'REF-2026-001',
-    orderId: 'ORD-1715000001',
-    subOrderId: 'ORD-1715000001-SUB-1',
-    customerId: 'user_cust_01',
-    customerName: 'Amina Farah Warsame',
-    customerPhone: '+252 61 5551234',
-    sellerId: 'user_seller_01',
-    storeId: 'store_cosmetics_01',
-    amount: 18.0,
-    reason: 'damaged',
-    notes: 'One cosmetic bottle arrived leaking during transit',
-    status: 'REFUNDED',
-    settlementType: 'MANUAL_MOBILE_TRANSFER',
-    settlementReference: 'EVC-REF-9920194',
-    adminNotes: 'Verified with merchant and customer. Partial refund issued via EVC Plus.',
-    processedBy: 'system_admin',
-    processedAt: '2026-02-15T14:30:00.000Z',
-    createdAt: '2026-02-14T10:00:00.000Z',
-    updatedAt: '2026-02-15T14:30:00.000Z',
-  },
-];
+// Financial UI Integrity: Zero synthetic refund records.
+// Real financial records must strictly originate from authoritative database.
+export const INITIAL_REFUNDS: RefundRequest[] = [];
 
 let memoryRefunds: RefundRequest[] = [];
 

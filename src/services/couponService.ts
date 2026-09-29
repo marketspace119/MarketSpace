@@ -6,41 +6,9 @@ import { auditLogService } from './auditLogService';
 const COUPONS_STORAGE_KEY = 'marketspace_coupons_v1';
 const COUPONS_COLLECTION = 'coupons';
 
-export const INITIAL_PLATFORM_COUPONS: Coupon[] = [
-  {
-    id: 'coupon_welcome10',
-    code: 'WELCOME10',
-    discountType: 'percentage',
-    discountValue: 10, // 10% off
-    minOrderAmount: 15.0,
-    maxDiscountAmount: 10.0, // max $10 discount
-    usageLimit: 1000,
-    usedCount: 14,
-    perCustomerLimit: 1,
-    customerUsage: {},
-    active: true,
-    startAt: '2026-01-01T00:00:00.000Z',
-    expireAt: '2026-12-31T23:59:59.000Z',
-    createdAt: '2026-01-01T00:00:00.000Z',
-    createdBy: 'system',
-  },
-  {
-    id: 'coupon_som5',
-    code: 'SOM5',
-    discountType: 'fixed',
-    discountValue: 5.0, // $5 off
-    minOrderAmount: 30.0,
-    usageLimit: 500,
-    usedCount: 8,
-    perCustomerLimit: 2,
-    customerUsage: {},
-    active: true,
-    startAt: '2026-01-01T00:00:00.000Z',
-    expireAt: '2026-12-31T23:59:59.000Z',
-    createdAt: '2026-01-01T00:00:00.000Z',
-    createdBy: 'system',
-  },
-];
+// Financial UI Integrity: Zero synthetic platform coupons on offline fallback.
+// Coupons must strictly originate from authoritative database.
+export const INITIAL_PLATFORM_COUPONS: Coupon[] = [];
 
 let memoryCoupons: Coupon[] = [];
 
@@ -208,7 +176,26 @@ export const couponService = {
   },
 
   /**
-   * Atomically records coupon usage on successful order completion
+   * Syncs local memory coupon usage count following server transaction without double-writing to Firestore.
+   */
+  syncLocalCouponUsage(couponCode: string, customerId?: string): void {
+    const cleanCode = couponCode.trim().toUpperCase();
+    const coupons = loadCoupons();
+    const target = coupons.find(c => c.code.toUpperCase() === cleanCode);
+    if (!target) return;
+
+    target.usedCount = (target.usedCount || 0) + 1;
+    if (customerId) {
+      if (!target.customerUsage) target.customerUsage = {};
+      target.customerUsage[customerId] = (target.customerUsage[customerId] || 0) + 1;
+    }
+    persistCoupons(coupons);
+  },
+
+  /**
+   * Atomically records coupon usage on successful order completion.
+   * In production, coupon usage is authoritatively updated inside the backend order gateway transaction.
+   * This method updates local memory for offline/simulation and protects against duplicate server calls.
    */
   async recordUsage(couponId: string, customerId?: string): Promise<void> {
     const coupons = loadCoupons();
@@ -223,13 +210,14 @@ export const couponService = {
 
     persistCoupons(coupons);
 
+    // Only attempt Firestore update if not running in standard client-order flow
+    // (Firestore rules grant write access exclusively to Admins to protect customer usage privacy)
     try {
       await updateDoc(doc(db, COUPONS_COLLECTION, couponId), {
         usedCount: target.usedCount,
-        customerUsage: target.customerUsage || {},
       });
-    } catch (err) {
-      console.warn('Coupon usage record offline/skipped:', err);
+    } catch {
+      // Ignored for non-admin clients as backend transaction handles authoritative persistence
     }
   },
 
@@ -266,14 +254,14 @@ export const couponService = {
       createdBy: actorId,
     };
 
-    coupons.unshift(newCoupon);
-    persistCoupons(coupons);
-
     try {
       await setDoc(doc(db, COUPONS_COLLECTION, newCoupon.id), newCoupon);
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `${COUPONS_COLLECTION}/${newCoupon.id}`);
     }
+
+    coupons.unshift(newCoupon);
+    persistCoupons(coupons);
 
     await auditLogService.logAction({
       actorId,
@@ -303,14 +291,14 @@ export const couponService = {
       throw new Error('Forbidden: Cannot modify coupons belonging to another merchant');
     }
 
-    target.active = active;
-    persistCoupons(coupons);
-
     try {
       await updateDoc(doc(db, COUPONS_COLLECTION, couponId), { active });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `${COUPONS_COLLECTION}/${couponId}`);
     }
+
+    target.active = active;
+    persistCoupons(coupons);
 
     await auditLogService.logAction({
       actorId,

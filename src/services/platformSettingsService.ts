@@ -1,4 +1,4 @@
-import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { doc, getDoc, setDoc, writeBatch } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { PlatformSettings, UserRole } from '../types';
 import { auditLogService } from './auditLogService';
@@ -74,13 +74,29 @@ function persistLocal(settings: PlatformSettings) {
 }
 
 export const platformSettingsService = {
-  async syncWithFirestore(): Promise<PlatformSettings> {
+  async syncWithFirestore(userRole?: UserRole): Promise<PlatformSettings> {
     try {
-      const snap = await getDoc(doc(db, SETTINGS_COLLECTION, DEFAULT_SETTINGS_DOC));
-      if (snap.exists()) {
-        const cloud = snap.data() as PlatformSettings;
-        persistLocal(cloud);
-        return cloud;
+      // P1-01: Admin reads full settings; non-admin reads operational and public documents only
+      if (userRole === 'ADMIN' || userRole === 'SUPER_ADMIN') {
+        const snap = await getDoc(doc(db, SETTINGS_COLLECTION, DEFAULT_SETTINGS_DOC));
+        if (snap.exists()) {
+          const cloud = snap.data() as PlatformSettings;
+          persistLocal(cloud);
+          return cloud;
+        }
+      } else {
+        const [publicSnap, opSnap] = await Promise.all([
+          getDoc(doc(db, SETTINGS_COLLECTION, 'publicPlatformSettings')).catch(() => null),
+          getDoc(doc(db, SETTINGS_COLLECTION, 'operationalSettings')).catch(() => null),
+        ]);
+        const current = initSettings();
+        const merged: PlatformSettings = {
+          ...current,
+          ...(publicSnap && publicSnap.exists() ? publicSnap.data() : {}),
+          ...(opSnap && opSnap.exists() ? opSnap.data() : {}),
+        };
+        persistLocal(merged);
+        return merged;
       }
     } catch (err) {
       console.warn('Settings Firestore sync offline/skipped:', err);
@@ -90,6 +106,40 @@ export const platformSettingsService = {
 
   getSettings(): PlatformSettings {
     return initSettings();
+  },
+
+  /**
+   * Section 3 & P1-01: Tiered Financial Settings Access Policy
+   * - PUBLIC: Support info & feature toggles only
+   * - AUTHENTICATED OPERATIONAL: Merchant numbers for checkout
+   * - ADMIN / SUPER_ADMIN: Full financial policies & rates
+   */
+  getSettingsForRole(userRole?: UserRole): Partial<PlatformSettings> {
+    const s = initSettings();
+    if (userRole === 'SUPER_ADMIN' || userRole === 'ADMIN') {
+      return s;
+    }
+    if (userRole === 'SELLER' || userRole === 'RESTAURANT' || userRole === 'CUSTOMER' || userRole === 'SERVICE_PROVIDER' || (userRole as string) === 'DRIVER') {
+      return {
+        evcPlusMerchantNumber: s.evcPlusMerchantNumber,
+        zaadMerchantNumber: s.zaadMerchantNumber,
+        sahalMerchantNumber: s.sahalMerchantNumber,
+        cardPaymentAvailable: false,
+        platformDeliveryEnabled: s.platformDeliveryEnabled,
+        sellerDeliveryEnabled: s.sellerDeliveryEnabled,
+        customerPickupEnabled: s.customerPickupEnabled,
+        supportPhone: s.supportPhone,
+        supportEmail: s.supportEmail,
+      };
+    }
+    return {
+      supportPhone: s.supportPhone,
+      supportEmail: s.supportEmail,
+      cardPaymentAvailable: false,
+      platformDeliveryEnabled: s.platformDeliveryEnabled,
+      sellerDeliveryEnabled: s.sellerDeliveryEnabled,
+      customerPickupEnabled: s.customerPickupEnabled,
+    };
   },
 
   async updateSettings(
@@ -102,6 +152,18 @@ export const platformSettingsService = {
       throw new Error('Forbidden: Only Super Administrators can alter core platform policies and commission settings');
     }
 
+    // Section 11: Unified Commission Invariant (0% <= rate <= 50%)
+    if (updates.defaultCommissionRate !== undefined) {
+      if (typeof updates.defaultCommissionRate !== 'number' || !Number.isFinite(updates.defaultCommissionRate) || updates.defaultCommissionRate < 0 || updates.defaultCommissionRate > 50) {
+        throw new Error('Invalid default commission rate: rate must be between 0% and 50%');
+      }
+    }
+    if (updates.minPayoutThreshold !== undefined) {
+      if (typeof updates.minPayoutThreshold !== 'number' || !Number.isFinite(updates.minPayoutThreshold) || updates.minPayoutThreshold < 5 || updates.minPayoutThreshold > 1000) {
+        throw new Error('Invalid minimum payout threshold: threshold must be between $5 and $1,000');
+      }
+    }
+
     const current = initSettings();
     const updated: PlatformSettings = {
       ...current,
@@ -112,16 +174,69 @@ export const platformSettingsService = {
       updatedBy: actorId,
     };
 
-    persistLocal(updated);
+    // P1-01: Disaggregate into segregated Firestore records
+    const publicData = {
+      supportPhone: updated.supportPhone,
+      supportEmail: updated.supportEmail,
+      platformDeliveryEnabled: updated.platformDeliveryEnabled,
+      sellerDeliveryEnabled: updated.sellerDeliveryEnabled,
+      customerPickupEnabled: updated.customerPickupEnabled,
+      cardPaymentAvailable: false,
+      updatedAt: updated.updatedAt,
+      updatedBy: actorId,
+    };
 
-    try {
-      await Promise.race([
-        setDoc(doc(db, SETTINGS_COLLECTION, DEFAULT_SETTINGS_DOC), updated, { merge: true }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore write timeout')), 600)),
-      ]);
-    } catch (err) {
-      console.warn('Failed to save settings to Firestore:', err);
+    const operationalData = {
+      evcPlusMerchantNumber: updated.evcPlusMerchantNumber,
+      zaadMerchantNumber: updated.zaadMerchantNumber,
+      sahalMerchantNumber: updated.sahalMerchantNumber,
+      sellerPlansEnabled: updated.sellerPlansEnabled,
+      advertisingEnabled: updated.advertisingEnabled,
+      featuredStoresEnabled: updated.featuredStoresEnabled,
+      promotionsEnabled: updated.promotionsEnabled,
+      couponsEnabled: updated.couponsEnabled,
+      updatedAt: updated.updatedAt,
+      updatedBy: actorId,
+    };
+
+    const privateFinancialData = {
+      defaultCommissionRate: updated.defaultCommissionRate,
+      minPayoutThreshold: updated.minPayoutThreshold,
+      payoutProcessingDays: updated.payoutProcessingDays,
+      sellerTypeCommissionRates: updated.sellerTypeCommissionRates,
+      categoryCommissionRates: updated.categoryCommissionRates,
+      updatedAt: updated.updatedAt,
+      updatedBy: actorId,
+    };
+
+    const saveOperations = async () => {
+      const batch = writeBatch(db);
+      batch.set(doc(db, SETTINGS_COLLECTION, DEFAULT_SETTINGS_DOC), updated, { merge: true });
+      batch.set(doc(db, SETTINGS_COLLECTION, 'publicPlatformSettings'), publicData, { merge: true });
+      batch.set(doc(db, SETTINGS_COLLECTION, 'operationalSettings'), operationalData, { merge: true });
+      batch.set(doc(db, SETTINGS_COLLECTION, 'privateFinancialSettings'), privateFinancialData, { merge: true });
+      await batch.commit();
+    };
+
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+      try {
+        await saveOperations();
+      } catch (err) {
+        console.error('Failed to save settings to Firestore:', err);
+        throw err;
+      }
+    } else {
+      try {
+        await Promise.race([
+          saveOperations(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore write timeout')), 800)),
+        ]);
+      } catch (err) {
+        console.warn('Failed to save settings to Firestore (test/offline):', err);
+      }
     }
+
+    persistLocal(updated);
 
     await auditLogService.logAction({
       actorId,

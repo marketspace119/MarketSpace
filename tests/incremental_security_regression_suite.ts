@@ -1,3 +1,9 @@
+process.env.NODE_ENV = 'test';
+process.env.ENABLE_TEST_TOKENS = 'true';
+process.env.FIRESTORE_EMULATOR_HOST = '127.0.0.1:8085';
+process.env.FIREBASE_STORAGE_EMULATOR_HOST = '127.0.0.1:9199';
+process.env.GCLOUD_PROJECT = 'marketspace-applet';
+
 import assert from 'assert';
 import fs from 'fs';
 import { initializeTestEnvironment, assertFails, assertSucceeds, RulesTestEnvironment } from '@firebase/rules-unit-testing';
@@ -78,8 +84,16 @@ async function runIncrementalSecurityRegressionSuite() {
   try {
     testEnv = await initializeTestEnvironment({
       projectId: 'marketspace-applet',
-      firestore: { rules: firestoreRules },
-      storage: { rules: storageRules },
+      firestore: {
+        rules: firestoreRules,
+        host: '127.0.0.1',
+        port: 8085,
+      },
+      storage: {
+        rules: storageRules,
+        host: '127.0.0.1',
+        port: 9199,
+      },
     });
     console.log('[IncrementalHarness] Live emulator connected for rules evaluation.\n');
   } catch (err: any) {
@@ -168,26 +182,20 @@ async function runIncrementalSecurityRegressionSuite() {
   });
 
   // Also pre-seed users into adminDb for server gateways
-  await adminDb.collection('users').doc(FIXTURES.customerA.uid).set({
-    id: FIXTURES.customerA.uid,
-    email: FIXTURES.customerA.email,
-    role: 'CUSTOMER',
-    isVerified: false,
-    balance: 0,
-  });
-  await adminDb.collection('users').doc(FIXTURES.customerB.uid).set({
-    id: FIXTURES.customerB.uid,
-    email: FIXTURES.customerB.email,
-    role: 'CUSTOMER',
-    isVerified: true,
-  });
-  await adminDb.collection('users').doc(FIXTURES.admin.uid).set({
-    id: FIXTURES.admin.uid,
-    email: FIXTURES.admin.email,
-    role: 'ADMIN',
-    admin: true,
-    isVerified: true,
-  });
+  for (const f of Object.values(FIXTURES)) {
+    await adminDb.collection('users').doc(f.uid).set({
+      id: f.uid,
+      email: f.email,
+      role: f.role,
+      admin: (f as any).admin || false,
+      superAdmin: (f as any).superAdmin || false,
+      storeId: (f as any).storeId || null,
+      isVerified: f.uid === FIXTURES.customerA.uid ? false : f.email_verified,
+      status: 'active',
+      balance: 0,
+      createdAt: now,
+    });
+  }
 
   // --------------------------------------------------------------------------
   // TEST INC-01: Priority 1 - SUPER_ADMIN-only Role Elevation
@@ -412,6 +420,8 @@ async function runIncrementalSecurityRegressionSuite() {
     const order2 = 'ORD-INC-REPLAY-102';
     const sharedRef = 'EVC-INC-UNIQUE-999';
 
+    await adminDb.collection('paymentReferences').doc(sharedRef).delete();
+
     await adminDb.collection('orders').doc(order1).set({
       orderId: order1,
       customerId: FIXTURES.customerA.uid,
@@ -519,9 +529,18 @@ async function runIncrementalSecurityRegressionSuite() {
     let executed = false;
     const orderId = 'ORD-INC-DOUBLE-01';
 
+    await adminDb.collection('order_refund_locks').doc(orderId).delete();
+    await adminDb.collection('seller_payout_locks').doc(FIXTURES.sellerA.uid).delete();
+    await adminDb.collection('seller_ledgers').doc(FIXTURES.sellerA.uid).delete();
+    const prevRefunds = await adminDb.collection('refundRequests').where('orderId', '==', orderId).get();
+    for (const d of prevRefunds.docs) {
+      await d.ref.delete();
+    }
+
     await adminDb.collection('orders').doc(orderId).set({
       orderId,
       customerId: FIXTURES.customerA.uid,
+      sellerIds: [FIXTURES.sellerA.uid],
       total: 80,
       paymentStatus: 'paid',
       status: 'delivered',

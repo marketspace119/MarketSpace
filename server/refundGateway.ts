@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { getAdminDb, verifyFirebaseBearerToken, isCallerPlatformAdmin } from './firebaseAdmin';
+import { getAdminDb, requireAuthenticatedCaller, isCallerPlatformAdmin } from './firebaseAdmin';
 import { RefundRequest } from '../src/types';
 
 export interface CreateRefundGatewayRequest {
@@ -8,6 +8,7 @@ export interface CreateRefundGatewayRequest {
   amount: number;
   reason: RefundRequest['reason'];
   notes?: string;
+  idempotencyKey?: string;
 }
 
 // In-flight mutex per orderId to prevent race conditions during concurrent requests
@@ -27,13 +28,9 @@ export async function processRefundGateway(
     throw new Error('Authentication required: Bearer token is missing');
   }
 
-  const decoded = await verifyFirebaseBearerToken(authHeader);
-  if (!decoded) {
-    throw new Error('Authentication failed: Invalid or expired credentials');
-  }
-
-  const callerUid = decoded.uid;
-  const isPlatformAdmin = isCallerPlatformAdmin(decoded);
+  const caller = await requireAuthenticatedCaller(authHeader);
+  const callerUid = caller.uid;
+  const isPlatformAdmin = caller.isPlatformAdmin;
 
   // 2. Validate Input
   const { orderId, subOrderId, reason, notes } = payload;
@@ -85,13 +82,21 @@ export async function processRefundGateway(
       throw new Error('Forbidden: You can only request refunds for your own orders');
     }
 
-    // Terminal order status checks
+    // Terminal & Unsettled order status checks (OPEN-10)
     if (orderData.status === 'cancelled') {
       throw new Error('Order is already cancelled');
+    }
+    if (orderData.paymentStatus !== 'paid') {
+      throw new Error('Cannot request a refund for an unpaid order. Payment must be confirmed as paid first.');
     }
 
     // Resolve Authoritative Entity Context & Max Allowed Ceiling
     let maxAllowedCeiling = Number(orderData.total) || 0;
+
+    // Strict multi-vendor subOrderId allocation check (F-08)
+    if (Array.isArray(orderData.vendorOrders) && orderData.vendorOrders.length > 1 && !subOrderId) {
+      throw new Error('subOrderId is required when requesting a refund on a multi-vendor order to ensure proper vendor allocation.');
+    }
 
     if (subOrderId && Array.isArray(orderData.vendorOrders) && orderData.vendorOrders.length > 0) {
       const vo = orderData.vendorOrders.find((v: any) => v.subOrderId === subOrderId);
@@ -114,35 +119,78 @@ export async function processRefundGateway(
       throw new Error(`Requested refund amount ($${requestedAmount.toFixed(2)}) exceeds allowable total ($${maxAllowedCeiling.toFixed(2)})`);
     }
 
-    // 5. Atomic Transaction: Query all active refunds & commit within lock
+    // 5. Operation Fingerprint for Idempotency (P0-FIN-01)
+    const operationFingerprint = crypto.createHash('sha256').update(
+      JSON.stringify({
+        callerUid,
+        orderId,
+        subOrderId: subOrderId || null,
+        amount: requestedAmount,
+        reason,
+      })
+    ).digest('hex');
+
+    // 6. Atomic Transaction: Idempotency, Invariant Verification & Execution within One Transaction
     const refundLockRef = adminDb.collection('order_refund_locks').doc(orderId);
     const sellerLockRef = authoritativeSellerId ? adminDb.collection('seller_payout_locks').doc(authoritativeSellerId) : null;
     const refundId = `ref_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     const now = new Date().toISOString();
 
-    const result = await adminDb.runTransaction(async (transaction) => {
-      // Read the order refund lock document and seller payout lock if present
-      const lockDoc = await transaction.get(refundLockRef);
-      if (sellerLockRef) {
-        await transaction.get(sellerLockRef);
-      }
+    let idempotencyDocRef: FirebaseFirestore.DocumentReference | null = null;
+    if (payload.idempotencyKey) {
+      const compositeIdemKey = `${callerUid}:${orderId}:${payload.idempotencyKey}`;
+      const idemHash = crypto.createHash('sha256').update(compositeIdemKey).digest('hex');
+      idempotencyDocRef = adminDb.collection('refund_idempotency').doc(idemHash);
+    }
 
-      // Query all existing refunds for this order
-      const existingRefundsSnap = await adminDb
+    // Pre-transaction read: Gather historical settled refunds baseline prior to transaction (Strict Fail-Closed)
+    let baselineHistoricalRefunded = 0;
+    try {
+      const histSnap = await adminDb
         .collection('refundRequests')
         .where('orderId', '==', orderId)
         .get();
-
-      let cumulativeRefunded = 0;
-      if (!existingRefundsSnap.empty) {
-        existingRefundsSnap.forEach((d) => {
+      if (!histSnap.empty) {
+        histSnap.forEach((d) => {
           const r = d.data();
           if (r.status !== 'REFUND_REJECTED') {
-            cumulativeRefunded += (Number(r.amount) || 0);
+            baselineHistoricalRefunded += (Number(r.amount) || 0);
           }
         });
       }
+    } catch (e: any) {
+      console.error('[RefundGateway:FailClosed] Historical refunds baseline query failed:', e?.message || e);
+      throw new Error(`Database query failure: Unable to verify historical refunds for order #${orderId}. Operation aborted (Fail-Closed).`);
+    }
 
+    const result = await adminDb.runTransaction(async (transaction) => {
+      // Step 1: Read durable idempotency document inside the transaction (P0-FIN-01)
+      if (idempotencyDocRef) {
+        const existingIdemDoc = await transaction.get(idempotencyDocRef);
+        if (existingIdemDoc.exists) {
+          const idemData = existingIdemDoc.data() || {};
+          // Check payload fingerprint
+          if (idemData.fingerprint && idemData.fingerprint !== operationFingerprint) {
+            const conflictErr = new Error(`Idempotency conflict: key '${payload.idempotencyKey}' was previously used with different refund parameters.`);
+            (conflictErr as any).statusCode = 409;
+            throw conflictErr;
+          }
+          console.log(`[RefundGateway:Idempotency] Returning previously recorded refund for key ${payload.idempotencyKey}`);
+          return idemData.refund;
+        }
+      }
+
+      // Step 2: Transactional reads of lock documents (strictly transaction.get - P1-11, OPEN-07)
+      const lockDoc = await transaction.get(refundLockRef);
+      let sellerCurrentRefundReserved = 0;
+      if (sellerLockRef) {
+        const sellerLockDoc = await transaction.get(sellerLockRef);
+        if (sellerLockDoc.exists) {
+          sellerCurrentRefundReserved = Number(sellerLockDoc.data()?.totalRefundReserved) || 0;
+        }
+      }
+
+      let cumulativeRefunded = baselineHistoricalRefunded;
       // Add any locked active amount from lockDoc if more recent
       if (lockDoc.exists) {
         const lockData = lockDoc.data();
@@ -162,7 +210,7 @@ export async function processRefundGateway(
       const newCumulative = Number((cumulativeRefunded + requestedAmount).toFixed(2));
 
       // Build authoritative refund object
-      const customerName = orderData.customerName || decoded.name || 'Customer';
+      const customerName = orderData.customerName || caller.token?.name || 'Customer';
       const customerPhone = orderData.phone || '';
 
       const newRefund: RefundRequest = {
@@ -197,6 +245,8 @@ export async function processRefundGateway(
 
       if (sellerLockRef) {
         transaction.set(sellerLockRef, {
+          sellerId: authoritativeSellerId,
+          totalRefundReserved: Number((sellerCurrentRefundReserved + requestedAmount).toFixed(2)),
           lastRefundAt: now,
           lastRefundId: refundId,
           lastOrderRefunded: orderId,
@@ -206,6 +256,18 @@ export async function processRefundGateway(
       // Write refund document
       const refundDocRef = adminDb.collection('refundRequests').doc(refundId);
       transaction.set(refundDocRef, newRefund);
+
+      // Persist durable idempotency record atomically inside the transaction
+      if (idempotencyDocRef) {
+        transaction.set(idempotencyDocRef, {
+          idempotencyKey: payload.idempotencyKey,
+          fingerprint: operationFingerprint,
+          refund: newRefund,
+          orderId,
+          callerUid,
+          createdAt: now,
+        });
+      }
 
       return newRefund;
     });

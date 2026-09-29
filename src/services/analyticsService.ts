@@ -101,11 +101,18 @@ export const analyticsService = {
     events.unshift(event);
     persistEvents(events);
 
-    try {
-      await setDoc(doc(db, EVENTS_COLLECTION, event.id), event);
-    } catch {
-      // Fire-and-forget
-    }
+    // P1-ABUSE-01 & P1-15: Single authoritative rate-limited backend ingestion path
+    const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || 'http://127.0.0.1:3000');
+    fetch(`${baseUrl}/api/analytics/event`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: params.type,
+        entityId: params.targetId,
+        sellerId: params.sellerId,
+        metadata: params.metadata,
+      }),
+    }).catch(() => {});
   },
 
   /**

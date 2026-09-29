@@ -138,7 +138,7 @@ const INITIAL_DEMO_VEHICLES: Vehicle[] = [
 
 function initAssignments(): DeliveryAssignment[] {
   if (memoryAssignments.length > 0) return memoryAssignments;
-  if (typeof window === 'undefined') return [];
+  if (typeof localStorage === 'undefined') return [];
   try {
     const raw = localStorage.getItem(DELIVERY_STORAGE_KEY);
     if (!raw) return [];
@@ -152,7 +152,7 @@ function initAssignments(): DeliveryAssignment[] {
 
 function persistAssignments(items: DeliveryAssignment[]) {
   memoryAssignments = items;
-  if (typeof window === 'undefined') return;
+  if (typeof localStorage === 'undefined') return;
   try {
     localStorage.setItem(DELIVERY_STORAGE_KEY, JSON.stringify(items));
   } catch (err) {
@@ -162,7 +162,7 @@ function persistAssignments(items: DeliveryAssignment[]) {
 
 function initDrivers(): DriverProfile[] {
   if (memoryDrivers.length > 0) return memoryDrivers;
-  if (typeof window === 'undefined') return INITIAL_DEMO_DRIVERS;
+  if (typeof localStorage === 'undefined') return INITIAL_DEMO_DRIVERS;
   try {
     const raw = localStorage.getItem(DRIVERS_STORAGE_KEY);
     if (!raw) {
@@ -178,7 +178,7 @@ function initDrivers(): DriverProfile[] {
 
 function persistDrivers(items: DriverProfile[]) {
   memoryDrivers = items;
-  if (typeof window === 'undefined') return;
+  if (typeof localStorage === 'undefined') return;
   try {
     localStorage.setItem(DRIVERS_STORAGE_KEY, JSON.stringify(items));
   } catch (err) {
@@ -232,6 +232,11 @@ export function normalizeDeliveryStatus(
 }
 
 export const deliveryService = {
+  resetMemoryState() {
+    memoryAssignments = [];
+    memoryDrivers = [];
+    memoryVehicles = [];
+  },
   /**
    * Seed assignments in memory for deterministic test fixtures and audits
    */
@@ -497,28 +502,42 @@ export const deliveryService = {
 
     const now = new Date().toISOString();
 
-    // Prevent assigning offline/suspended driver if driverId is given
+    // Section 7: Server-side driver existence, active status, and tenant authorization checks
+    let resolvedDriverName = params.driverName;
+    let resolvedDriverPhone = params.driverPhone;
+    let resolvedVehicleInfo = params.vehicleInfo;
+
     if (params.driverId) {
       const driver = this.getDriverById(params.driverId);
-      if (driver && (driver.status === 'OFFLINE' || driver.status === 'SUSPENDED')) {
+      if (!driver) {
+        throw new Error(`Driver not found: Driver "${params.driverId}" does not exist in registry.`);
+      }
+      if (driver.status === 'OFFLINE' || driver.status === 'SUSPENDED') {
         throw new Error(`Cannot assign driver with status ${driver.status}`);
       }
+      if ((driver as any).sellerId && isSeller && (driver as any).sellerId !== params.actorId) {
+        throw new Error('Forbidden: Driver belongs to a different seller or organization');
+      }
+      // Authoritative population
+      resolvedDriverName = driver.name;
+      resolvedDriverPhone = driver.phone;
+      resolvedVehicleInfo = driver.plateNumber || driver.vehicleType || params.vehicleInfo;
     }
 
-    const isReassignment = !!prev.assignedDriver && prev.assignedDriver !== params.driverName;
-    const newStatus: DeliveryAssignmentStatus = params.driverName ? 'ASSIGNED' : prev.status;
+    const isReassignment = !!prev.assignedDriver && prev.assignedDriver !== resolvedDriverName;
+    const newStatus: DeliveryAssignmentStatus = resolvedDriverName ? 'ASSIGNED' : prev.status;
 
     const updated: DeliveryAssignment = {
       ...prev,
       deliveryType: params.deliveryType,
       driverId: params.driverId || prev.driverId,
-      assignedDriver: params.driverName,
-      driverPhone: params.driverPhone || prev.driverPhone,
-      vehicleInfo: params.vehicleInfo || prev.vehicleInfo,
+      assignedDriver: resolvedDriverName,
+      driverPhone: resolvedDriverPhone || prev.driverPhone,
+      vehicleInfo: resolvedVehicleInfo || prev.vehicleInfo,
       status: newStatus,
       timestamps: {
         ...prev.timestamps,
-        assignedAt: params.driverName ? now : prev.timestamps.assignedAt,
+        assignedAt: resolvedDriverName ? now : prev.timestamps.assignedAt,
       },
       updatedAt: now,
     };
@@ -844,5 +863,9 @@ export const deliveryService = {
     persistAssignments(assignments);
 
     return newAssignment;
+  },
+
+  seedAssignments(assignments: DeliveryAssignment[]) {
+    memoryAssignments = [...assignments];
   },
 };

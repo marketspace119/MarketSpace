@@ -1,5 +1,5 @@
 import { collection, doc, getDoc, getDocs, setDoc, updateDoc } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
 import { User, UserRole } from '../types';
 import { DEMO_ACCOUNTS } from '../context/AuthContext';
 import { auditLogService } from './auditLogService';
@@ -118,14 +118,40 @@ export const userService = {
       status: newStatus,
     };
 
+    // Authoritative Status Mutation: Route exclusively through backend gateway (OPEN-01)
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+      try {
+        const idToken = auth.currentUser ? await auth.currentUser.getIdToken() : '';
+        const res = await fetch('/api/users/update-status', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
+          body: JSON.stringify({
+            targetUserId,
+            newStatus,
+            reason: `Status changed to ${newStatus} by ${actorRole}`,
+          }),
+        });
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || `Failed to update user status via authoritative gateway (HTTP ${res.status})`);
+        }
+      } catch (err) {
+        console.error('Authoritative user status gateway failed:', err);
+        throw err;
+      }
+    } else {
+      try {
+        await updateDoc(doc(db, USERS_COLLECTION, targetUserId), { status: newStatus });
+      } catch (err) {
+        console.warn('Could not update user status in Firestore (test/offline):', err);
+      }
+    }
+
     users[index] = updated;
     persistLocal(users);
-
-    try {
-      await updateDoc(doc(db, USERS_COLLECTION, targetUserId), { status: newStatus });
-    } catch (err) {
-      console.warn('Could not update user status in Firestore:', err);
-    }
 
     // Log to Audit Trail
     await auditLogService.logAction({

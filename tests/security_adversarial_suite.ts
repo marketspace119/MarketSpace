@@ -1,3 +1,8 @@
+process.env.NODE_ENV = 'test';
+process.env.ENABLE_TEST_TOKENS = 'true';
+process.env.FIRESTORE_EMULATOR_HOST = '127.0.0.1:8085';
+process.env.FIREBASE_STORAGE_EMULATOR_HOST = '127.0.0.1:9199';
+
 import assert from 'assert';
 import fs from 'fs';
 import { initializeTestEnvironment, assertFails, RulesTestEnvironment } from '@firebase/rules-unit-testing';
@@ -39,8 +44,16 @@ async function runAdversarialSuite() {
   try {
     testEnv = await initializeTestEnvironment({
       projectId: 'demo-marketspace-adversarial',
-      firestore: { rules: firestoreRules },
-      storage: { rules: storageRules },
+      firestore: {
+        rules: firestoreRules,
+        host: '127.0.0.1',
+        port: 8085,
+      },
+      storage: {
+        rules: storageRules,
+        host: '127.0.0.1',
+        port: 9199,
+      },
     });
     console.log('[AdversarialHarness] Live emulator connected for defense-in-depth rules evaluation.\n');
   } catch (err: any) {
@@ -79,6 +92,14 @@ async function runAdversarialSuite() {
     id: 'user_attacker_admin',
     email: 'attacker_admin@marketspace.test',
     role: 'ADMIN',
+    status: 'active',
+    isVerified: true,
+  });
+  await adminDb.collection('users').doc('user_super_admin').set({
+    id: 'user_super_admin',
+    email: 'marketspace119@gmail.com',
+    role: 'SUPER_ADMIN',
+    status: 'active',
     isVerified: true,
   });
 
@@ -927,6 +948,30 @@ async function runAdversarialSuite() {
     }
 
     await testEnv.cleanup();
+  } else {
+    // Fail-Closed Invariant (OPEN-30): Tests requiring emulator must NOT disappear.
+    // They must be recorded explicitly as BLOCKED / NOT EXECUTED.
+    const blockedAdv = [
+      { id: 'ADV-12', name: 'Direct Firestore Client Write to paymentSubmissions' },
+      { id: 'ADV-13', name: 'Direct Firestore Client Write to paymentReferences' },
+      { id: 'ADV-14', name: 'Cross-Customer Privacy Snooping on paymentReferences' },
+      { id: 'ADV-15', name: 'Direct Customer Order Tampering (Total Forgery)' },
+      { id: 'ADV-16', name: 'Direct Client Order Cancellation on Non-Pending Order' },
+      { id: 'ADV-17', name: 'Audit Trail Deletion / Tampering Attempt by Admin' },
+      { id: 'ADV-18', name: 'Storage Cross-User Avatar Overwrite & Invalid MIME Upload' },
+    ];
+    for (const b of blockedAdv) {
+      recordAttack({
+        id: b.id,
+        attackVector: b.name,
+        category: 'DEFENSE_IN_DEPTH_RULES',
+        payload: 'Runtime emulator execution required',
+        expectedDefensiveResponse: 'PERMISSION_DENIED',
+        actualDefensiveResponse: 'BLOCKED / NOT EXECUTED: Firestore/Storage Emulator required for runtime rules verification but unavailable in container (missing Java runtime)',
+        defenseVerified: false,
+        pass: false,
+      });
+    }
   }
 
   // --------------------------------------------------------------------------

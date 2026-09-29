@@ -6,21 +6,31 @@ service firebase.storage {
       return request.auth != null;
     }
 
+    function isActive() {
+      return isSignedIn() &&
+        (!('status' in request.auth.token) || (
+          request.auth.token.status != 'suspended' &&
+          request.auth.token.status != 'banned' &&
+          request.auth.token.status != 'disabled' &&
+          request.auth.token.status == 'active'
+        )) &&
+        (!('disabled' in request.auth.token) || request.auth.token.disabled != true);
+    }
+
     function isAdmin() {
-      return isSignedIn() && (
+      return isActive() && (
         (request.auth.token.email == 'spacecompanies119@gmail.com' && request.auth.token.email_verified == true) ||
         (request.auth.token.email == 'marketspace119@gmail.com' && request.auth.token.email_verified == true) ||
-        ('admin' in request.auth.token && request.auth.token.admin == true && request.auth.token.email_verified == true)
+        ('admin' in request.auth.token && request.auth.token.admin == true && request.auth.token.email_verified == true) ||
+        ('super_admin' in request.auth.token && request.auth.token.super_admin == true && request.auth.token.email_verified == true) ||
+        ('role' in request.auth.token && (request.auth.token.role == 'ADMIN' || request.auth.token.role == 'SUPER_ADMIN') && request.auth.token.email_verified == true)
       );
     }
 
     function isImage() {
       return request.resource != null &&
-             (request.resource.contentType == 'image/jpeg' ||
-              request.resource.contentType == 'image/png' ||
-              request.resource.contentType == 'image/webp' ||
-              request.resource.contentType == 'image/gif') &&
-             request.resource.size < 5 * 1024 * 1024;
+             request.resource.contentType.matches('image/(jpeg|png|webp|gif)') &&
+             request.resource.size <= 5 * 1024 * 1024;
     }
 
     // Default deny
@@ -31,29 +41,29 @@ service firebase.storage {
     // User avatars
     match /users/{userId}/{fileName} {
       allow read: if true;
-      allow write: if isSignedIn() && (request.auth.uid == userId || isAdmin()) && isImage();
-      allow delete: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow write: if isActive() && (request.auth.uid == userId || isAdmin()) && isImage();
+      allow delete: if isActive() && (request.auth.uid == userId || isAdmin());
     }
 
     // Seller isolated storage (products, store assets, banners: sellers/{sellerId}/...)
     match /sellers/{sellerId}/{allPaths=**} {
       allow read: if true;
-      allow write: if isSignedIn() && (request.auth.uid == sellerId || isAdmin()) && isImage();
-      allow delete: if isSignedIn() && (request.auth.uid == sellerId || isAdmin());
+      allow write: if isActive() && (request.auth.uid == sellerId || isAdmin()) && isImage();
+      allow delete: if isActive() && (request.auth.uid == sellerId || isAdmin());
     }
 
     // Store assets (admin controlled direct upload fallback)
     match /stores/{storeId}/{fileName} {
       allow read: if true;
-      allow write: if isSignedIn() && isAdmin() && isImage();
-      allow delete: if isSignedIn() && isAdmin();
+      allow write: if isActive() && isAdmin() && isImage();
+      allow delete: if isActive() && isAdmin();
     }
 
     // Product images (admin controlled only)
     match /products/{productId}/{fileName} {
       allow read: if true;
-      allow write: if isSignedIn() && isAdmin() && isImage();
-      allow delete: if isSignedIn() && isAdmin();
+      allow write: if isActive() && isAdmin() && isImage();
+      allow delete: if isActive() && isAdmin();
     }
   }
 }

@@ -189,14 +189,14 @@ export const promotionService = {
       createdBy: adminId,
     };
 
-    items.unshift(newListing);
-    persistFeatured(items);
-
     try {
       await setDoc(doc(db, FEATURED_COLLECTION, newListing.id), newListing);
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `${FEATURED_COLLECTION}/${newListing.id}`);
     }
+
+    items.unshift(newListing);
+    persistFeatured(items);
 
     await auditLogService.logAction({
       actorId: adminId,
@@ -304,8 +304,6 @@ export const promotionService = {
       target.endAt = new Date(now.getTime() + target.durationDays * 24 * 60 * 60 * 1000).toISOString();
     }
 
-    persistPromotions(requests);
-
     try {
       await updateDoc(doc(db, PROMOTIONS_COLLECTION, target.id), {
         status: target.status,
@@ -320,6 +318,8 @@ export const promotionService = {
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `${PROMOTIONS_COLLECTION}/${target.id}`);
     }
+
+    persistPromotions(requests);
 
     await auditLogService.logAction({
       actorId: params.adminId,

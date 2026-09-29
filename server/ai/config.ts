@@ -10,7 +10,7 @@ export interface AIConfig {
 
 export const DEFAULT_AI_CONFIG: AIConfig = {
   model: process.env.AI_MODEL || 'gemini-3.8-flash',
-  maxOutputTokens: Number(process.env.AI_MAX_OUTPUT_TOKENS) || 1024,
+  maxOutputTokens: Math.min(4096, Math.max(128, Number(process.env.AI_MAX_OUTPUT_TOKENS) || 1024)),
   temperature: 0.2, // Low temperature for high factual accuracy and reduced hallucination
   timeoutMs: 15000, // 15-second fail-closed timeout
   maxPromptLength: 2000, // Max 2,000 characters for user prompt
@@ -45,7 +45,7 @@ export async function callGeminiSafely(params: {
   const cfg = { ...DEFAULT_AI_CONFIG, ...params.config };
   const client = getGenAIClient();
 
-  if (!client) {
+  if (!client || process.env.NODE_ENV === 'test') {
     if (params.mockFallbackGenerator) {
       return params.mockFallbackGenerator();
     }
@@ -58,16 +58,24 @@ export async function callGeminiSafely(params: {
   });
 
   const apiPromise = (async () => {
-    const response = await client.models.generateContent({
-      model: cfg.model,
-      contents: params.prompt,
-      config: {
-        systemInstruction: params.systemInstruction,
-        maxOutputTokens: cfg.maxOutputTokens,
-        temperature: cfg.temperature,
-      },
-    });
-    return response.text || '';
+    try {
+      const response = await client.models.generateContent({
+        model: cfg.model,
+        contents: params.prompt,
+        config: {
+          systemInstruction: params.systemInstruction,
+          maxOutputTokens: cfg.maxOutputTokens,
+          temperature: cfg.temperature,
+        },
+      });
+      return response.text || '';
+    } catch (err: any) {
+      console.warn('[GeminiAPI] Remote generation error:', err?.message || err);
+      if (params.mockFallbackGenerator) {
+        return params.mockFallbackGenerator();
+      }
+      throw new Error('AI generation temporarily unavailable. Please try again later.');
+    }
   })();
 
   return await Promise.race([apiPromise, timeoutPromise]);

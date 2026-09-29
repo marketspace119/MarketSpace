@@ -1,5 +1,5 @@
 import { collection, doc, getDocs, setDoc, query, orderBy, limit } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
 import { AuditLog, UserRole } from '../types';
 
 const AUDIT_LOGS_STORAGE_KEY = 'marketspace_audit_logs_v1';
@@ -13,36 +13,8 @@ function initAuditLogs(): AuditLog[] {
   try {
     const raw = localStorage.getItem(AUDIT_LOGS_STORAGE_KEY);
     if (!raw) {
-      // Seed some initial baseline platform events
-      const seed: AuditLog[] = [
-        {
-          id: 'audit_01',
-          actorId: 'user_superadmin_01',
-          actorRole: 'SUPER_ADMIN',
-          actorEmail: 'superadmin@marketspace.so',
-          action: 'PLATFORM_INITIALIZED',
-          targetType: 'settings',
-          targetId: 'global_settings',
-          targetName: 'MarketSpace Platform Policy',
-          timestamp: new Date(Date.now() - 86400000 * 3).toISOString(),
-          metadata: { version: '4.0.0', multiVendorEnabled: true },
-        },
-        {
-          id: 'audit_02',
-          actorId: 'user_admin_01',
-          actorRole: 'ADMIN',
-          actorEmail: 'admin@marketspace.so',
-          action: 'SELLER_VERIFIED',
-          targetType: 'seller',
-          targetId: 'user_seller_01',
-          targetName: 'Mustafa Cosmetics',
-          timestamp: new Date(Date.now() - 86400000 * 2).toISOString(),
-          metadata: { badge: 'blue_checkmark', city: 'Mogadishu' },
-        },
-      ];
-      localStorage.setItem(AUDIT_LOGS_STORAGE_KEY, JSON.stringify(seed));
-      memoryAuditLogs = seed;
-      return seed;
+      // Invariant (OPEN-19): Zero synthetic audit events in production UI
+      return [];
     }
     memoryAuditLogs = JSON.parse(raw);
     return memoryAuditLogs;
@@ -109,9 +81,28 @@ export const auditLogService = {
     logs.unshift(newLog);
     persistLocal(logs);
 
-    setDoc(doc(db, AUDIT_LOGS_COLLECTION, id), newLog).catch(err => {
-      console.warn('Could not persist audit log to Firestore:', err);
-    });
+    // P1-AUDIT-01: Authoritative write via trusted server endpoint /api/audit/log
+    if (auth?.currentUser && (entry.actorRole === 'ADMIN' || entry.actorRole === 'SUPER_ADMIN')) {
+      auth.currentUser.getIdToken().then(token => {
+        const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || 'http://127.0.0.1:3000');
+        fetch(`${baseUrl}/api/audit/log`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            action: entry.action,
+            targetType: entry.targetType,
+            targetId: entry.targetId,
+            targetName: entry.targetName,
+            metadata: entry.metadata,
+          }),
+        }).catch(err => {
+          console.warn('[AuditLogService] Server audit endpoint notice:', err?.message || err);
+        });
+      }).catch(() => {});
+    }
 
     return newLog;
   },

@@ -4,8 +4,32 @@ import { getFirestore, connectFirestoreEmulator, doc, getDocFromServer } from 'f
 import { getStorage, connectStorageEmulator } from 'firebase/storage';
 import firebaseConfig from '../../firebase-applet-config.json';
 
-const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+// P0-01 Remediation: Prioritize real environment variables to guarantee browser and backend connect to the exact same Firebase project
+const env: Record<string, any> = typeof import.meta !== 'undefined' && (import.meta as any).env
+  ? (import.meta as any).env
+  : (typeof process !== 'undefined' ? process.env : {});
+
+const resolvedConfig = {
+  apiKey: env.VITE_FIREBASE_API_KEY || (firebaseConfig as any)?.apiKey,
+  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || (firebaseConfig as any)?.authDomain,
+  projectId: env.VITE_FIREBASE_PROJECT_ID || (firebaseConfig as any)?.projectId,
+  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || (firebaseConfig as any)?.storageBucket,
+  messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || (firebaseConfig as any)?.messagingSenderId,
+  appId: env.VITE_FIREBASE_APP_ID || (firebaseConfig as any)?.appId,
+  firestoreDatabaseId: env.VITE_FIREBASE_DATABASE_ID || (firebaseConfig as any)?.firestoreDatabaseId || '(default)',
+};
+
+// Fail-closed invariant in production: prohibit demo configuration in production environments
+if (env.PROD || env.NODE_ENV === 'production') {
+  if (resolvedConfig.projectId === 'marketspace-demo' && !env.ALLOW_DEMO_IN_PROD) {
+    throw new Error(
+      '[FirebaseClient:Critical] Production Misconfiguration (Fail-Closed): Production client cannot connect to demo Firebase project "marketspace-demo". Please set VITE_FIREBASE_PROJECT_ID.'
+    );
+  }
+}
+
+const app = initializeApp(resolvedConfig);
+export const db = getFirestore(app, resolvedConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const storage = getStorage(app);
 

@@ -1,9 +1,12 @@
 import crypto from 'crypto';
-import { getAdminDb, verifyFirebaseBearerToken, getServerIdentityInfo, isCallerSuperAdmin, isCallerPlatformAdmin } from './firebaseAdmin';
-import { seedProducts } from '../src/data/seedProducts';
-import { seedStores } from '../src/data/seedStores';
-import { INITIAL_PLATFORM_COUPONS } from '../src/services/couponService';
+import { getAdminDb, verifyFirebaseBearerToken, getServerIdentityInfo, isCallerSuperAdmin, isCallerPlatformAdmin, assertUserAccountActive, requireAuthenticatedCaller } from './firebaseAdmin';
 import { CartItem, OrderDetails, Product, VendorSubOrder } from '../src/types';
+import {
+  MASTER_PAYMENT_METHODS,
+  normalizePaymentMethod,
+  isValidPaymentMethod,
+  MasterPaymentMethod,
+} from '../src/constants/paymentMethods';
 
 const FREE_SHIPPING_STORE_THRESHOLD = 50.0;
 const DEFAULT_STORE_DELIVERY_FEE = 2.0;
@@ -39,7 +42,7 @@ export interface GatewayOrderRequest {
   email?: string;
   city: string;
   address: string;
-  paymentMethod: 'cash_on_delivery' | 'cod' | 'evc_plus' | 'zaad' | 'sahall' | 'card';
+  paymentMethod: string;
   notes?: string;
   customerId?: string;
   couponCode?: string;
@@ -68,7 +71,8 @@ async function getAuthoritativeProduct(productId: string): Promise<Product | nul
 }
 
 /**
- * Fetch store by ID authoritatively using Admin DB or verified catalog
+ * Fetch store by ID authoritatively using Admin DB only.
+ * Fail-Closed: Never fallback to seed/synthetic data in financial operations.
  */
 async function getAuthoritativeStore(storeId: string) {
   let snap;
@@ -82,25 +86,19 @@ async function getAuthoritativeStore(storeId: string) {
 
   if (snap && snap.exists) {
     const data = snap.data();
-    if (data?.status === 'suspended' || data?.status === 'rejected' || data?.status === 'inactive') {
-      throw new Error(`Store #${storeId} is currently ${data.status} and cannot accept orders`);
+    // Enforce active/approved lifecycle state
+    if (data?.status !== 'approved' && data?.status !== 'active') {
+      throw new Error(`Store #${storeId} is currently "${data?.status || 'unapproved'}" and cannot accept orders. Only approved stores may participate in transactions.`);
     }
     return { ...data, id: snap.id };
-  }
-
-  const found = seedStores.find(s => s.id === storeId);
-  if (found) {
-    if (found.status === 'suspended' || found.status === 'rejected') {
-      throw new Error(`Store #${storeId} is currently ${found.status} and cannot accept orders`);
-    }
-    return found;
   }
 
   throw new Error(`Store #${storeId} not found in authoritative database. Transaction aborted (Fail-Closed).`);
 }
 
 /**
- * Fetch coupon by code authoritatively using Admin DB or verified catalog
+ * Fetch coupon by code authoritatively using Admin DB only.
+ * Fail-Closed: Never fallback to static/untracked coupons in financial checkout.
  */
 async function getAuthoritativeCoupon(code: string) {
   const normalized = code.trim().toUpperCase();
@@ -118,8 +116,7 @@ async function getAuthoritativeCoupon(code: string) {
     return { ...docData, _docId: snap.docs[0].id };
   }
 
-  const found = INITIAL_PLATFORM_COUPONS.find(c => c.code.toUpperCase() === normalized);
-  return found || null;
+  return null;
 }
 
 /**
@@ -135,9 +132,10 @@ async function resolveAuthoritativeCommissionRate(
   sellerType: string,
   category?: string
 ): Promise<{ rate: number; policySource: string }> {
-  // 1. Store Custom Override
-  if (store && typeof store.commissionRate === 'number' && store.commissionRate >= 0) {
-    return { rate: store.commissionRate, policySource: 'seller_specific' };
+  // 1. Store Custom Override (Bounded strictly between 0% and 50% - F-03)
+  if (store && typeof store.commissionRate === 'number' && Number.isFinite(store.commissionRate) && store.commissionRate >= 0) {
+    const boundedRate = Math.min(50, Math.max(0, store.commissionRate));
+    return { rate: boundedRate, policySource: 'seller_specific' };
   }
 
   let globalRate = DEFAULT_COMMISSION_RATE;
@@ -170,24 +168,34 @@ async function resolveAuthoritativeCommissionRate(
       if (data?.categoryCommissionRates) {
         categoryRates = { ...categoryRates, ...data.categoryCommissionRates };
       }
+    } else {
+      // In production, missing authoritative settings MUST fail closed (OPEN-09)
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error('Authoritative platform settings document (platformSettings/default) is missing. Cannot resolve commission rate (Fail-Closed).');
+      }
     }
   } catch (err: any) {
     console.error('[OrderGateway:Error] Failed to read platformSettings for commission resolution:', err);
     throw new Error('Database error while querying authoritative commission policy. Transaction aborted (Fail-Closed).');
   }
 
+  const clampCommission = (r: number): number => {
+    if (typeof r !== 'number' || !Number.isFinite(r) || isNaN(r)) return DEFAULT_COMMISSION_RATE;
+    return Math.min(50, Math.max(0, r));
+  };
+
   // 2. Category Rate
   if (category && categoryRates[category] !== undefined) {
-    return { rate: categoryRates[category], policySource: 'category' };
+    return { rate: clampCommission(categoryRates[category]), policySource: 'category' };
   }
 
   // 3. Seller Type Rate
   if (sellerType && sellerTypeRates[sellerType] !== undefined) {
-    return { rate: sellerTypeRates[sellerType], policySource: 'seller_type' };
+    return { rate: clampCommission(sellerTypeRates[sellerType]), policySource: 'seller_type' };
   }
 
   // 4. Global Platform Rate
-  return { rate: globalRate, policySource: 'global' };
+  return { rate: clampCommission(globalRate), policySource: 'global' };
 }
 
 /**
@@ -205,6 +213,8 @@ export async function processOrderGateway(
   if (authHeader) {
     const decoded = await verifyFirebaseBearerToken(authHeader);
     if (decoded) {
+      // P0-AUTH-02: Universal check to enforce active, non-suspended account status
+      await assertUserAccountActive(decoded.uid);
       verifiedCustomerId = decoded.uid;
       isGuestOrder = false;
 
@@ -261,10 +271,11 @@ export async function processOrderGateway(
   if (!payload.address || !payload.address.trim()) {
     throw new Error('Delivery address is required');
   }
-  if (!payload.paymentMethod) {
-    throw new Error('Payment method is required');
+  const normalizedPaymentMethod = normalizePaymentMethod(payload.paymentMethod);
+  if (!normalizedPaymentMethod) {
+    throw new Error(`Invalid or unsupported payment method: ${payload.paymentMethod || 'empty'}. Supported: ${MASTER_PAYMENT_METHODS.join(', ')}`);
   }
-  if (payload.paymentMethod === 'card') {
+  if (normalizedPaymentMethod === 'card') {
     throw new Error('Card payments are temporarily unavailable awaiting PCI gateway certification');
   }
 
@@ -275,10 +286,24 @@ export async function processOrderGateway(
   const verifiedOrderItems: CartItem[] = [];
   const itemsByStore: Record<string, CartItem[]> = {};
 
+  // Aggregate requested quantities per product ID to prevent multi-line overselling
+  const aggregateQuantitiesByProduct = new Map<string, number>();
+  for (const it of payload.items) {
+    const rawPid = it.productId || (it as any).product?.id || (it as any).id;
+    if (rawPid) {
+      const q = Math.max(1, Math.min(999, Math.floor(Number(it.quantity) || 1)));
+      aggregateQuantitiesByProduct.set(rawPid, (aggregateQuantitiesByProduct.get(rawPid) || 0) + q);
+    }
+  }
+
   for (const clientItem of payload.items) {
-    const product = await getAuthoritativeProduct(clientItem.productId);
+    const rawProductId = clientItem.productId || (clientItem as any).product?.id || (clientItem as any).id;
+    if (!rawProductId) {
+      throw new Error(`Product not found: undefined`);
+    }
+    const product = await getAuthoritativeProduct(rawProductId);
     if (!product) {
-      throw new Error(`Product not found: ${clientItem.productId}`);
+      throw new Error(`Product not found: ${rawProductId}`);
     }
 
     if (product.status && product.status !== 'published' && product.status !== 'approved') {
@@ -287,14 +312,18 @@ export async function processOrderGateway(
 
     const qty = Math.max(1, Math.min(999, Math.floor(Number(clientItem.quantity) || 1)));
 
-    // Stock verification
-    if (product.stock !== undefined && product.stock < qty) {
+    // Stock verification: check aggregate quantity across all lines for this product
+    const totalProductRequested = aggregateQuantitiesByProduct.get(rawProductId) || qty;
+    if (product.stock !== undefined && product.stock < totalProductRequested) {
       const prodTitle = typeof product.title === 'string' ? product.title : product.title?.en || product.title?.ar || product.id;
-      throw new Error(`Insufficient stock for "${prodTitle}". Requested: ${qty}, In Stock: ${product.stock}`);
+      throw new Error(`Insufficient stock for "${prodTitle}". Requested: ${totalProductRequested}, In Stock: ${product.stock}`);
     }
 
-    // Authoritative pricing: NEVER use client price
-    const unitPrice = Math.max(0, Number(product.price) || 0);
+    // Authoritative pricing: NEVER use client price. Fail closed on malformed prices (F-27).
+    if (typeof product.price !== 'number' || isNaN(product.price) || !Number.isFinite(product.price) || product.price < 0) {
+      throw new Error(`Corrupted catalog price for product "${product.id}". Transaction aborted (Fail-Closed).`);
+    }
+    const unitPrice = product.price;
 
     // Verify Addons from catalog
     let verifiedAddonsTotal = 0;
@@ -304,7 +333,9 @@ export async function processOrderGateway(
       for (const clientAddon of clientItem.selectedAddons) {
         const catalogAddon = product.addons?.find(a => a.id === clientAddon.id);
         if (catalogAddon) {
-          const addonPrice = Math.max(0, Number(catalogAddon.price) || 0);
+          const addonPrice = typeof catalogAddon.price === 'number' && Number.isFinite(catalogAddon.price) && catalogAddon.price >= 0
+            ? catalogAddon.price
+            : 0;
           verifiedAddonsTotal += addonPrice;
           const addonNameObj = typeof catalogAddon.name === 'object' && catalogAddon.name !== null
             ? catalogAddon.name
@@ -318,24 +349,43 @@ export async function processOrderGateway(
       }
     }
 
-    const storeId = product.storeId || (
-      product.type === 'restaurants' || product.type === 'restaurant-products'
-        ? 'store_restaurant_01'
-        : product.type === 'services'
-        ? 'store_service_01'
-        : product.type === 'used' || product.type === 'ads'
-        ? 'store_classified_01'
-        : 'store_cosmetics_01'
-    );
-    const sellerId = product.sellerId || (
-      storeId === 'store_restaurant_01'
-        ? 'user_restaurant_01'
-        : storeId === 'store_service_01'
-        ? 'user_service_01'
-        : storeId === 'store_classified_01'
-        ? 'user_classified_01'
-        : 'user_seller_01'
-    );
+    // Authoritative store and seller isolation (F-28): Missing storeId or sellerId fails closed!
+    const storeId = product.storeId;
+    const sellerId = product.sellerId;
+    if (!storeId || !sellerId) {
+      throw new Error(`Authoritative seller/store relationship missing for product "${product.id}". Transaction aborted.`);
+    }
+
+    // Section 10: Server-side validation of product options (color, size) against catalog definitions
+    let verifiedColor: string | undefined = undefined;
+    if (clientItem.selectedOptions?.color) {
+      const cleanColor = String(clientItem.selectedOptions.color).trim().slice(0, 50);
+      if (product.colors && Array.isArray(product.colors) && product.colors.length > 0) {
+        const matched = product.colors.find(c => {
+          const cName = typeof c === 'object' && c !== null
+            ? (typeof c.name === 'object' ? `${c.name.en} ${c.name.ar} ${c.name.so}` : String((c as any).name || ''))
+            : String(c);
+          const cCode = typeof c === 'object' && c !== null && ((c as any).code || (c as any).hex) ? String((c as any).code || (c as any).hex) : '';
+          return cName.toLowerCase().includes(cleanColor.toLowerCase()) || (cCode && cCode.toLowerCase() === cleanColor.toLowerCase());
+        });
+        if (!matched) {
+          throw new Error(`Invalid color option "${cleanColor}" selected for product "${product.id}". Allowed colors: ${product.colors.map(c => typeof c === 'object' ? (c.name?.en || (c as any).name || (c as any).code || (c as any).hex) : c).join(', ')}`);
+        }
+      }
+      verifiedColor = cleanColor;
+    }
+
+    let verifiedSize: string | undefined = undefined;
+    if (clientItem.selectedOptions?.size) {
+      const cleanSize = String(clientItem.selectedOptions.size).trim().slice(0, 50);
+      if (product.sizes && Array.isArray(product.sizes) && product.sizes.length > 0) {
+        const matched = product.sizes.find(s => s.toLowerCase() === cleanSize.toLowerCase());
+        if (!matched) {
+          throw new Error(`Invalid size option "${cleanSize}" selected for product "${product.id}". Allowed sizes: ${product.sizes.join(', ')}`);
+        }
+      }
+      verifiedSize = cleanSize;
+    }
 
     const orderItem: CartItem = {
       id: `${product.id}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
@@ -344,8 +394,8 @@ export async function processOrderGateway(
         price: unitPrice, // Strictly enforce authoritative catalog price
       },
       quantity: qty,
-      selectedColor: clientItem.selectedOptions?.color,
-      selectedSize: clientItem.selectedOptions?.size,
+      selectedColor: verifiedColor,
+      selectedSize: verifiedSize,
       selectedAddons: verifiedSelectedAddons.length > 0 ? (verifiedSelectedAddons as any) : undefined,
       storeId,
       sellerId,
@@ -380,11 +430,12 @@ export async function processOrderGateway(
     }, 0);
     serverCalculatedSubtotal += storeSubtotal;
 
-    // Authoritative Delivery Fee: Store delivery fee or free shipping over threshold
+    // Authoritative Delivery Fee: Store delivery fee or free shipping over threshold (Strictly non-negative & finite - F-04)
     const isFreeShipping = storeSubtotal >= FREE_SHIPPING_STORE_THRESHOLD;
-    const storeDeliveryFee = isFreeShipping
-      ? 0
-      : (typeof store?.deliveryFee === 'number' ? store.deliveryFee : DEFAULT_STORE_DELIVERY_FEE);
+    const rawDeliveryFee = typeof store?.deliveryFee === 'number' && Number.isFinite(store.deliveryFee)
+      ? store.deliveryFee
+      : DEFAULT_STORE_DELIVERY_FEE;
+    const storeDeliveryFee = isFreeShipping ? 0 : Math.max(0, Math.min(500, rawDeliveryFee));
     serverCalculatedShipping += storeDeliveryFee;
 
     // Authoritative 4-Tier Commission calculation (PART 14)
@@ -526,8 +577,6 @@ export async function processOrderGateway(
 
   const sellerIds = Array.from(new Set(vendorOrders.map(v => v.sellerId)));
   const vendorStoreIds = Array.from(new Set(vendorOrders.map(v => v.storeId)));
-  const normalizedPaymentMethod = payload.paymentMethod === 'cod' ? 'cash_on_delivery' : payload.paymentMethod;
-
   const finalOrder: OrderDetails = {
     orderId: parentOrderId,
     customerId: verifiedCustomerId,
@@ -580,58 +629,113 @@ export async function processOrderGateway(
         }
       }
 
-      // 1b. Product stock reads
-      const productDocsToUpdate: Array<{ ref: FirebaseFirestore.DocumentReference; newStock: number }> = [];
+      // 1b. Product stock reads (Aggregated per product ID to prevent duplicate product overselling)
+      const productQuantities = new Map<string, { totalQty: number; title: string }>();
       for (const it of verifiedOrderItems) {
-        if (it.product.stock !== undefined) {
-          const prodRef = adminDb.collection('products').doc(it.product.id);
-          const prodDoc = await transaction.get(prodRef);
-          if (prodDoc.exists) {
-            const currentStock = prodDoc.data()?.stock;
-            if (typeof currentStock === 'number') {
-              if (currentStock < it.quantity) {
-                throw new Error(`Insufficient stock for product "${it.product.title?.en || it.product.id}"`);
-              }
-              productDocsToUpdate.push({
-                ref: prodRef,
-                newStock: currentStock - it.quantity,
-              });
+        if (it.product && it.product.id && it.product.stock !== undefined) {
+          const pid = it.product.id;
+          const current = productQuantities.get(pid) || {
+            totalQty: 0,
+            title: it.product.title?.en || it.product.id,
+          };
+          current.totalQty += it.quantity;
+          productQuantities.set(pid, current);
+        }
+      }
+
+      const productDocsToUpdate: Array<{ ref: FirebaseFirestore.DocumentReference; newStock: number }> = [];
+      for (const [prodId, req] of productQuantities.entries()) {
+        const prodRef = adminDb.collection('products').doc(prodId);
+        const prodDoc = await transaction.get(prodRef);
+        if (prodDoc.exists) {
+          const currentStock = prodDoc.data()?.stock;
+          if (typeof currentStock === 'number') {
+            if (currentStock < req.totalQty) {
+              throw new Error(`Insufficient stock for product "${req.title}". Available: ${currentStock}, Requested: ${req.totalQty}`);
             }
+            productDocsToUpdate.push({
+              ref: prodRef,
+              newStock: currentStock - req.totalQty,
+            });
           }
         }
       }
 
-      // 1c. Coupon read & atomic invariant verification inside transaction
+      // 1c. Coupon read & atomic invariant verification inside transaction (P1-08 & P1-09)
       let couponDocToUpdate: { ref: FirebaseFirestore.DocumentReference; newCount: number; newCustUsage: Record<string, number> } | null = null;
+      let couponUsageLedgerToSet: { ref: FirebaseFirestore.DocumentReference; data: Record<string, any> } | null = null;
+
       if (verifiedCouponDocId) {
         const couponRef = adminDb.collection('coupons').doc(verifiedCouponDocId);
         const couponDoc = await transaction.get(couponRef);
-        if (couponDoc.exists) {
-          const cData = couponDoc.data() || {};
-          if (cData.active === false) {
-            throw new Error(`Coupon '${verifiedCouponCode}' is inactive`);
+        if (!couponDoc.exists) {
+          throw new Error(`Authoritative coupon document not found for '${verifiedCouponCode}'. Transaction aborted (Fail-Closed).`);
+        }
+        const cData = couponDoc.data() || {};
+        if (cData.active === false) {
+          throw new Error(`Coupon '${verifiedCouponCode}' is inactive`);
+        }
+        if (cData.startAt && new Date(cData.startAt).getTime() > Date.now()) {
+          throw new Error(`Coupon '${verifiedCouponCode}' is not yet active`);
+        }
+        if (cData.expireAt && new Date(cData.expireAt).getTime() < Date.now()) {
+          throw new Error(`Coupon '${verifiedCouponCode}' has expired`);
+        }
+        if (typeof cData.minOrderAmount === 'number' && cData.minOrderAmount > 0 && serverCalculatedSubtotal < cData.minOrderAmount) {
+          throw new Error(`Order subtotal does not meet the minimum required for coupon '${verifiedCouponCode}'`);
+        }
+        // Authoritative verification that discount type and value have not changed concurrently
+        const authoritativeDiscountType = cData.discountType || 'percentage';
+        const authoritativeDiscountValue = Number(cData.discountValue) || 0;
+        let recomputedDiscount = 0;
+        if (authoritativeDiscountType === 'percentage') {
+          recomputedDiscount = (serverCalculatedSubtotal * authoritativeDiscountValue) / 100;
+          if (typeof cData.maxDiscount === 'number' && cData.maxDiscount > 0) {
+            recomputedDiscount = Math.min(recomputedDiscount, cData.maxDiscount);
           }
-          const currentCount = Number(cData.usedCount) || 0;
-          if (typeof cData.usageLimit === 'number' && cData.usageLimit > 0 && currentCount >= cData.usageLimit) {
-            throw new Error(`Coupon '${verifiedCouponCode}' usage limit has been reached`);
+        } else {
+          recomputedDiscount = Math.min(serverCalculatedSubtotal, authoritativeDiscountValue);
+        }
+        recomputedDiscount = Number(recomputedDiscount.toFixed(2));
+        if (Math.abs(recomputedDiscount - serverCalculatedDiscount) > 0.01) {
+          throw new Error(`Coupon terms changed concurrently for '${verifiedCouponCode}'. Please retry checkout.`);
+        }
+
+        const currentCount = Number(cData.usedCount) || 0;
+        if (typeof cData.usageLimit === 'number' && cData.usageLimit > 0 && currentCount >= cData.usageLimit) {
+          throw new Error(`Coupon '${verifiedCouponCode}' usage limit has been reached`);
+        }
+        const currentCustUsage = { ...(cData.customerUsage || {}) };
+        if (verifiedCustomerId && typeof cData.perCustomerLimit === 'number' && cData.perCustomerLimit > 0) {
+          const customerUses = currentCustUsage[verifiedCustomerId] || 0;
+          if (customerUses >= cData.perCustomerLimit) {
+            throw new Error(`Coupon '${verifiedCouponCode}' per-customer usage limit exceeded`);
           }
-          const currentCustUsage = { ...(cData.customerUsage || {}) };
-          if (verifiedCustomerId && typeof cData.perCustomerLimit === 'number' && cData.perCustomerLimit > 0) {
-            const customerUses = currentCustUsage[verifiedCustomerId] || 0;
-            if (customerUses >= cData.perCustomerLimit) {
-              throw new Error(`Coupon '${verifiedCouponCode}' per-customer usage limit exceeded`);
-            }
-          }
-          if (verifiedCustomerId) {
-            currentCustUsage[verifiedCustomerId] = (currentCustUsage[verifiedCustomerId] || 0) + 1;
-          }
-          couponDocToUpdate = {
-            ref: couponRef,
-            newCount: currentCount + 1,
-            newCustUsage: currentCustUsage,
+        }
+        if (verifiedCustomerId) {
+          currentCustUsage[verifiedCustomerId] = (currentCustUsage[verifiedCustomerId] || 0) + 1;
+        }
+        couponDocToUpdate = {
+          ref: couponRef,
+          newCount: currentCount + 1,
+          newCustUsage: currentCustUsage,
+        };
+
+          // P1-09: Isolated atomic ledger entry per usage to prevent monolithic document bloat
+          const usageDocId = `use_${verifiedCouponDocId}_${verifiedCustomerId}_${Date.now()}`;
+          const usageLedgerRef = adminDb.collection('couponUsages').doc(usageDocId);
+          couponUsageLedgerToSet = {
+            ref: usageLedgerRef,
+            data: {
+              id: usageDocId,
+              couponId: verifiedCouponDocId,
+              couponCode: verifiedCouponCode,
+              customerId: verifiedCustomerId,
+              orderId: finalOrder.orderId,
+              usedAt: now,
+            },
           };
         }
-      }
 
       // Step 2: All Transactional Writes SECOND
       // 2a. Update product stocks
@@ -642,13 +746,16 @@ export async function processOrderGateway(
         });
       }
 
-      // 2b. Update coupon usage
+      // 2b. Update coupon usage & write to ledger
       if (couponDocToUpdate) {
         transaction.update(couponDocToUpdate.ref, {
           usedCount: couponDocToUpdate.newCount,
           customerUsage: couponDocToUpdate.newCustUsage,
           updatedAt: now,
         });
+      }
+      if (couponUsageLedgerToSet) {
+        transaction.set(couponUsageLedgerToSet.ref, couponUsageLedgerToSet.data);
       }
 
       // 2c. Write authoritative order
@@ -712,109 +819,133 @@ export async function processSubOrderUpdateGateway(
   if (!authHeader) {
     throw new Error('Authentication required: Missing Authorization Bearer token');
   }
-  const decoded = await verifyFirebaseBearerToken(authHeader);
-  if (!decoded) {
-    throw new Error('Authentication failed: Invalid or expired Firebase ID token');
-  }
+  const caller = await requireAuthenticatedCaller(authHeader);
 
   const { parentOrderId, subOrderId, newStatus, trackingNumber, note } = payload;
   if (!parentOrderId || !subOrderId || !newStatus) {
     throw new Error('Missing required fields: parentOrderId, subOrderId, newStatus');
   }
 
-  let snap;
-  try {
-    const adminDb = getAdminDb();
-    const orderRef = adminDb.collection('orders').doc(parentOrderId);
-    snap = await orderRef.get();
-  } catch (err: any) {
-    console.error('[OrderGateway:Error] Firestore read failed for suborder update:', err?.message || err);
-    throw new Error(`Database read failure: Unable to retrieve parent order ${parentOrderId}. Operation aborted (Fail-Closed).`);
-  }
-
-  if (!snap || !snap.exists) {
-    throw new Error(`Order ${parentOrderId} not found in authoritative database`);
-  }
-
-  const orderData = snap.data() as any;
-  const vendorOrders = orderData.vendorOrders || [];
-  const subIndex = vendorOrders.findIndex((s: any) => s.subOrderId === subOrderId);
-
-  if (subIndex === -1) {
-    throw new Error(`Sub-order ${subOrderId} not found in order ${parentOrderId}`);
-  }
-
-  const subOrder = vendorOrders[subIndex];
-  const callerUid = decoded.uid;
-  const isSuperAdminUser = isCallerSuperAdmin(decoded);
-  const isAdminUser = isCallerPlatformAdmin(decoded);
-
-  // Strict Tenant Isolation: Only the sub-order seller or an admin can update fulfillment status
-  if (!isAdminUser && subOrder.sellerId !== callerUid) {
-    throw new Error('Forbidden: You can only update sub-orders for your own store');
-  }
-
-  // Forward-only state machine (Terminal state protection)
-  if (subOrder.status === 'delivered' && newStatus !== 'delivered') {
-    throw new Error('Terminal state violation: Delivered sub-orders cannot be reopened');
-  }
-  if (subOrder.status === 'cancelled' && newStatus !== 'cancelled') {
-    throw new Error('Terminal state violation: Cancelled sub-orders cannot be reactivated');
-  }
-
-  // IMMUTABILITY OF FINANCIAL FIELDS:
-  // Clone the sub-order preserving subtotal, total, platformCommission, sellerRevenue, commissionRate, deliveryFee, items, etc.
-  const updatedSubOrder = {
-    ...subOrder,
-    status: newStatus,
-    ...(trackingNumber ? { trackingNumber } : {}),
-  };
-
-  const now = new Date().toISOString();
-  const historyEntry = {
-    status: newStatus,
-    timestamp: now,
-    actor: callerUid,
-    note: note || `Sub-order status updated to ${newStatus}`,
-  };
-
-  updatedSubOrder.statusHistory = [...(updatedSubOrder.statusHistory || []), historyEntry];
-  const updatedVendorOrders = [...vendorOrders];
-  updatedVendorOrders[subIndex] = updatedSubOrder;
-
-  let nextOrderStatus = orderData.status;
-  const allDelivered = updatedVendorOrders.every((s: any) => s.status === 'delivered' || s.status === 'completed');
-  const allCancelled = updatedVendorOrders.length > 0 && updatedVendorOrders.every((s: any) => s.status === 'cancelled');
-  if (allDelivered) {
-    nextOrderStatus = 'delivered';
-  } else if (allCancelled) {
-    nextOrderStatus = 'cancelled';
-  } else if (updatedVendorOrders.some((s: any) =>
-    s.status === 'preparing' ||
-    s.status === 'in_progress' ||
-    s.status === 'ready' ||
-    s.status === 'shipped' ||
-    s.status === 'out_for_delivery'
-  )) {
-    nextOrderStatus = 'processing';
-  }
-
-  const updatedStatusHistory = [...(orderData.statusHistory || []), historyEntry];
+  const adminDb = getAdminDb();
+  const orderRef = adminDb.collection('orders').doc(parentOrderId);
 
   try {
-    const adminDb = getAdminDb();
-    const orderRef = adminDb.collection('orders').doc(parentOrderId);
-    await orderRef.update({
-      status: nextOrderStatus,
-      vendorOrders: updatedVendorOrders,
-      statusHistory: updatedStatusHistory,
-      ...(trackingNumber ? { deliveryTrackingCode: trackingNumber } : {}),
-      updatedAt: now,
+    const result = await adminDb.runTransaction(async (transaction) => {
+      const snap = await transaction.get(orderRef);
+      if (!snap || !snap.exists) {
+        throw new Error(`Order ${parentOrderId} not found in authoritative database`);
+      }
+
+      const orderData = snap.data() as any;
+      const vendorOrders = orderData.vendorOrders || [];
+      const subIndex = vendorOrders.findIndex((s: any) => s.subOrderId === subOrderId);
+
+      if (subIndex === -1) {
+        throw new Error(`Sub-order ${subOrderId} not found in order ${parentOrderId}`);
+      }
+
+      const subOrder = vendorOrders[subIndex];
+      const callerUid = caller.uid;
+      const isAdminUser = caller.isPlatformAdmin;
+
+      // Strict Tenant Isolation: Only the sub-order seller or an admin can update fulfillment status
+      if (!isAdminUser && subOrder.sellerId !== callerUid) {
+        throw new Error('Forbidden: You can only update sub-orders for your own store');
+      }
+
+      // Forward-only state machine (Terminal state protection and transition enforcement - F-06)
+      const validSubOrderStatuses = [
+        'pending', 'confirmed', 'preparing', 'ready', 'shipped', 'out_for_delivery', 'delivered', 'cancelled'
+      ];
+      if (!validSubOrderStatuses.includes(newStatus)) {
+        throw new Error(`Invalid sub-order status "${newStatus}". Must be one of: ${validSubOrderStatuses.join(', ')}`);
+      }
+
+      const currentStatus = subOrder.status || 'pending';
+
+      if (currentStatus === 'delivered' && newStatus !== 'delivered') {
+        throw new Error('Terminal state violation: Delivered sub-orders cannot be reopened');
+      }
+      if (currentStatus === 'cancelled' && newStatus !== 'cancelled') {
+        throw new Error('Terminal state violation: Cancelled sub-orders cannot be reactivated');
+      }
+
+      const ALLOWED_SUBORDER_TRANSITIONS: Record<string, string[]> = {
+        pending: ['confirmed', 'preparing', 'cancelled'],
+        confirmed: ['preparing', 'ready', 'cancelled'],
+        preparing: ['ready', 'shipped', 'out_for_delivery', 'cancelled'],
+        ready: ['shipped', 'out_for_delivery', 'cancelled'],
+        shipped: ['out_for_delivery', 'delivered', 'cancelled'],
+        out_for_delivery: ['delivered', 'cancelled'],
+        delivered: [],
+        cancelled: [],
+      };
+
+      if (currentStatus !== newStatus && !isAdminUser) {
+        const allowed = ALLOWED_SUBORDER_TRANSITIONS[currentStatus] || [];
+        if (!allowed.includes(newStatus)) {
+          throw new Error(`Invalid forward transition from "${currentStatus}" to "${newStatus}". Allowed transitions: ${allowed.length ? allowed.join(', ') : 'none'}`);
+        }
+      }
+
+      // IMMUTABILITY OF FINANCIAL FIELDS:
+      // Clone the sub-order preserving subtotal, total, platformCommission, sellerRevenue, commissionRate, deliveryFee, items, etc.
+      const updatedSubOrder = {
+        ...subOrder,
+        status: newStatus,
+        ...(trackingNumber ? { trackingNumber } : {}),
+      };
+
+      const now = new Date().toISOString();
+      const historyEntry = {
+        status: newStatus,
+        timestamp: now,
+        actor: callerUid,
+        note: note || `Sub-order status updated to ${newStatus}`,
+      };
+
+      updatedSubOrder.statusHistory = [...(updatedSubOrder.statusHistory || []), historyEntry];
+      const updatedVendorOrders = [...vendorOrders];
+      updatedVendorOrders[subIndex] = updatedSubOrder;
+
+      let nextOrderStatus = orderData.status;
+      const allDelivered = updatedVendorOrders.every((s: any) => s.status === 'delivered' || s.status === 'completed');
+      const allCancelled = updatedVendorOrders.length > 0 && updatedVendorOrders.every((s: any) => s.status === 'cancelled');
+      if (allDelivered) {
+        nextOrderStatus = 'delivered';
+      } else if (allCancelled) {
+        nextOrderStatus = 'cancelled';
+      } else if (updatedVendorOrders.some((s: any) =>
+        s.status === 'preparing' ||
+        s.status === 'in_progress' ||
+        s.status === 'ready' ||
+        s.status === 'shipped' ||
+        s.status === 'out_for_delivery'
+      )) {
+        nextOrderStatus = 'processing';
+      }
+
+      const updatedStatusHistory = [...(orderData.statusHistory || []), historyEntry];
+
+      transaction.update(orderRef, {
+        status: nextOrderStatus,
+        vendorOrders: updatedVendorOrders,
+        statusHistory: updatedStatusHistory,
+        ...(trackingNumber ? { deliveryTrackingCode: trackingNumber } : {}),
+        updatedAt: now,
+      });
+
+      return { success: true, updatedVendorOrders };
     });
+
+    return result;
   } catch (err: any) {
-    console.error('[OrderGateway:Error] Firestore update failed for suborder status:', err?.message || err);
+    if (err?.message?.includes('Forbidden') || err?.message?.includes('Terminal') || err?.message?.includes('Invalid') || err?.message?.includes('not found')) {
+      throw err;
+    }
+    console.error('[OrderGateway:Error] Firestore transaction failed for suborder update:', err?.message || err);
     throw new Error('Database write failure: Unable to persist sub-order status update. Operation aborted (Fail-Closed).');
   }
-
-  return { success: true, updatedVendorOrders };
 }
+
+export const processOrderCreationGateway = processOrderGateway;

@@ -13,6 +13,7 @@ import { orderService } from '../services/orderService';
 import { addressService } from '../services/addressService';
 import { notificationService } from '../services/notificationService';
 import { messagingService } from '../services/messagingService';
+import { paymentService } from '../services/paymentService';
 
 interface AuthContextType {
   user: User | null;
@@ -134,12 +135,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
           if (userDocSnap.exists()) {
             const data = userDocSnap.data() as User;
-            // Elevate if present in admin collection or platform owner email (STRICT REQUIREMENT: email_verified === true)
+            // Elevate if verified owner or present in admin collection (F-20: Obey documented role hierarchy)
             let effectiveRole = data.role;
             const isVerifiedOwner = fbUser.emailVerified === true &&
               (fbUser.email === 'spacecompanies119@gmail.com' || fbUser.email === 'marketspace119@gmail.com');
-            if (adminDocSnap.exists() || isVerifiedOwner) {
+            if (isVerifiedOwner) {
               effectiveRole = 'SUPER_ADMIN';
+            } else if (adminDocSnap.exists()) {
+              const adminData = adminDocSnap.data();
+              effectiveRole = adminData?.role === 'SUPER_ADMIN' ? 'SUPER_ADMIN' : 'ADMIN';
             }
             const updatedUser: User = {
               ...data,
@@ -156,8 +160,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             let initialRole: UserRole = 'CUSTOMER';
             const isVerifiedOwner = fbUser.emailVerified === true &&
               (fbUser.email === 'spacecompanies119@gmail.com' || fbUser.email === 'marketspace119@gmail.com');
-            if (adminDocSnap.exists() || isVerifiedOwner) {
+            if (isVerifiedOwner) {
               initialRole = 'SUPER_ADMIN';
+            } else if (adminDocSnap.exists()) {
+              const adminData = adminDocSnap.data();
+              initialRole = adminData?.role === 'SUPER_ADMIN' ? 'SUPER_ADMIN' : 'ADMIN';
             }
             const newUser: User = {
               id: fbUser.uid,
@@ -303,11 +310,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setUser(null);
     setToken(null);
     localStorage.removeItem(AUTH_USER_KEY);
-    // Purge user-isolated data caches on logout
+    // Purge user-isolated data caches on logout (F-22, F-23, OPEN-21)
     orderService.clearUserCache();
     addressService.clearUserCache();
     notificationService.clearUserCache();
     messagingService.clearUserCache();
+    paymentService.clearUserCache();
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem('marketspace_cart');
+      localStorage.removeItem('marketspace_favorites');
+      localStorage.removeItem('marketspace_recent_searches');
+      localStorage.removeItem('marketspace_recently_viewed');
+      localStorage.removeItem('marketspace_bookings_v1');
+      localStorage.removeItem('marketspace_user_addresses');
+      localStorage.removeItem('marketspace_audit_logs_v1');
+    }
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.clear();
+    }
   };
 
   const updateUser = async (updates: Partial<User>) => {

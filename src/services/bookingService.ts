@@ -10,7 +10,7 @@ let memoryBookings: ServiceBooking[] = [];
 
 function initBookings(): ServiceBooking[] {
   if (memoryBookings.length > 0) return memoryBookings;
-  if (typeof window === 'undefined') return [];
+  if (typeof localStorage === 'undefined') return [];
   try {
     const raw = localStorage.getItem(BOOKINGS_STORAGE_KEY);
     memoryBookings = raw ? JSON.parse(raw) : [];
@@ -23,7 +23,7 @@ function initBookings(): ServiceBooking[] {
 
 function persistLocal(bookings: ServiceBooking[]) {
   memoryBookings = bookings;
-  if (typeof window === 'undefined') return;
+  if (typeof localStorage === 'undefined') return;
   try {
     localStorage.setItem(BOOKINGS_STORAGE_KEY, JSON.stringify(bookings));
   } catch (err) {
@@ -31,7 +31,23 @@ function persistLocal(bookings: ServiceBooking[]) {
   }
 }
 
+export const ALLOWED_BOOKING_TRANSITIONS: Record<ServiceBooking['status'], ServiceBooking['status'][]> = {
+  requested: ['accepted', 'confirmed', 'cancelled'],
+  accepted: ['scheduled', 'in_progress', 'cancelled'],
+  confirmed: ['scheduled', 'in_progress', 'cancelled'],
+  scheduled: ['in_progress', 'completed', 'cancelled'],
+  in_progress: ['completed', 'cancelled'],
+  completed: [], // Terminal
+  cancelled: [], // Terminal
+};
+
 export const bookingService = {
+  resetMemoryState() {
+    memoryBookings = [];
+  },
+  seedBookings(bookings: ServiceBooking[]) {
+    memoryBookings = [...bookings];
+  },
   async syncWithFirestore(filter?: { customerId?: string; sellerId?: string; isAdmin?: boolean }): Promise<ServiceBooking[]> {
     try {
       let q;
@@ -71,9 +87,11 @@ export const bookingService = {
     bookings.unshift(newBooking);
     persistLocal(bookings);
 
-    // Persist to Cloud Firestore
+    // Persist to Cloud Firestore with rollback on failure
     setDoc(doc(db, BOOKINGS_COLLECTION, newBooking.id), newBooking).catch(err => {
-      console.warn('Could not write booking to Firestore immediately:', err);
+      console.warn('Could not write booking to Firestore immediately, rolling back local cache:', err);
+      const current = initBookings().filter(b => b.id !== newBooking.id);
+      persistLocal(current);
     });
 
     // Notify Service Provider
@@ -134,11 +152,22 @@ export const bookingService = {
       throw new Error('Forbidden: You can only manage bookings for your own services');
     }
 
+    // Section 6: Enforce valid state machine transition
+    const allowed = ALLOWED_BOOKING_TRANSITIONS[booking.status] || [];
+    if (!allowed.includes(status)) {
+      throw new Error(`Illegal booking status transition: cannot transition from "${booking.status}" to "${status}". Allowed transitions: ${allowed.join(', ') || 'none (terminal state)'}`);
+    }
+
+    const previousStatus = booking.status;
     booking.status = status;
     bookings[index] = booking;
     persistLocal(bookings);
 
     updateDoc(doc(db, BOOKINGS_COLLECTION, bookingId), { status }).catch(err => {
+      // Rollback local cache on Firestore write failure
+      booking.status = previousStatus;
+      bookings[index] = booking;
+      persistLocal(bookings);
       handleFirestoreError(err, OperationType.UPDATE, `${BOOKINGS_COLLECTION}/${bookingId}`);
     });
 

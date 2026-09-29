@@ -1,0 +1,66 @@
+name: MarketSpace Security & CI Release Gate
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  security-and-build-gate:
+    name: Build, Static Typecheck & Forensic Security Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js (LTS 20)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Setup Java (Required for Firebase Local Emulators)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Dependency Vulnerability Audit
+        run: npm audit --audit-level=high
+
+      - name: TypeScript Typecheck (Zero Errors Allowed)
+        run: npm run lint
+
+      - name: Production Webpack/Vite Server Bundle Build
+        run: npm run build
+
+      - name: Run Deterministic Gap Closure Test Suite
+        run: npx tsx tests/gap_closure_suite.ts
+
+      - name: Run Strict Repair Regression Test Suite
+        run: npx tsx tests/strict_final_repair_regression_suite.ts
+
+      - name: Run AI Security & RBAC Policy Suite
+        run: npx tsx tests/ai_security_suite.ts
+
+      - name: Run Firebase Emulator Rules & Storage Integration Tests
+        run: npm run test:integration
+        env:
+          NODE_ENV: test
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8085
+          FIREBASE_STORAGE_EMULATOR_HOST: 127.0.0.1:9199
+
+      - name: Run Adversarial Security Negative Test Suite
+        run: npm run test:adversarial
+        env:
+          NODE_ENV: test
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8085
+          FIREBASE_STORAGE_EMULATOR_HOST: 127.0.0.1:9199
+
+      - name: Security Sign-Off Verification
+        run: echo "CI Release Gate PASSED with 0 Critical, 0 High vulnerabilities."

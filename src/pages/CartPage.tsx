@@ -106,6 +106,10 @@ export const CartPage: React.FC<CartPageProps> = ({ onNavigate }) => {
   const [checkoutError, setCheckoutError] = useState<string | null>(null);
   const [completedOrder, setCompletedOrder] = useState<OrderDetails | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
+  // Section 9: Persistent logical checkout session idempotency key prevents duplicates across retries
+  const [checkoutIdempotencyKey, setCheckoutIdempotencyKey] = useState<string>(
+    () => `chk_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`
+  );
 
   // Load saved addresses for authenticated customer
   useEffect(() => {
@@ -213,7 +217,11 @@ export const CartPage: React.FC<CartPageProps> = ({ onNavigate }) => {
         items: [...items],
         customerId: user?.id,
         couponCode: appliedCoupon || undefined,
+        idempotencyKey: checkoutIdempotencyKey,
       });
+
+      // Reset idempotency key for any future orders
+      setCheckoutIdempotencyKey(`chk_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`);
 
       // Automatically save address if user requested
       if (user?.id && saveThisAddress && selectedAddressId === 'new') {

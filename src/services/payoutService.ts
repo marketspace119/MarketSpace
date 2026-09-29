@@ -8,39 +8,8 @@ import { normalizePayout } from '../lib/dataNormalization';
 const PAYOUTS_STORAGE_KEY = 'marketspace_payouts_v1';
 const PAYOUTS_COLLECTION = 'payoutRequests';
 
-const seedPayouts: PayoutRequest[] = [
-  {
-    id: 'pay_01',
-    sellerId: 'user_seller_01',
-    storeId: 'store_cosmetics_01',
-    sellerName: 'Mustafa Cosmetics',
-    storeName: 'متجر مصطفى لمستحضرات التجميل',
-    amount: 150.0,
-    paymentMethod: 'zaad',
-    settlementType: 'MANUAL_SETTLEMENT',
-    accountNumber: '+252 63 4112233',
-    accountName: 'Mustafa Cosmetics Sole',
-    status: 'paid',
-    requestedAt: '2025-02-15T10:00:00Z',
-    processedAt: '2025-02-15T14:30:00Z',
-    notes: 'تم التحويل يدوياً وتسوية المعاملة عبر خدمة زاد (Ref: ZAD-98231)',
-  },
-  {
-    id: 'pay_02',
-    sellerId: 'user_restaurant_01',
-    storeId: 'store_restaurant_01',
-    sellerName: 'Chef Sultan',
-    storeName: 'مطعم الشيف سلطان',
-    amount: 280.0,
-    paymentMethod: 'evc_plus',
-    settlementType: 'MANUAL_SETTLEMENT',
-    accountNumber: '+252 61 2112233',
-    accountName: 'Sultan Food Services',
-    status: 'pending',
-    requestedAt: new Date(Date.now() - 3600000 * 24).toISOString(),
-    notes: 'طلب سحب أرباح مبيعات الأسبوع المنصرم',
-  },
-];
+// P1-23: Do not fabricate synthetic merchant payouts offline; real financial records must come from authoritative database
+const seedPayouts: PayoutRequest[] = [];
 
 let memoryPayouts: PayoutRequest[] = [];
 
@@ -226,38 +195,42 @@ export const payoutService = {
       throw new Error('Cannot modify terminal rejected payout: لا يمكن تعديل طلب سحب مرفوض');
     }
 
-    const now = new Date().toISOString();
-    const updated: PayoutRequest = {
-      ...prev,
-      status: params.newStatus,
-      notes: params.notes || prev.notes,
-      reviewedBy: params.actorId,
-      processedAt: params.newStatus === 'paid' || params.newStatus === 'approved' ? now : prev.processedAt,
-    };
-
-    // SEC-02: Durable Firestore write strictly Fail-Closed.
-    // NEVER swallow PERMISSION_DENIED or any database authorization errors!
-    try {
-      await setDoc(doc(db, PAYOUTS_COLLECTION, params.payoutId), cleanForFirestore(updated), { merge: true });
-    } catch (err: any) {
-      console.error('[PayoutService:Error] Authoritative Firestore payout write failed (Fail-Closed):', err?.message);
-      handleFirestoreError(err, OperationType.UPDATE, `${PAYOUTS_COLLECTION}/${params.payoutId}`);
-      throw err;
+    // Authoritative Server-Side Review Gateway (P1-RBAC-02)
+    let token = '';
+    if (auth?.currentUser) {
+      try {
+        token = await auth.currentUser.getIdToken();
+      } catch (e) {}
     }
 
-    // Update local display cache ONLY after authoritative write succeeds
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || 'http://127.0.0.1:3000');
+    const res = await fetch(`${baseUrl}/api/payouts/review`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        payoutId: params.payoutId,
+        newStatus: params.newStatus,
+        notes: params.notes,
+      }),
+    });
+
+    const resData = await res.json().catch(() => ({}));
+    if (!res.ok || !resData.success || !resData.payout) {
+      throw new Error(resData.error || `فشل مراجعة طلب السحب عبر البوابة الموثوقة (HTTP ${res.status})`);
+    }
+
+    const updated: PayoutRequest = resData.payout;
+
+    // Update local display cache ONLY after authoritative write succeeds (P1-CONS-01)
     payouts[index] = updated;
     persistLocal(payouts);
-
-    await auditLogService.logAction({
-      actorId: params.actorId,
-      actorRole: params.actorRole,
-      action: `PAYOUT_${params.newStatus.toUpperCase()}`,
-      targetType: 'payout',
-      targetId: params.payoutId,
-      targetName: `Payout to ${prev.sellerName || prev.accountName} ($${prev.amount})`,
-      metadata: { method: prev.paymentMethod, amount: prev.amount, notes: params.notes },
-    });
 
     return updated;
   },

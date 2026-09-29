@@ -22,6 +22,7 @@ service cloud.firestore {
 
     function isSuperAdmin() {
       return isSignedIn() &&
+        isUserActive(request.auth.uid) &&
         ('email_verified' in request.auth.token && request.auth.token.email_verified == true) && (
           (('email' in request.auth.token &&
             (request.auth.token.email == 'spacecompanies119@gmail.com' ||
@@ -32,15 +33,36 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isSignedIn() && (
+      return isSignedIn() && isUserActive(request.auth.uid) && (
         isSuperAdmin() ||
         (('email_verified' in request.auth.token && request.auth.token.email_verified == true) && (
-          exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+          (exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+           (get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'ADMIN' ||
+            get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role == 'SUPER_ADMIN')) ||
           (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
            (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN' ||
             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'SUPER_ADMIN'))
         ))
       );
+    }
+
+    // Centralized Account State Verification (P0-02, P0-04, P1-04)
+    // Ensures suspended, disabled, or banned users are strictly forbidden from performing client writes
+    function isUserActive(uid) {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/users/$(uid)) &&
+        (!('status' in get(/databases/$(database)/documents/users/$(uid)).data) || (
+          get(/databases/$(database)/documents/users/$(uid)).data.status != 'suspended' &&
+          get(/databases/$(database)/documents/users/$(uid)).data.status != 'banned' &&
+          get(/databases/$(database)/documents/users/$(uid)).data.status != 'disabled'
+        )) &&
+        (!('disabled' in get(/databases/$(database)/documents/users/$(uid)).data) ||
+         get(/databases/$(database)/documents/users/$(uid)).data.disabled != true)
+      );
+    }
+
+    function isActiveUser() {
+      return isSignedIn() && isUserActive(request.auth.uid);
     }
 
     // 1. Users Collection
@@ -56,9 +78,16 @@ service cloud.firestore {
       (!('balance' in incoming()) || incoming().balance == 0);
 
       allow update: if isSignedIn() && (
-        // Super Admin has full authoritative privileges
-        isSuperAdmin() ||
-        // Regular Admin CANNOT modify role, isVerified, sellerStatus, permissions, or balance
+        // Super Admin profile updates (status/disabled must go through backend gateway)
+        (isSuperAdmin() &&
+         incoming().id == existing().id &&
+         incoming().role == existing().role &&
+         (!('status' in incoming()) || incoming().status == existing().status) &&
+         (!('disabled' in incoming()) || incoming().disabled == existing().disabled) &&
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'name', 'phone', 'avatar', 'notes', 'updatedAt', 'addresses', 'preferredLanguage'
+         ])) ||
+        // Regular Admin CANNOT modify role, isVerified, sellerStatus, permissions, balance, OR status (OPEN-01)
         (isAdmin() &&
          incoming().id == existing().id &&
          incoming().role == existing().role &&
@@ -66,11 +95,14 @@ service cloud.firestore {
          (!('sellerStatus' in incoming()) || incoming().sellerStatus == existing().sellerStatus) &&
          (!('permissions' in incoming()) || incoming().permissions == existing().permissions) &&
          (!('balance' in incoming()) || incoming().balance == existing().balance) &&
+         (!('status' in incoming()) || incoming().status == existing().status) &&
+         (!('disabled' in incoming()) || incoming().disabled == existing().disabled) &&
          incoming().diff(existing()).affectedKeys().hasOnly([
-           'name', 'phone', 'avatar', 'status', 'notes', 'updatedAt', 'addresses'
+           'name', 'phone', 'avatar', 'notes', 'updatedAt', 'addresses'
          ])) ||
-        // Customer updating their own profile (strictly non-privilege fields)
+        // Active Customer updating their own profile (strictly non-privilege fields)
         (request.auth.uid == userId &&
+         isUserActive(userId) &&
          incoming().id == existing().id &&
          incoming().role == existing().role &&
          (!('isVerified' in incoming()) || incoming().isVerified == existing().isVerified) &&
@@ -94,7 +126,7 @@ service cloud.firestore {
     match /sellerApplications/{applicationId} {
       allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
-      allow create: if isSignedIn() && incoming().userId == request.auth.uid && incoming().status == 'pending';
+      allow create: if isActiveUser() && incoming().userId == request.auth.uid && incoming().status == 'pending';
       allow update, delete: if isAdmin();
     }
 
@@ -104,16 +136,23 @@ service cloud.firestore {
       allow list: if true;
       allow create: if isSignedIn() && (
         isAdmin() ||
-        (incoming().sellerId == request.auth.uid &&
+        (isActiveUser() &&
+         incoming().sellerId == request.auth.uid &&
          incoming().status == 'pending' &&
          incoming().isVerified == false &&
-         (!('commissionRate' in incoming()) || incoming().commissionRate >= 10))
+         (!('commissionRate' in incoming()) || (incoming().commissionRate >= 5 && incoming().commissionRate <= 50)) &&
+         (!('deliveryFee' in incoming()) || (incoming().deliveryFee >= 0 && incoming().deliveryFee <= 500)))
       );
       allow update: if isSignedIn() && (
         isSuperAdmin() ||
-        (isAdmin() && incoming().sellerId == existing().sellerId) ||
-        (resource.data.sellerId == request.auth.uid &&
+        (isAdmin() && incoming().sellerId == existing().sellerId &&
+         (!('commissionRate' in incoming()) || (incoming().commissionRate >= 5 && incoming().commissionRate <= 50)) &&
+         (!('deliveryFee' in incoming()) || (incoming().deliveryFee >= 0 && incoming().deliveryFee <= 500))) ||
+        (isActiveUser() &&
+         resource.data.sellerId == request.auth.uid &&
          incoming().sellerId == existing().sellerId &&
+         (!('deliveryFee' in incoming()) || (incoming().deliveryFee >= 0 && incoming().deliveryFee <= 500)) &&
+         (!('commissionRate' in incoming()) || incoming().commissionRate == existing().commissionRate) &&
          incoming().diff(existing()).affectedKeys().hasOnly([
            'name', 'description', 'phone', 'whatsapp', 'email', 'city', 'district',
            'address', 'openingHours', 'deliveryAvailable', 'deliveryFee', 'minOrder',
@@ -129,29 +168,32 @@ service cloud.firestore {
       allow list: if true;
       allow create: if isSignedIn() && (
         isAdmin() ||
-        (incoming().sellerId == request.auth.uid &&
+        (isActiveUser() &&
+         incoming().sellerId == request.auth.uid &&
          incoming().price is number && incoming().price >= 0 &&
          incoming().stock is number && incoming().stock >= 0 &&
-         (incoming().status in ['active', 'draft', 'pending', 'ACTIVE', 'DRAFT', 'PENDING']) &&
+         (incoming().status in ['draft', 'pending', 'pending_review', 'hidden', 'DRAFT', 'PENDING', 'HIDDEN']) &&
          (!('salesCount' in incoming()) || incoming().salesCount == 0) &&
          (!('rating' in incoming()) || incoming().rating == 0) &&
          (!('reviewCount' in incoming()) || incoming().reviewCount == 0))
       );
       allow update: if isSignedIn() && (
         isAdmin() ||
-        (resource.data.sellerId == request.auth.uid &&
+        (isActiveUser() &&
+         resource.data.sellerId == request.auth.uid &&
          incoming().sellerId == existing().sellerId &&
          incoming().storeId == existing().storeId &&
          incoming().price is number && incoming().price >= 0 &&
          incoming().stock is number && incoming().stock >= 0 &&
          (incoming().inventoryHistory == null || incoming().inventoryHistory is list) &&
+         (incoming().status == existing().status || (incoming().status in ['draft', 'pending', 'pending_review', 'hidden', 'DRAFT', 'PENDING', 'HIDDEN'])) &&
          incoming().diff(existing()).affectedKeys().hasOnly([
            'title', 'description', 'price', 'oldPrice', 'discount', 'images', 'thumbnail',
            'category', 'categories', 'stock', 'sizes', 'colors', 'addons', 'status',
            'isOffer', 'features', 'specs', 'inventoryHistory', 'updatedAt'
          ]))
       );
-      allow delete: if isSignedIn() && (resource.data.sellerId == request.auth.uid || isAdmin());
+      allow delete: if isSignedIn() && ((isActiveUser() && resource.data.sellerId == request.auth.uid) || isAdmin());
     }
 
     // 6. Orders Collection
@@ -184,7 +226,8 @@ service cloud.firestore {
              'status', 'notes', 'statusHistory', 'deliveryTrackingCode', 'updatedAt'
            ])) ||
           // Customer can only add delivery notes or cancel their own pending order
-          (resource.data.customerId == request.auth.uid &&
+          (isActiveUser() &&
+           resource.data.customerId == request.auth.uid &&
            incoming().customerId == existing().customerId &&
            incoming().total == existing().total &&
            incoming().subtotal == existing().subtotal &&
@@ -199,7 +242,8 @@ service cloud.firestore {
              existing().status == 'pending' &&
              incoming().status == 'cancelled'))) ||
           // Seller can update order status, status history, and delivery tracking code for single-vendor orders, but CANNOT modify vendorOrders or financial fields
-          (resource.data.sellerIds != null && resource.data.sellerIds.size() == 1 && (request.auth.uid in resource.data.sellerIds) &&
+          (isActiveUser() &&
+           resource.data.sellerIds != null && resource.data.sellerIds.size() == 1 && (request.auth.uid in resource.data.sellerIds) &&
            incoming().customerId == existing().customerId &&
            incoming().total == existing().total &&
            incoming().subtotal == existing().subtotal &&
@@ -219,7 +263,6 @@ service cloud.firestore {
              (existing().status == 'confirmed' && incoming().status == 'preparing') ||
              (existing().status == 'preparing' && incoming().status == 'ready') ||
              (existing().status == 'ready' && (incoming().status == 'out_for_delivery' || incoming().status == 'shipped')) ||
-             ((existing().status == 'out_for_delivery' || existing().status == 'shipped') && incoming().status == 'delivered') ||
              ((existing().status == 'shipped' && incoming().status == 'out_for_delivery') || (existing().status == 'out_for_delivery' && incoming().status == 'shipped')) ||
              (existing().status == incoming().status)
            ))
@@ -263,26 +306,48 @@ service cloud.firestore {
          ('sellerId' in resource.data && resource.data.sellerId == request.auth.uid)) ||
         isAdmin()
       );
-      allow create: if isSignedIn() &&
+      allow create: if isActiveUser() &&
         incoming().customerId == request.auth.uid &&
-        (incoming().status in ['requested', 'pending']) &&
+        (incoming().status == 'requested') &&
         incoming().price is number && incoming().price >= 0 &&
         incoming().sellerId is string &&
-        incoming().serviceId is string;
+        incoming().serviceId is string &&
+        (!exists(/databases/$(database)/documents/products/$(incoming().serviceId)) || (
+          get(/databases/$(database)/documents/products/$(incoming().serviceId)).data.sellerId == incoming().sellerId &&
+          incoming().price == get(/databases/$(database)/documents/products/$(incoming().serviceId)).data.price
+        ));
       allow update: if isSignedIn() && (
         isAdmin() ||
-        (resource.data.customerId == request.auth.uid &&
+        (isActiveUser() &&
+         resource.data.customerId == request.auth.uid &&
          incoming().customerId == existing().customerId &&
          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'notes', 'updatedAt']) &&
-         incoming().status == 'cancelled') ||
-        (('providerId' in resource.data && resource.data.providerId == request.auth.uid) &&
+         incoming().status == 'cancelled' &&
+         (existing().status in ['requested', 'accepted', 'confirmed'])) ||
+        (isActiveUser() &&
+         ('providerId' in resource.data && resource.data.providerId == request.auth.uid) &&
          incoming().customerId == existing().customerId &&
          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'time', 'date', 'notes', 'updatedAt']) &&
-         (incoming().status in ['accepted', 'scheduled', 'in_progress', 'completed', 'cancelled'])) ||
-        (('sellerId' in resource.data && resource.data.sellerId == request.auth.uid) &&
+         (
+           (existing().status == 'requested' && incoming().status in ['accepted', 'confirmed', 'cancelled']) ||
+           (existing().status == 'accepted' && incoming().status in ['scheduled', 'in_progress', 'cancelled']) ||
+           (existing().status == 'confirmed' && incoming().status in ['scheduled', 'in_progress', 'cancelled']) ||
+           (existing().status == 'scheduled' && incoming().status in ['in_progress', 'completed', 'cancelled']) ||
+           (existing().status == 'in_progress' && incoming().status in ['completed', 'cancelled']) ||
+           (existing().status == incoming().status)
+         )) ||
+        (isActiveUser() &&
+         ('sellerId' in resource.data && resource.data.sellerId == request.auth.uid) &&
          incoming().customerId == existing().customerId &&
          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'time', 'date', 'notes', 'updatedAt']) &&
-         (incoming().status in ['accepted', 'scheduled', 'in_progress', 'completed', 'cancelled']))
+         (
+           (existing().status == 'requested' && incoming().status in ['accepted', 'confirmed', 'cancelled']) ||
+           (existing().status == 'accepted' && incoming().status in ['scheduled', 'in_progress', 'cancelled']) ||
+           (existing().status == 'confirmed' && incoming().status in ['scheduled', 'in_progress', 'cancelled']) ||
+           (existing().status == 'scheduled' && incoming().status in ['in_progress', 'completed', 'cancelled']) ||
+           (existing().status == 'in_progress' && incoming().status in ['completed', 'cancelled']) ||
+           (existing().status == incoming().status)
+         ))
       );
       allow delete: if isAdmin();
     }
@@ -291,11 +356,18 @@ service cloud.firestore {
     match /reviews/{reviewId} {
       allow get: if true;
       allow list: if true;
-      allow create: if isSignedIn() &&
+      allow create: if isActiveUser() &&
         (!('customerId' in incoming()) || incoming().customerId == request.auth.uid) &&
         (!('userId' in incoming()) || incoming().userId == request.auth.uid) &&
         (('customerId' in incoming()) || ('userId' in incoming())) &&
-        (!('isVerifiedPurchase' in incoming()) || incoming().isVerifiedPurchase == false || isAdmin()) &&
+        (!('orderId' in incoming()) || (
+          exists(/databases/$(database)/documents/orders/$(incoming().orderId)) &&
+          get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.customerId == request.auth.uid
+        )) &&
+        (!('isVerifiedPurchase' in incoming()) || incoming().isVerifiedPurchase == false || isSuperAdmin()) &&
+        (!('verifiedPurchase' in incoming()) || incoming().verifiedPurchase == false || isSuperAdmin()) &&
+        incoming().targetType in ['product', 'store', 'restaurant', 'service'] &&
+        incoming().targetId is string &&
         incoming().rating is number &&
         incoming().rating >= 1 &&
         incoming().rating <= 5 &&
@@ -303,41 +375,39 @@ service cloud.firestore {
         incoming().comment.size() <= 2000;
       allow update: if isSignedIn() && (
         isAdmin() ||
-        ((resource.data.customerId == request.auth.uid || resource.data.userId == request.auth.uid) &&
+        (isActiveUser() &&
+         (resource.data.customerId == request.auth.uid || resource.data.userId == request.auth.uid) &&
          (!('customerId' in incoming()) || incoming().customerId == existing().customerId) &&
          (!('userId' in incoming()) || incoming().userId == existing().userId) &&
          (!('isVerifiedPurchase' in incoming()) || incoming().isVerifiedPurchase == existing().isVerifiedPurchase) &&
+         (!('verifiedPurchase' in incoming()) || incoming().verifiedPurchase == existing().verifiedPurchase) &&
          incoming().diff(existing()).affectedKeys().hasOnly(['rating', 'comment', 'updatedAt'])) ||
         // Seller reply to customer review: Must be the verified seller of this product/review
-        (('sellerId' in resource.data && resource.data.sellerId == request.auth.uid) &&
+        (isActiveUser() &&
+         ('sellerId' in resource.data && resource.data.sellerId == request.auth.uid) &&
          incoming().diff(existing()).affectedKeys().hasOnly(['sellerReply', 'updatedAt']))
       );
       allow delete: if isSignedIn() && (
-        resource.data.customerId == request.auth.uid ||
-        resource.data.userId == request.auth.uid ||
+        (isActiveUser() && (resource.data.customerId == request.auth.uid || resource.data.userId == request.auth.uid)) ||
         isAdmin()
       );
     }
 
-    // 10. Notifications Collection (Spoofing prevention: sensitive notifications restricted to server/admin)
+    // 10. Notifications Collection (Spoofing prevention: sensitive notifications restricted to server/admin - F-14)
     match /notifications/{notificationId} {
       allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
       allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
       allow create: if isSignedIn() && (
-        isAdmin() ||
-        incoming().userId == request.auth.uid ||
-        (
-          ('type' in incoming() && incoming().type in ['booking', 'review', 'message', 'delivery']) &&
-          ('senderId' in incoming() && incoming().senderId == request.auth.uid) &&
-          ('userId' in incoming() && incoming().userId is string && incoming().userId != '')
-        )
+        isSuperAdmin() ||
+        (isActiveUser() && incoming().userId == request.auth.uid)
       );
       allow update: if isSignedIn() && (
-        (resource.data.userId == request.auth.uid &&
+        (isActiveUser() &&
+         resource.data.userId == request.auth.uid &&
          incoming().diff(existing()).affectedKeys().hasOnly(['read'])) ||
         isAdmin()
       );
-      allow delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow delete: if isSignedIn() && ((isActiveUser() && resource.data.userId == request.auth.uid) || isAdmin());
     }
 
     // 11. Payout Requests Collection
@@ -350,11 +420,18 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // P1-PAYOUT-DATA: Secure Settlement Destinations (Super-Admin Read Only, Server-Only Writes - OPEN-08)
+    match /payout_settlement_destinations/{payoutId} {
+      allow read: if isSuperAdmin();
+      allow write: if false;
+    }
+
     // 12. Audit Logs Collection (Unified Schema & Immutability)
+    // Server-Only writes via Admin SDK (F-11 Remediation: Client cannot forge audit trails)
     match /audit_logs/{logId} {
       allow get: if isAdmin();
       allow list: if isAdmin();
-      allow create: if isAdmin() && incoming().actorId == request.auth.uid;
+      allow create: if false;
       allow update: if false;
       allow delete: if false;
     }
@@ -362,7 +439,7 @@ service cloud.firestore {
     match /auditLogs/{logId} {
       allow get: if isAdmin();
       allow list: if isAdmin();
-      allow create: if isAdmin() && incoming().actorId == request.auth.uid;
+      allow create: if false;
       allow update: if false;
       allow delete: if false;
     }
@@ -383,16 +460,24 @@ service cloud.firestore {
       );
       allow create: if isSignedIn() && (
         isAdmin() ||
-        (incoming().sellerId == request.auth.uid &&
+        (isActiveUser() &&
+         incoming().sellerId == request.auth.uid &&
          incoming().orderId is string &&
          exists(/databases/$(database)/documents/orders/$(incoming().orderId)) &&
          (request.auth.uid in get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.sellerIds) &&
          (!('customerId' in incoming()) || incoming().customerId == get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.customerId) &&
-         (incoming().status in ['pending', 'assigned', 'preparing', 'ready', 'PENDING', 'ASSIGNED', 'PREPARING', 'READY']))
+         (incoming().status in ['pending', 'assigned', 'preparing', 'ready', 'PENDING', 'ASSIGNED', 'PREPARING', 'READY']) &&
+         (!('driverId' in incoming()) || incoming().driverId == null || (
+           exists(/databases/$(database)/documents/drivers/$(incoming().driverId)) &&
+           get(/databases/$(database)/documents/drivers/$(incoming().driverId)).data.status == 'active' &&
+           get(/databases/$(database)/documents/drivers/$(incoming().driverId)).data.sellerId == request.auth.uid
+         )))
       );
       allow update: if isSignedIn() && (
         isAdmin() ||
-        (!(existing().status in ['delivered', 'cancelled', 'DELIVERED', 'CANCELLED']) &&
+        (isActiveUser() &&
+         !(existing().status in ['delivered', 'cancelled', 'DELIVERED', 'CANCELLED']) &&
+         !((existing().status in ['pending', 'PENDING']) && (incoming().status in ['delivered', 'DELIVERED'])) &&
          ((resource.data.sellerId == request.auth.uid &&
            incoming().sellerId == existing().sellerId &&
            incoming().orderId == existing().orderId &&
@@ -422,26 +507,32 @@ service cloud.firestore {
     // 14. Saved Customer Addresses Collection
     match /addresses/{addressId} {
       allow get, list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
-      allow create: if isSignedIn() && incoming().userId == request.auth.uid;
+      allow create: if isActiveUser() && incoming().userId == request.auth.uid;
       allow update: if isSignedIn() && (
-        (resource.data.userId == request.auth.uid && incoming().userId == request.auth.uid) ||
+        (isActiveUser() && resource.data.userId == request.auth.uid && incoming().userId == request.auth.uid) ||
         isAdmin()
       );
-      allow delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow delete: if isSignedIn() && ((isActiveUser() && resource.data.userId == request.auth.uid) || isAdmin());
     }
 
     // 15. Conversations Collection
     match /conversations/{conversationId} {
       allow get, list: if isSignedIn() && (
-        (resource.data.participantIds != null && (request.auth.uid in resource.data.participantIds)) ||
+        (('participantIds' in resource.data && (request.auth.uid in resource.data.participantIds)) ||
+         ('participants' in resource.data && (request.auth.uid in resource.data.participants))) ||
         isAdmin()
       );
-      allow create: if isSignedIn() && (
-        incoming().participantIds != null && (request.auth.uid in incoming().participantIds)
+      allow create: if isActiveUser() && (
+        incoming().participantIds != null &&
+        incoming().participantIds is list &&
+        incoming().participantIds.size() >= 2 &&
+        incoming().participantIds.size() <= 10 &&
+        (request.auth.uid in incoming().participantIds)
       );
       allow update: if isSignedIn() && (
         isAdmin() ||
-        (resource.data.participantIds != null && (request.auth.uid in resource.data.participantIds) &&
+        (isActiveUser() &&
+         resource.data.participantIds != null && (request.auth.uid in resource.data.participantIds) &&
          incoming().participantIds == existing().participantIds &&
          incoming().diff(existing()).affectedKeys().hasOnly([
            'lastMessage', 'lastMessageAt', 'lastSenderId', 'unreadCount', 'updatedAt'
@@ -450,7 +541,7 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    // 16. Chat Messages Collection (Strict privacy: Only participants can read messages)
+    // 16. Chat Messages Collection (Strict privacy: Only participants can read messages; orphan messages blocked)
     match /messages/{messageId} {
       allow get, list: if isSignedIn() && (
         resource.data.senderId == request.auth.uid ||
@@ -459,13 +550,14 @@ service cloud.firestore {
          (request.auth.uid in get(/databases/$(database)/documents/conversations/$(resource.data.conversationId)).data.participantIds)) ||
         isAdmin()
       );
-      allow create: if isSignedIn() &&
+      allow create: if isActiveUser() &&
         incoming().senderId == request.auth.uid &&
         incoming().text is string &&
         incoming().text.size() > 0 &&
         incoming().text.size() <= 2000 &&
-        (!exists(/databases/$(database)/documents/conversations/$(incoming().conversationId)) ||
-         request.auth.uid in get(/databases/$(database)/documents/conversations/$(incoming().conversationId)).data.participantIds ||
+        incoming().conversationId is string &&
+        exists(/databases/$(database)/documents/conversations/$(incoming().conversationId)) &&
+        (request.auth.uid in get(/databases/$(database)/documents/conversations/$(incoming().conversationId)).data.participantIds ||
          isAdmin());
       allow update, delete: if isAdmin();
     }
@@ -490,10 +582,33 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
-    // 19. Platform Settings Collection (Super Admin controlled only)
+    // 19. Platform Settings Collections & Documents (Tiered Access Isolation - P1-01)
     match /platformSettings/{settingId} {
-      allow get: if true;
-      allow list: if true;
+      // Public settings (branding, support contacts, customer pickup/delivery flags)
+      allow get: if (settingId == 'public' || settingId == 'publicPlatformSettings' || isAdmin());
+      // Operational settings (merchant payment numbers for checkout, operational business configs)
+      allow get: if (isSignedIn() && (settingId == 'operational' || settingId == 'operationalSettings')) || isAdmin();
+      // Private financial settings (commissions, settlement configs, payout thresholds)
+      allow get: if (settingId == 'privateFinancial' || settingId == 'privateFinancialSettings') && isAdmin();
+      // Default doc: Strictly Admin only to prevent leaking commission rates & financial policies to regular users
+      allow get: if (settingId == 'default') && isAdmin();
+      
+      allow list: if isAdmin();
+      allow write: if isSuperAdmin();
+    }
+
+    // Isolated collection for private financial settings (P1-01)
+    match /privateFinancialSettings/{docId} {
+      allow read, write: if isAdmin();
+    }
+
+    match /operationalSettings/{docId} {
+      allow get, list: if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+
+    match /publicPlatformSettings/{docId} {
+      allow get, list: if true;
       allow write: if isSuperAdmin();
     }
 
@@ -503,34 +618,40 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
-    // 21. Seller Subscriptions (Activation strictly admin/server-controlled)
+    // 21. Seller Subscriptions (Activation strictly super-admin/server-controlled - F-10)
     match /subscriptions/{subscriptionId} {
       allow get, list: if isSignedIn() && (resource.data.sellerId == request.auth.uid || isAdmin());
-      allow create: if isSignedIn() && incoming().sellerId == request.auth.uid && (
+      allow create: if isActiveUser() && incoming().sellerId == request.auth.uid && (
         incoming().status in ['PENDING_PAYMENT', 'PENDING_REVIEW']
       );
-      allow update: if isAdmin() || (
-        isSignedIn() &&
+      allow update: if isSuperAdmin() || (
+        isAdmin() &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['notes', 'updatedAt'])
+      ) || (
+        isActiveUser() &&
         resource.data.sellerId == request.auth.uid &&
         incoming().sellerId == existing().sellerId &&
         incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt'])
       );
-      allow delete: if isAdmin();
+      allow delete: if isSuperAdmin();
     }
 
     // Compatibility alias for sellerSubscriptions
     match /sellerSubscriptions/{subscriptionId} {
       allow get, list: if isSignedIn() && (resource.data.sellerId == request.auth.uid || isAdmin());
-      allow create: if isSignedIn() && incoming().sellerId == request.auth.uid && (
+      allow create: if isActiveUser() && incoming().sellerId == request.auth.uid && (
         incoming().status in ['PENDING_PAYMENT', 'PENDING_REVIEW']
       );
-      allow update: if isAdmin() || (
-        isSignedIn() &&
+      allow update: if isSuperAdmin() || (
+        isAdmin() &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['notes', 'updatedAt'])
+      ) || (
+        isActiveUser() &&
         resource.data.sellerId == request.auth.uid &&
         incoming().sellerId == existing().sellerId &&
         incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt'])
       );
-      allow delete: if isAdmin();
+      allow delete: if isSuperAdmin();
     }
 
     // 22. Commission Policies (Super Admin controlled only)
@@ -548,9 +669,9 @@ service cloud.firestore {
     // 24. Promotion Requests
     match /promotionRequests/{requestId} {
       allow get, list: if isSignedIn() && (resource.data.sellerId == request.auth.uid || isAdmin());
-      allow create: if isSignedIn() && incoming().sellerId == request.auth.uid && (incoming().status in ['PENDING_REVIEW', 'PENDING_PAYMENT']);
+      allow create: if isActiveUser() && incoming().sellerId == request.auth.uid && (incoming().status in ['PENDING_REVIEW', 'PENDING_PAYMENT']);
       allow update: if isAdmin() || (
-        isSignedIn() &&
+        isActiveUser() &&
         resource.data.sellerId == request.auth.uid &&
         incoming().sellerId == existing().sellerId &&
         incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt'])
@@ -560,40 +681,70 @@ service cloud.firestore {
 
     // 25. Ad Campaigns (Activation strictly admin-controlled)
     match /campaigns/{campaignId} {
-      allow get, list: if true;
-      allow create: if isSignedIn() &&
+      allow get, list: if (resource.data.status in ['ACTIVE', 'active'] || (isSignedIn() && (resource.data.sellerId == request.auth.uid || resource.data.advertiserId == request.auth.uid || isAdmin())));
+      allow create: if isActiveUser() &&
         (incoming().sellerId == request.auth.uid || incoming().advertiserId == request.auth.uid) &&
         (incoming().status in ['DRAFT', 'PENDING_REVIEW']) &&
         (!('spent' in incoming()) || incoming().spent == 0) &&
         (!('paymentStatus' in incoming()) || incoming().paymentStatus in ['UNPAID', 'PENDING', 'pending', 'unpaid']);
-      allow update: if isAdmin() || (
-        isSignedIn() &&
-        (resource.data.sellerId == request.auth.uid || resource.data.advertiserId == request.auth.uid) &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt'])
+      allow update: if (
+        isSuperAdmin() ||
+        (isAdmin() &&
+         incoming().sellerId == existing().sellerId &&
+         (!('advertiserId' in existing()) || incoming().advertiserId == existing().advertiserId) &&
+         incoming().budget == existing().budget &&
+         (!('spent' in existing()) || incoming().spent == existing().spent) &&
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'status', 'rejectionReason', 'approvedBy', 'approvedAt', 'notes', 'updatedAt'
+         ])) ||
+        (isActiveUser() &&
+         (resource.data.sellerId == request.auth.uid || resource.data.advertiserId == request.auth.uid) &&
+         incoming().sellerId == existing().sellerId &&
+         (!('advertiserId' in existing()) || incoming().advertiserId == existing().advertiserId) &&
+         incoming().budget == existing().budget &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt']))
       );
       allow delete: if isAdmin();
     }
 
     // Compatibility alias for adCampaigns
     match /adCampaigns/{campaignId} {
-      allow get, list: if true;
-      allow create: if isSignedIn() &&
+      allow get, list: if (resource.data.status in ['ACTIVE', 'active'] || (isSignedIn() && (resource.data.sellerId == request.auth.uid || resource.data.advertiserId == request.auth.uid || isAdmin())));
+      allow create: if isActiveUser() &&
         (incoming().sellerId == request.auth.uid || incoming().advertiserId == request.auth.uid) &&
         (incoming().status in ['DRAFT', 'PENDING_REVIEW']) &&
         (!('spent' in incoming()) || incoming().spent == 0) &&
         (!('paymentStatus' in incoming()) || incoming().paymentStatus in ['UNPAID', 'PENDING', 'pending', 'unpaid']);
-      allow update: if isAdmin() || (
-        isSignedIn() &&
-        (resource.data.sellerId == request.auth.uid || resource.data.advertiserId == request.auth.uid) &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt'])
+      allow update: if (
+        isSuperAdmin() ||
+        (isAdmin() &&
+         incoming().sellerId == existing().sellerId &&
+         (!('advertiserId' in existing()) || incoming().advertiserId == existing().advertiserId) &&
+         incoming().budget == existing().budget &&
+         (!('spent' in existing()) || incoming().spent == existing().spent) &&
+         incoming().diff(existing()).affectedKeys().hasOnly([
+           'status', 'rejectionReason', 'approvedBy', 'approvedAt', 'notes', 'updatedAt'
+         ])) ||
+        (isActiveUser() &&
+         (resource.data.sellerId == request.auth.uid || resource.data.advertiserId == request.auth.uid) &&
+         incoming().sellerId == existing().sellerId &&
+         (!('advertiserId' in existing()) || incoming().advertiserId == existing().advertiserId) &&
+         incoming().budget == existing().budget &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['paymentReferenceNumber', 'notes', 'updatedAt']))
       );
       allow delete: if isAdmin();
     }
 
-    // 26. Coupons Engine (Public/User read for validation, admin write)
+    // 26. Coupons Engine (Public/User read for validation, admin write - P1-PRIVATE-02)
     match /coupons/{couponId} {
-      allow get, list: if true;
+      allow get, list: if true && (!('customerUsage' in resource.data) || resource.data.customerUsage == null || isAdmin());
       allow write: if isAdmin();
+    }
+
+    // P1-PRIVATE-02: Isolated Customer Coupon Usage (Private, customer or admin read only, server-only write)
+    match /couponUsages/{usageId} {
+      allow get, list: if isSignedIn() && (resource.data.customerId == request.auth.uid || isAdmin());
+      allow write: if false;
     }
 
     // 27. Refund Requests Collection
@@ -614,19 +765,11 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // 28. Analytics Events (Public tracking with validated bounds, admin view)
+    // 28. Analytics Events (Exclusively ingested via backend gateway /api/analytics/event; direct client creation denied)
     match /analyticsEvents/{eventId} {
       allow get, list: if isAdmin();
-      allow create: if incoming().type in [
-        'PRODUCT_VIEW', 'STORE_VIEW', 'SERVICE_VIEW', 'RESTAURANT_VIEW',
-        'SEARCH_QUERY', 'AD_IMPRESSION', 'AD_CLICK', 'PROMOTION_VIEW', 'PROMOTION_CLICK', 'CATEGORY_VIEW'
-      ] &&
-      incoming().timestamp is string &&
-      incoming().targetId is string &&
-      (!('revenue' in incoming()) || incoming().revenue == null) &&
-      (!('amount' in incoming()) || incoming().amount == null) &&
-      (!('admin' in incoming()) || incoming().admin == null);
-      allow update, delete: if isAdmin();
+      allow create: if false;
+      allow update, delete: if isSuperAdmin();
     }
   }
 }

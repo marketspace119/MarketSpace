@@ -77,6 +77,11 @@ export class MemoryRateLimitStore implements RateLimitStore {
     };
   }
 
+  async increment(key: string, windowSeconds = 60): Promise<{ totalHits: number; resetTime: number }> {
+    const res = await this.consume(key, Number.MAX_SAFE_INTEGER, windowSeconds * 1000);
+    return { totalHits: res.count, resetTime: res.resetTime };
+  }
+
   destroy() {
     if (this.cleanupInterval) {
       clearInterval(this.cleanupInterval);
@@ -172,36 +177,73 @@ export function getRateLimitStore(): RateLimitStore {
   return activeStore;
 }
 
+export function normalizeClientIp(rawIp: string | undefined): string {
+  if (!rawIp || typeof rawIp !== 'string') return 'unknown';
+  let ip = rawIp.trim();
+  // Strip IPv4-mapped IPv6 prefix (e.g., ::ffff:127.0.0.1 -> 127.0.0.1)
+  if (ip.startsWith('::ffff:')) {
+    return ip.substring(7);
+  }
+  return ip.toLowerCase();
+}
+
 export function createRateLimiter(options: {
   windowMs: number;
   max: number;
   message?: string;
   store?: RateLimitStore;
+  allowGuest?: boolean;
 }) {
   return async (req: Request, res: Response, next: NextFunction) => {
     const store = options.store || activeStore;
-    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const rawIp = req.ip || req.socket.remoteAddress || 'unknown';
+    // P2-RATE-01: Correct IPv6 handling that preserves address uniqueness
+    const clientIp = normalizeClientIp(typeof rawIp === 'string' ? rawIp : undefined);
     const authHeader = req.headers.authorization;
 
-    // Rate Limit Identity: Use verified UID when caller is genuinely authenticated with Firebase Auth.
-    // Unverified or arbitrary fake Bearer tokens MUST NOT create a new identity key (prevents rate limit bypass).
-    // If token verification fails or no token is provided, strictly bind identity to client IP.
+    // F-36: Hardened Rate Limit Identity Architecture
+    // 1. Never trust client-supplied identity headers (X-User-ID, X-Forwarded-User, etc.)
+    // 2. If Bearer token is provided: MUST cryptographically verify it via Firebase Admin.
+    //    - If valid: bind rate limit identity strictly to verified UID (`user_${uid}`)
+    //    - If invalid/malformed: REJECT IMMEDIATELY with 401 Unauthorized before consuming quota.
+    //      This prevents malicious random tokens from burning legitimate user or guest IP quotas.
+    // 3. If NO Authorization header is provided:
+    //    - If guests are allowed: bind rate limit identity strictly to sanitized client IP (`guest_ip_${clientIp}`)
+    //    - If guests are not allowed and endpoint requires auth: reject with 401
     let identityKey: string;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
+
+    if (authHeader) {
+      if (!authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({
+          success: false,
+          error: 'Authentication failed: Authorization header must use Bearer schema',
+        });
+      }
+
       try {
         const decoded = await verifyFirebaseBearerToken(authHeader);
-        if (decoded && decoded.uid) {
-          identityKey = `user_${decoded.uid}`;
-        } else {
-          identityKey = `ip_${ip}`;
+        if (!decoded || !decoded.uid) {
+          return res.status(401).json({
+            success: false,
+            error: 'Authentication failed: Invalid token claims or missing UID',
+          });
         }
-      } catch {
-        // Token invalid or fake: Fallback strictly to client IP identity so rotating fake Bearer tokens cannot bypass guest quota
-        identityKey = `ip_${ip}`;
+        identityKey = `user_${decoded.uid}`;
+        (req as any).authenticatedUser = decoded;
+      } catch (err: any) {
+        // Invalid or expired token: Reject fail-closed.
+        // Do NOT fall back to IP; doing so would allow attackers with fake tokens to exhaust shared IP quotas.
+        return res.status(401).json({
+          success: false,
+          error: err?.message || 'Authentication failed: Invalid or expired Bearer token',
+        });
       }
     } else {
-      identityKey = `ip_${ip}`;
+      // Unauthenticated request: isolate to guest IP bucket
+      identityKey = `guest_ip_${clientIp}`;
     }
+
+    (req as any).rateLimitIdentity = identityKey;
 
     const endpointKey = `${req.method}_${req.baseUrl || req.path}_${identityKey}`;
 

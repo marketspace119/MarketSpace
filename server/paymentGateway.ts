@@ -1,8 +1,15 @@
 import { getAdminDb, requireAuthenticatedCaller, requireVerifiedPlatformAdmin, requireVerifiedSuperAdmin } from './firebaseAdmin';
+import {
+  MASTER_PAYMENT_METHODS,
+  normalizePaymentMethod,
+  isValidPaymentMethod,
+  isMobilePaymentMethod,
+  isCashPaymentMethod,
+} from '../src/constants/paymentMethods';
 
 export interface SubmitPaymentReferencePayload {
   orderId: string;
-  method: 'evc_plus' | 'zaad' | 'sahall';
+  method: string;
   amount?: number;
   currency?: string;
   referenceNumber: string;
@@ -46,6 +53,14 @@ export async function processPaymentReferenceSubmissionGateway(
   const orderId = (payload.orderId || '').trim();
   if (!orderId) {
     const err = new Error('رقم الطلب مطلوب لإرسال إشعار الدفع.');
+    (err as any).statusCode = 400;
+    throw err;
+  }
+
+  // P1-PAY-02: Runtime payment method validation against Master Allowlist
+  const normalizedMethod = normalizePaymentMethod(payload.method);
+  if (!normalizedMethod) {
+    const err = new Error(`طريقة الدفع غير صالحة أو غير مدعومة: ${payload.method || 'فارغة'}. الطرق المدعومة: ${MASTER_PAYMENT_METHODS.join(', ')}`);
     (err as any).statusCode = 400;
     throw err;
   }
@@ -136,6 +151,15 @@ export async function processPaymentReferenceSubmissionGateway(
           (err as any).statusCode = 400;
           throw err;
         }
+      }
+
+      // Enforce payment method matching between submission and order (P1-PAY-02)
+      const orderMethod = (orderData.paymentMethod || '').toLowerCase().trim();
+      const rawMethod = (payload.method || '').toLowerCase().trim();
+      if (rawMethod !== orderMethod && !(orderMethod === 'cod' && rawMethod === 'cash_on_delivery')) {
+        const err = new Error(`طريقة دفع إشعار الدفع (${rawMethod}) لا تطابق طريقة دفع الطلب (${orderMethod}).`);
+        (err as any).statusCode = 400;
+        throw err;
       }
 
       // 3. Write: Create unique reservation
@@ -328,12 +352,31 @@ export async function processPaymentReviewGateway(
         (err as any).statusCode = 400;
         throw err;
       }
+
+      // Mandatory payment method validation against Master Allowlist
+      const normSubMethod = normalizePaymentMethod(subData.method || subData.paymentMethod);
+      const normOrderMethod = normalizePaymentMethod(orderData.paymentMethod);
+      if (!normSubMethod) {
+        const err = new Error(`طريقة دفع إشعار الدفع غير صالحة أو غير مدعومة: ${subData.method || subData.paymentMethod}`);
+        (err as any).statusCode = 400;
+        throw err;
+      }
+      if (!normOrderMethod) {
+        const err = new Error(`طريقة دفع الطلب غير صالحة أو غير مدعومة: ${orderData.paymentMethod}`);
+        (err as any).statusCode = 400;
+        throw err;
+      }
+      if (normSubMethod !== normOrderMethod) {
+        const err = new Error(`طريقة دفع إشعار الدفع (${normSubMethod}) لا تطابق طريقة دفع الطلب (${normOrderMethod}).`);
+        (err as any).statusCode = 400;
+        throw err;
+      }
     }
 
     // Invariant: If COD_SETTLEMENT, verify paymentMethod is cash_on_delivery
     if (action === 'COD_SETTLEMENT') {
-      const method = (orderData.paymentMethod || '').toLowerCase();
-      if (method !== 'cash_on_delivery' && method !== 'cod') {
+      const normMethod = normalizePaymentMethod(orderData.paymentMethod);
+      if (normMethod !== 'cash_on_delivery') {
         const err = new Error(`طريقة دفع الطلب هي (${orderData.paymentMethod}) وتتطلب إشعار دفع إلكتروني موثق وليس تسوية عند الاستلام.`);
         (err as any).statusCode = 400;
         throw err;

@@ -1,5 +1,5 @@
 import { doc, getDocs, collection, setDoc, updateDoc, query, where } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
 import { SellerPlan, SellerSubscription, SubscriptionStatus, UserRole } from '../types';
 import { auditLogService } from './auditLogService';
 
@@ -303,7 +303,7 @@ export const subscriptionService = {
   },
 
   /**
-   * Admin authoritative approval for manual mobile money subscription payment
+   * Admin authoritative approval for manual mobile money subscription payment (P1-RBAC-01)
    */
   async approveSubscriptionPayment(
     subscriptionId: string,
@@ -315,66 +315,112 @@ export const subscriptionService = {
       throw new Error('Forbidden: Only administrators can approve subscription activations');
     }
 
-    const currentSubs = loadSubscriptions();
-    const target = currentSubs.find(s => s.id === subscriptionId);
-    if (!target) throw new Error('Subscription not found');
-
-    const now = new Date().toISOString();
-    target.status = 'ACTIVE';
-    target.approvedBy = adminId;
-    target.approvedAt = now;
-    target.updatedAt = now;
-    if (notes) target.notes = notes;
-
-    persistSubscriptions(currentSubs);
-
-    try {
-      await updateDoc(doc(db, SUBSCRIPTIONS_COLLECTION, subscriptionId), {
-        status: 'ACTIVE',
-        approvedBy: adminId,
-        approvedAt: now,
-        updatedAt: now,
-        notes: target.notes || '',
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `${SUBSCRIPTIONS_COLLECTION}/${subscriptionId}`);
+    let token = '';
+    if (auth?.currentUser) {
+      try {
+        token = await auth.currentUser.getIdToken();
+      } catch (e) {}
     }
 
-    await auditLogService.logAction({
-      actorId: adminId,
-      actorRole: adminRole,
-      action: 'SUBSCRIPTION_APPROVED',
-      targetType: 'subscription',
-      targetId: subscriptionId,
-      targetName: `Plan ${target.planTier} for Seller ${target.sellerId}`,
-      metadata: { price: target.price, tier: target.planTier },
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || 'http://127.0.0.1:3000');
+    const res = await fetch(`${baseUrl}/api/subscriptions/review`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        subscriptionId,
+        action: 'APPROVE',
+        notes,
+      }),
     });
 
-    return target;
+    const resData = await res.json().catch(() => ({}));
+    if (!res.ok || !resData.success || !resData.subscription) {
+      throw new Error(resData.error || `فشل اعتماد الاشتراك عبر البوابة الموثوقة (HTTP ${res.status})`);
+    }
+
+    const updatedSub: SellerSubscription = resData.subscription;
+
+    // P1-CONS-01: Update local memory and cache ONLY after authoritative backend write succeeds
+    const currentSubs = loadSubscriptions();
+    const index = currentSubs.findIndex(s => s.id === subscriptionId);
+    if (index !== -1) {
+      currentSubs[index] = updatedSub;
+    } else {
+      currentSubs.unshift(updatedSub);
+    }
+    persistSubscriptions(currentSubs);
+
+    return updatedSub;
   },
 
   /**
-   * Cancel a subscription
+   * Cancel a subscription (P1-RBAC-01)
    */
   async cancelSubscription(
     subscriptionId: string,
     actorId: string,
     actorRole: UserRole
   ): Promise<SellerSubscription> {
+    const isAdmin = actorRole === 'ADMIN' || actorRole === 'SUPER_ADMIN';
+
+    let token = '';
+    if (auth?.currentUser) {
+      try {
+        token = await auth.currentUser.getIdToken();
+      } catch (e) {}
+    }
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    if (isAdmin) {
+      const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || 'http://127.0.0.1:3000');
+      const res = await fetch(`${baseUrl}/api/subscriptions/review`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          subscriptionId,
+          action: 'CANCEL',
+        }),
+      });
+
+      const resData = await res.json().catch(() => ({}));
+      if (!res.ok || !resData.success || !resData.subscription) {
+        throw new Error(resData.error || `فشل إلغاء الاشتراك عبر البوابة الموثوقة (HTTP ${res.status})`);
+      }
+
+      const updatedSub: SellerSubscription = resData.subscription;
+      const currentSubs = loadSubscriptions();
+      const index = currentSubs.findIndex(s => s.id === subscriptionId);
+      if (index !== -1) {
+        currentSubs[index] = updatedSub;
+      }
+      persistSubscriptions(currentSubs);
+      return updatedSub;
+    }
+
     const currentSubs = loadSubscriptions();
     const target = currentSubs.find(s => s.id === subscriptionId);
     if (!target) throw new Error('Subscription not found');
 
-    const isAdmin = actorRole === 'ADMIN' || actorRole === 'SUPER_ADMIN';
-    if (!isAdmin && target.sellerId !== actorId) {
+    if (target.sellerId !== actorId) {
       throw new Error('Forbidden: Cannot cancel another merchant subscription');
     }
 
     const now = new Date().toISOString();
     target.status = 'CANCELLED';
     target.updatedAt = now;
-
-    persistSubscriptions(currentSubs);
 
     try {
       await updateDoc(doc(db, SUBSCRIPTIONS_COLLECTION, subscriptionId), {
@@ -383,18 +429,10 @@ export const subscriptionService = {
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `${SUBSCRIPTIONS_COLLECTION}/${subscriptionId}`);
+      throw err;
     }
 
-    await auditLogService.logAction({
-      actorId,
-      actorRole,
-      action: 'SUBSCRIPTION_CANCELLED',
-      targetType: 'subscription',
-      targetId: subscriptionId,
-      targetName: `Subscription ${subscriptionId}`,
-      metadata: { planTier: target.planTier },
-    });
-
+    persistSubscriptions(currentSubs);
     return target;
   },
 

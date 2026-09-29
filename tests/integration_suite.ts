@@ -86,9 +86,13 @@ export async function runIntegrationSuite() {
       projectId: 'demo-marketspace',
       firestore: {
         rules: firestoreRulesContent,
+        host: '127.0.0.1',
+        port: 8085,
       },
       storage: {
         rules: storageRulesContent,
+        host: '127.0.0.1',
+        port: 9199,
       },
     });
     console.log('[TestHarness] RulesTestEnvironment initialized successfully with live emulator rules.');
@@ -1069,16 +1073,16 @@ export async function runIntegrationSuite() {
 
       storageRulesExecuted = true;
     } else {
-      // Fallback verification if emulator environment is bypassed: verify rules syntax and invariants
-      assert(firestoreRulesContent.includes("request.auth.token.email_verified == true"), "firestore.rules must require email_verified == true for admin");
-      assert(firestoreRulesContent.includes("allow delete: if false"), "Orders collection must have allow delete: if false");
-      assert(storageRulesContent.includes("request.auth.token.email_verified == true"), "storage.rules must require email_verified == true for admin");
-      // P0 Payment Gateway Bypass: Direct client writes to payment collections must be strictly denied
-      assert(firestoreRulesContent.includes("match /paymentSubmissions/{submissionId}"), "firestore.rules must contain paymentSubmissions rule");
-      assert(firestoreRulesContent.includes("match /paymentReferences/{normalizedRef}"), "firestore.rules must contain paymentReferences rule");
-      assert(firestoreRulesContent.includes("incoming().paymentStatus == existing().paymentStatus"), "Orders paymentStatus must be immutable from client SDK");
-      firestoreRulesExecuted = true;
-      storageRulesExecuted = true;
+      // Invariant (OPEN-29): Missing Emulator must be recorded as BLOCKED / NOT EXECUTED, never PASS
+      record({
+        id: 'TEST-I16',
+        name: 'Firestore Security Rules & Storage Rules Boundary Verification',
+        category: 'FIRESTORE_RULES',
+        assertionExecuted: false,
+        pass: false,
+        details: 'BLOCKED / NOT EXECUTED: Runtime Firestore and Storage rules verification requires running Firebase Emulator (missing Java runtime in container). Static string inspection is NOT runtime proof.',
+      });
+      return;
     }
 
     const executed = firestoreRulesExecuted && storageRulesExecuted;

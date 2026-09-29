@@ -379,7 +379,7 @@ export interface OrderDetails {
     phoneNumber?: string;
     addressLine1?: string;
   };
-  paymentMethod: 'cash_on_delivery' | 'evc_plus' | 'zaad' | 'sahall' | 'card';
+  paymentMethod: 'cash_on_delivery' | 'evc_plus' | 'zaad' | 'sahal' | 'edahab' | 'sahall' | 'card';
   paymentStatus?: 'pending' | 'unpaid' | 'paid_pending_review' | 'paid';
   notes?: string;
   items: CartItem[];

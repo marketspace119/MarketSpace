@@ -400,6 +400,15 @@ export const messagingService = {
     if (typeof localStorage !== 'undefined') {
       try {
         localStorage.removeItem(CONVERSATIONS_STORAGE_KEY);
+        // Clear all conversation message caches (F-23 Remediation)
+        const keysToRemove: string[] = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const key = localStorage.key(i);
+          if (key && (key.startsWith(MESSAGES_STORAGE_KEY) || key.startsWith('marketspace_messages_'))) {
+            keysToRemove.push(key);
+          }
+        }
+        keysToRemove.forEach(k => localStorage.removeItem(k));
       } catch {
         // ignore
       }
