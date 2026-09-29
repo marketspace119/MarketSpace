@@ -293,4 +293,26 @@ export const storeService = {
       return [];
     }
   },
+
+  updateStoreRating(storeId: string, rating: number, reviewsCount: number): void {
+    const stores = initStores();
+    const index = stores.findIndex(s => s.id === storeId);
+    if (index === -1) return;
+
+    const updated: Store = {
+      ...stores[index],
+      rating: Number(rating.toFixed(1)),
+      reviewsCount: Math.max(0, Math.floor(reviewsCount)),
+      updatedAt: new Date().toISOString(),
+    };
+
+    stores[index] = updated;
+    persistLocal(stores);
+
+    setDoc(doc(db, STORES_COLLECTION, storeId), {
+      rating: updated.rating,
+      reviewsCount: updated.reviewsCount,
+      updatedAt: updated.updatedAt,
+    }, { merge: true }).catch(() => {});
+  },
 };

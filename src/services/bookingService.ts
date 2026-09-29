@@ -76,6 +76,19 @@ export const bookingService = {
 
   createBooking(data: Omit<ServiceBooking, 'id' | 'bookingCode' | 'createdAt' | 'status'>): ServiceBooking {
     const bookings = initBookings();
+
+    // Double-booking conflict validation (Phase 6)
+    const hasConflict = bookings.some(
+      b =>
+        b.sellerId === data.sellerId &&
+        b.date === data.date &&
+        b.time === data.time &&
+        ['requested', 'accepted', 'confirmed', 'scheduled', 'in_progress'].includes(b.status)
+    );
+    if (hasConflict) {
+      throw new Error(`الموعد المطلوب (${data.date} في ${data.time}) محجوز مسبقاً لدى مقدم الخدمة. يرجى اختيار موعد آخر.`);
+    }
+
     const newBooking: ServiceBooking = {
       ...data,
       id: `book_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
@@ -189,5 +202,33 @@ export const bookingService = {
     }).catch(() => {});
 
     return booking;
+  },
+
+  isTimeslotAvailable(sellerId: string, date: string, time: string): boolean {
+    const bookings = initBookings();
+    const conflict = bookings.some(
+      b =>
+        b.sellerId === sellerId &&
+        b.date === date &&
+        b.time === time &&
+        ['requested', 'accepted', 'confirmed', 'scheduled', 'in_progress'].includes(b.status)
+    );
+    return !conflict;
+  },
+
+  getAvailableTimeslots(sellerId: string, date: string): string[] {
+    const STANDARD_SLOTS = ['09:00', '10:00', '11:00', '12:00', '14:00', '15:00', '16:00', '17:00'];
+    const bookings = initBookings();
+    const bookedTimes = new Set(
+      bookings
+        .filter(
+          b =>
+            b.sellerId === sellerId &&
+            b.date === date &&
+            ['requested', 'accepted', 'confirmed', 'scheduled', 'in_progress'].includes(b.status)
+        )
+        .map(b => b.time)
+    );
+    return STANDARD_SLOTS.filter(slot => !bookedTimes.has(slot));
   },
 };

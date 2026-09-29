@@ -216,7 +216,8 @@ async function runE2EForensicInvariantSuite() {
         paymentMethod: 'cash_on_delivery',
         items: [
           {
-            product: {
+            productId: testProductId,
+            productSnapshot: {
               id: testProductId,
               price: 25,
               stock: 5,
@@ -225,10 +226,11 @@ async function runE2EForensicInvariantSuite() {
               title: { en: 'Limited Stock Widget' } as any,
             } as any,
             quantity: 3,
-            selectedColor: 'Blue',
+            selectedOptions: { color: 'Blue' },
           },
           {
-            product: {
+            productId: testProductId,
+            productSnapshot: {
               id: testProductId,
               price: 25,
               stock: 5,
@@ -237,7 +239,7 @@ async function runE2EForensicInvariantSuite() {
               title: { en: 'Limited Stock Widget' } as any,
             } as any,
             quantity: 3,
-            selectedColor: 'Red',
+            selectedOptions: { color: 'Red' },
           },
         ],
       });
@@ -447,6 +449,7 @@ async function runE2EForensicInvariantSuite() {
 
       await processPayoutGateway(
         {
+          sellerId: testSellerId,
           amount: 100,
           paymentMethod: 'zaad',
           accountNumber: '252634000000',

@@ -705,7 +705,7 @@ async function runFinalClosurePass() {
   // =========================================================================
   try {
     // Calling syncUserCustomClaims for user with suspension
-    const claimsRes = await syncUserCustomClaims('user_to_suspend', 'suspended', false);
+    const claimsRes = await syncUserCustomClaims('user_to_suspend', 'CUSTOMER', 'suspended', false);
     // Verified that revocation logic is invoked without unhandled rejections
     assert.strictEqual(typeof claimsRes, 'object', 'syncUserCustomClaims must return structured status');
 
@@ -983,7 +983,7 @@ async function runFinalClosurePass() {
       // Seller 2 attempts to assign driver to Seller 1's delivery
       await deliveryService.assignDriver({
         assignmentId: crossDelivId,
-        deliveryType: 'store_to_customer',
+        deliveryType: 'seller_delivery',
         driverId: driver1Uid,
         driverName: 'Driver 1',
         actorId: seller2Uid,

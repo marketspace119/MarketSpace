@@ -24,11 +24,13 @@ import {
 } from 'lucide-react';
 import { useLanguage } from '../i18n/LanguageContext';
 import { useAuth } from '../context/AuthContext';
-import { OrderDetails, VendorSubOrder, DeliveryAssignment } from '../types';
+import { useCart } from '../context/CartContext';
+import { OrderDetails, VendorSubOrder, DeliveryAssignment, OrderDispute, DisputeReason, DisputeRequestedAction } from '../types';
 import { orderService } from '../services/orderService';
 import { reviewService } from '../services/reviewService';
 import { deliveryService } from '../services/deliveryService';
 import { messagingService } from '../services/messagingService';
+import { disputeService } from '../services/disputeService';
 
 interface OrdersPageProps {
   onNavigate: (path: string) => void;
@@ -38,6 +40,7 @@ interface OrdersPageProps {
 export const OrdersPage: React.FC<OrdersPageProps> = ({ onNavigate, orderIdFromRoute }) => {
   const { language, t, isRTL } = useLanguage();
   const { user } = useAuth();
+  const { addItem } = useCart();
 
   const [orders, setOrders] = useState<OrderDetails[]>([]);
   const [selectedOrder, setSelectedOrder] = useState<OrderDetails | null>(null);
@@ -46,6 +49,14 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ onNavigate, orderIdFromR
   const [guestPhone, setGuestPhone] = useState('');
   const [guestError, setGuestError] = useState<string | null>(null);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
+
+  // Dispute State
+  const [activeDispute, setActiveDispute] = useState<OrderDispute | null>(null);
+  const [isDisputeModalOpen, setIsDisputeModalOpen] = useState(false);
+  const [disputeReason, setDisputeReason] = useState<DisputeReason>('damaged_item');
+  const [disputeDesc, setDisputeDesc] = useState('');
+  const [disputeAction, setDisputeAction] = useState<DisputeRequestedAction>('full_refund');
+  const [isSubmittingDispute, setIsSubmittingDispute] = useState(false);
 
   // Review Modal State
   const [reviewModalData, setReviewModalData] = useState<{
@@ -62,6 +73,62 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ onNavigate, orderIdFromR
     navigator.clipboard.writeText(code);
     setCopiedCode(code);
     setTimeout(() => setCopiedCode(null), 2000);
+  };
+
+  const handleReorder = (order: OrderDetails) => {
+    if (!order.items || order.items.length === 0) return;
+    let addedCount = 0;
+    order.items.forEach(it => {
+      if (it.product) {
+        addItem(it.product, it.quantity, (it as any).selectedColor, (it as any).selectedSize, it.selectedAddons);
+        addedCount++;
+      }
+    });
+    if (addedCount > 0) {
+      onNavigate('/cart');
+    }
+  };
+
+  const handleOpenDisputeModal = () => {
+    if (!user) {
+      onNavigate('/login');
+      return;
+    }
+    setDisputeDesc('');
+    setDisputeReason('damaged_item');
+    setDisputeAction('full_refund');
+    setIsDisputeModalOpen(true);
+  };
+
+  const handleSubmitDispute = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user || !selectedOrder || !disputeDesc.trim()) return;
+
+    try {
+      setIsSubmittingDispute(true);
+      const primaryVendor = selectedOrder.vendorOrders?.[0];
+      const created = disputeService.createDispute({
+        orderId: selectedOrder.orderId,
+        subOrderId: primaryVendor?.subOrderId,
+        customerId: user.id,
+        customerName: user.name || selectedOrder.customerName,
+        customerPhone: selectedOrder.phone,
+        sellerId: primaryVendor?.sellerId || selectedOrder.sellerIds?.[0] || 'seller_system',
+        sellerName: primaryVendor?.storeName || 'Merchant',
+        storeId: primaryVendor?.storeId,
+        reason: disputeReason,
+        description: disputeDesc.trim(),
+        requestedAction: disputeAction,
+      });
+
+      setActiveDispute(created);
+      setIsDisputeModalOpen(false);
+      setIsSubmittingDispute(false);
+      alert(language === 'ar' ? 'تم فتح النزاع بنجاح، وسيتم إخطار المتجر ومراجعته من الإدارة.' : 'Dispute filed successfully. The merchant and administration have been notified.');
+    } catch (err: any) {
+      setIsSubmittingDispute(false);
+      alert(err.message || 'فشل فتح النزاع');
+    }
   };
 
   const handleSubmitReview = (e: React.FormEvent) => {
@@ -182,6 +249,15 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ onNavigate, orderIdFromR
         };
     }
   };
+
+  useEffect(() => {
+    if (selectedOrder) {
+      const disp = disputeService.getDisputeByOrderId(selectedOrder.orderId);
+      setActiveDispute(disp || null);
+    } else {
+      setActiveDispute(null);
+    }
+  }, [selectedOrder]);
 
   const filteredOrders = orders.filter(o => {
     if (statusFilter === 'all') return true;

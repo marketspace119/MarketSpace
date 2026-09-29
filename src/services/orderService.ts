@@ -603,6 +603,23 @@ export const orderService = {
     orders[index] = order;
     persistLocal(orders);
 
+    // Restore inventory stock when an order is cancelled
+    if (newStatus === 'cancelled' && Array.isArray(order.items)) {
+      for (const item of order.items) {
+        const prodId = item.product?.id || item.id;
+        if (prodId && item.quantity > 0) {
+          inventoryService.restoreStockOnCancellation(prodId, item.quantity, {
+            orderId,
+            customerId: order.customerId,
+            timestamp: now,
+            reason: reason || 'Order cancelled',
+          }).catch(err => {
+            console.warn(`[OrderService] Failed restoring stock for product ${prodId}:`, err);
+          });
+        }
+      }
+    }
+
     auditLogService.logAction({
       actorId: currentUserId,
       actorRole: userRole as any,

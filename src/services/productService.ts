@@ -304,6 +304,28 @@ export const productService = {
     return updated;
   },
 
+  updateProductRating(productId: string, rating: number, reviewsCount: number): void {
+    const products = initProducts();
+    const index = products.findIndex(p => p.id === productId);
+    if (index === -1) return;
+
+    const updated: Product = {
+      ...products[index],
+      rating: Number(rating.toFixed(1)),
+      reviewsCount: Math.max(0, Math.floor(reviewsCount)),
+      updatedAt: new Date().toISOString(),
+    };
+
+    products[index] = updated;
+    persistLocal(products);
+
+    setDoc(doc(db, PRODUCTS_COLLECTION, productId), {
+      rating: updated.rating,
+      reviewsCount: updated.reviewsCount,
+      updatedAt: updated.updatedAt,
+    }, { merge: true }).catch(() => {});
+  },
+
   deleteProduct(id: string, currentUserId: string, userRole: string): boolean {
     const products = initProducts();
     const product = products.find(p => p.id === id);

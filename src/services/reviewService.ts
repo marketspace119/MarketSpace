@@ -4,6 +4,7 @@ import { Review, UserRole } from '../types';
 import { auditLogService } from './auditLogService';
 import { orderService } from './orderService';
 import { productService } from './productService';
+import { storeService } from './storeService';
 
 const REVIEWS_STORAGE_KEY = 'marketspace_reviews_v1';
 const REVIEWS_COLLECTION = 'reviews';
@@ -149,7 +150,22 @@ export const reviewService = {
       metadata: { commentExcerpt: prev.comment.slice(0, 60), targetType: prev.targetType, targetId: prev.targetId },
     });
 
+    this.recalculateAggregateRating(prev.targetType, prev.targetId);
+
     return updated;
+  },
+
+  recalculateAggregateRating(targetType: Review['targetType'], targetId: string): void {
+    const reviews = initReviews();
+    const active = reviews.filter(r => r.targetType === targetType && r.targetId === targetId && !r.isHidden);
+    const count = active.length;
+    const avg = count > 0 ? active.reduce((sum, r) => sum + r.rating, 0) / count : 5.0;
+
+    if (targetType === 'product') {
+      productService.updateProductRating(targetId, avg, count);
+    } else if (targetType === 'store' || targetType === 'restaurant' || targetType === 'service') {
+      storeService.updateStoreRating(targetId, avg, count);
+    }
   },
 
   addReview(data: Omit<Review, 'id' | 'createdAt'>): Review {
@@ -192,6 +208,8 @@ export const reviewService = {
       console.warn('Could not write review to Firestore immediately:', err);
     });
 
+    this.recalculateAggregateRating(newReview.targetType, newReview.targetId);
+
     return newReview;
   },
 
@@ -200,8 +218,9 @@ export const reviewService = {
     const index = reviews.findIndex(r => r.id === id);
     if (index === -1) return false;
 
+    const targetReview = reviews[index];
     const isAdmin = userRole === 'ADMIN' || userRole === 'SUPER_ADMIN';
-    if (!isAdmin && reviews[index].userId !== currentUserId) {
+    if (!isAdmin && targetReview.userId !== currentUserId) {
       throw new Error('Forbidden: You can only delete your own reviews');
     }
 
@@ -211,6 +230,8 @@ export const reviewService = {
     deleteDoc(doc(db, REVIEWS_COLLECTION, id)).catch(err => {
       handleFirestoreError(err, OperationType.DELETE, `${REVIEWS_COLLECTION}/${id}`);
     });
+
+    this.recalculateAggregateRating(targetReview.targetType, targetReview.targetId);
 
     return true;
   },

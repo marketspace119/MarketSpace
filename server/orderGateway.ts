@@ -888,6 +888,24 @@ export async function processSubOrderUpdateGateway(
         }
       }
 
+      // Step 2: Pre-read products to restore stock if sub-order is being cancelled (All reads before writes)
+      const productsToRestore: Array<{ ref: FirebaseFirestore.DocumentReference; currentStock: number; restoreQty: number }> = [];
+      if (newStatus === 'cancelled' && currentStatus !== 'cancelled' && Array.isArray(subOrder.items)) {
+        for (const it of subOrder.items) {
+          const pId = it.productId || (it as any).product?.id || (it as any).id;
+          if (pId) {
+            const pRef = adminDb.collection('products').doc(pId);
+            const pSnap = await transaction.get(pRef);
+            if (pSnap.exists) {
+              const pData = pSnap.data();
+              const currentStock = typeof pData?.stock === 'number' ? pData.stock : 0;
+              const q = Math.max(1, Math.min(999, Math.floor(Number(it.quantity) || 1)));
+              productsToRestore.push({ ref: pRef, currentStock, restoreQty: q });
+            }
+          }
+        }
+      }
+
       // IMMUTABILITY OF FINANCIAL FIELDS:
       // Clone the sub-order preserving subtotal, total, platformCommission, sellerRevenue, commissionRate, deliveryFee, items, etc.
       const updatedSubOrder = {
@@ -926,6 +944,25 @@ export async function processSubOrderUpdateGateway(
       }
 
       const updatedStatusHistory = [...(orderData.statusHistory || []), historyEntry];
+
+      // Restore product catalog stock for cancelled items atomically
+      for (const p of productsToRestore) {
+        const newStock = p.currentStock + p.restoreQty;
+        transaction.update(p.ref, {
+          stock: newStock,
+          updatedAt: now,
+          lastInventoryAudit: {
+            orderId: parentOrderId,
+            subOrderId,
+            action: 'RESTORE_CANCELLED',
+            quantity: p.restoreQty,
+            previousStock: p.currentStock,
+            newStock,
+            timestamp: now,
+            reason: note || 'Sub-order cancelled by merchant/admin',
+          },
+        });
+      }
 
       transaction.update(orderRef, {
         status: nextOrderStatus,

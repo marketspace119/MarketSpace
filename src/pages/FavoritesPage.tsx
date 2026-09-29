@@ -1,7 +1,7 @@
 import React from 'react';
 import { Heart, ShoppingBasket, ArrowRight, Trash2 } from 'lucide-react';
 import { useFavorites } from '../context/FavoritesContext';
-import { seedProducts } from '../data/seedProducts';
+import { productService } from '../services/productService';
 import { ProductCard } from '../components/common/ProductCard';
 import { Product } from '../types';
 import { useLanguage } from '../i18n/LanguageContext';
@@ -15,7 +15,8 @@ export const FavoritesPage: React.FC<FavoritesPageProps> = ({ onNavigate, onQuic
   const { favorites, clearFavorites } = useFavorites();
   const { t } = useLanguage();
 
-  const favoriteProducts = seedProducts.filter(p => favorites.includes(p.id));
+  const allProducts = productService.getAllProducts();
+  const favoriteProducts = allProducts.filter(p => favorites.includes(p.id));
 
   if (favoriteProducts.length === 0) {
     return (

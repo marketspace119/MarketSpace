@@ -743,4 +743,57 @@ export interface PlatformSettings {
   updatedBy: string;
 }
 
+export type DisputeReason =
+  | 'item_not_received'
+  | 'damaged_item'
+  | 'wrong_item'
+  | 'quality_issue'
+  | 'seller_unresponsive'
+  | 'other';
+
+export type DisputeStatus =
+  | 'OPEN'
+  | 'SELLER_RESPONDED'
+  | 'UNDER_ADMIN_REVIEW'
+  | 'RESOLVED_REFUND'
+  | 'RESOLVED_REJECTED'
+  | 'CLOSED';
+
+export type DisputeRequestedAction =
+  | 'full_refund'
+  | 'partial_refund'
+  | 'replacement'
+  | 'explanation';
+
+export interface OrderDispute {
+  id: string;
+  orderId: string;
+  subOrderId?: string;
+  customerId: string;
+  customerName: string;
+  customerPhone?: string;
+  sellerId: string;
+  sellerName: string;
+  storeId?: string;
+  reason: DisputeReason;
+  description: string;
+  evidenceUrls?: string[];
+  requestedAction: DisputeRequestedAction;
+  status: DisputeStatus;
+  sellerResponse?: {
+    message: string;
+    respondedAt: string;
+    proposedAction?: 'accept_refund' | 'send_replacement' | 'reject';
+  };
+  adminResolution?: {
+    resolvedBy: string;
+    actionTaken: 'REFUND_APPROVED' | 'CLAIM_DISMISSED';
+    resolutionNotes: string;
+    resolvedAt: string;
+    refundAmount?: number;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
 export * from './monetization';

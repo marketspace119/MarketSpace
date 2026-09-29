@@ -864,8 +864,4 @@ export const deliveryService = {
 
     return newAssignment;
   },
-
-  seedAssignments(assignments: DeliveryAssignment[]) {
-    memoryAssignments = [...assignments];
-  },
 };
