@@ -129,6 +129,18 @@ export const commissionService = {
   },
 
   /**
+   * Calculates platform fee and seller net revenue for a given subtotal and percentage
+   */
+  calculateCommission(subtotal: number, commissionPercent: number): { platformFee: number; sellerNet: number } {
+    const platformFee = Math.round((subtotal * (commissionPercent / 100)) * 100) / 100;
+    const sellerNet = Math.round((subtotal - platformFee) * 100) / 100;
+    return {
+      platformFee,
+      sellerNet,
+    };
+  },
+
+  /**
    * Set commission rate policy
    * HIGH-07: Strictly enforced for SUPER_ADMIN role only. No automatic escalation from ADMIN.
    */

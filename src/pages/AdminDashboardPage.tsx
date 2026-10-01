@@ -19,6 +19,7 @@ import { AdminPaymentsSection } from '../components/admin/AdminPaymentsSection';
 import { AdminPayoutsSection } from '../components/admin/AdminPayoutsSection';
 import { AdminReviewsSection } from '../components/admin/AdminReviewsSection';
 import { AdminDeliverySection } from '../components/admin/AdminDeliverySection';
+import { AdminDisputesSection } from '../components/admin/AdminDisputesSection';
 import { AdminAuditSection } from '../components/admin/AdminAuditSection';
 import { AdminReportsSection } from '../components/admin/AdminReportsSection';
 import { AdminSettingsSection } from '../components/admin/AdminSettingsSection';
@@ -69,6 +70,7 @@ export const AdminDashboardPage: React.FC<AdminDashboardPageProps> = ({
       'bookings',
       'products',
       'orders',
+      'disputes',
       'payments',
       'payouts',
       'monetization',
@@ -332,6 +334,14 @@ export const AdminDashboardPage: React.FC<AdminDashboardPageProps> = ({
           {activeTab === 'orders' && (
             <AdminOrdersSection
               orders={orders}
+              currentUser={user}
+              onRefresh={loadPlatformData}
+              searchQuery={searchQuery}
+            />
+          )}
+
+          {activeTab === 'disputes' && (
+            <AdminDisputesSection
               currentUser={user}
               onRefresh={loadPlatformData}
               searchQuery={searchQuery}

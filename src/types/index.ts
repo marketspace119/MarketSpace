@@ -7,6 +7,7 @@ export type UserRole =
   | 'SELLER'
   | 'RESTAURANT'
   | 'SERVICE_PROVIDER'
+  | 'DRIVER'
   | 'ADMIN'
   | 'SUPER_ADMIN';
 
@@ -211,6 +212,7 @@ export interface Store {
   currentPlanId?: string;
   currentPlanTier?: string;
   createdAt: string;
+  updatedAt?: string;
 }
 
 export interface RestaurantMealAddon {
@@ -411,7 +413,7 @@ export interface Review {
   userAvatar?: string;
   rating: number;
   comment: string;
-  isVerifiedPurchase: boolean;
+  isVerifiedPurchase?: boolean;
   verifiedPurchase?: boolean;
   orderId?: string;
   isHidden?: boolean;
@@ -587,6 +589,8 @@ export interface DeliveryAssignment {
   trackingCode?: string;
   trackingNumber?: string;
   status: DeliveryAssignmentStatus;
+  deliveryFee?: number;
+  driverEarnings?: number;
   // Lifecycle timestamps
   timestamps: {
     created: string;

@@ -27,6 +27,7 @@ import {
   Bell,
   MapPin,
   Bot,
+  Truck,
 } from 'lucide-react';
 import { MarketSpaceLogo } from './MarketSpaceLogo';
 import { AIAssistantModal } from './AIAssistantModal';
@@ -513,6 +514,16 @@ export const Navbar: React.FC<NavbarProps> = ({ currentPath, onNavigate }) => {
             >
               <Shield className="w-4 h-4" />
               <span>لوحة الإدارة</span>
+            </button>
+          ) : user?.role === 'DRIVER' ? (
+            <button
+              type="button"
+              onClick={() => onNavigate('/driver')}
+              className="hidden sm:flex items-center gap-1.5 h-10 px-3.5 rounded-full bg-cyan-600 hover:bg-cyan-700 text-white font-bold text-xs shadow transition-all"
+              title={language === 'ar' ? 'لوحة التوصيل' : 'Driver Portal'}
+            >
+              <Truck className="w-4 h-4" />
+              <span>{language === 'ar' ? 'لوحة التوصيل' : 'Driver Portal'}</span>
             </button>
           ) : user?.role === 'SELLER' || user?.role === 'RESTAURANT' || user?.role === 'SERVICE_PROVIDER' ? (
             <button

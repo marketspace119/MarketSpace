@@ -40,6 +40,7 @@ export const AdminHeader: React.FC<AdminHeaderProps> = ({
     services: t('adminNavServices'),
     products: t('adminNavProducts'),
     orders: t('adminNavOrders'),
+    disputes: isRtl ? 'النزاعات والشكاوى' : 'Disputes',
     bookings: t('adminNavBookings'),
     payments: t('adminNavPayments'),
     payouts: t('adminNavPayouts'),

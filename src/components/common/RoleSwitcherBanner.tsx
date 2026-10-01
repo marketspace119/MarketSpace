@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Shield, Store as StoreIcon, Utensils, Briefcase, User as UserIcon, LogOut, ChevronDown, Check, Sparkles } from 'lucide-react';
+import { Shield, Store as StoreIcon, Utensils, Briefcase, User as UserIcon, LogOut, ChevronDown, Check, Sparkles, Truck } from 'lucide-react';
 import { useAuth, DEMO_ACCOUNTS } from '../../context/AuthContext';
 import { UserRole } from '../../types';
 import { useLanguage } from '../../i18n/LanguageContext';
@@ -27,6 +27,7 @@ export const RoleSwitcherBanner: React.FC<RoleSwitcherBannerProps> = ({ onNaviga
     { role: 'SELLER', labelAr: 'بائع متجر (Retail Seller)', labelEn: 'Store Seller', icon: StoreIcon, color: 'text-emerald-500' },
     { role: 'RESTAURANT', labelAr: 'مطعم (Restaurant Owner)', labelEn: 'Restaurant', icon: Utensils, color: 'text-amber-500' },
     { role: 'SERVICE_PROVIDER', labelAr: 'مقدم خدمة (Service Provider)', labelEn: 'Service Provider', icon: Briefcase, color: 'text-purple-500' },
+    { role: 'DRIVER', labelAr: 'مندوب توصيل (Delivery Driver)', labelEn: 'Courier / Driver', icon: Truck, color: 'text-cyan-400' },
     { role: 'ADMIN', labelAr: 'مدير المنصة (Marketplace Admin)', labelEn: 'Admin', icon: Shield, color: 'text-rose-500' },
     { role: 'SUPER_ADMIN', labelAr: 'المدير العام (Super Admin)', labelEn: 'Super Admin', icon: Sparkles, color: 'text-indigo-500' },
   ];
@@ -78,6 +79,8 @@ export const RoleSwitcherBanner: React.FC<RoleSwitcherBannerProps> = ({ onNaviga
                         handleNav('/admin');
                       } else if (item.role === 'SELLER' || item.role === 'RESTAURANT' || item.role === 'SERVICE_PROVIDER') {
                         handleNav('/seller-dashboard');
+                      } else if (item.role === 'DRIVER') {
+                        handleNav('/driver');
                       }
                     }}
                     className={`w-full flex items-center justify-between px-3 py-2 hover:bg-gray-800 transition ${

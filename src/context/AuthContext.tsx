@@ -80,6 +80,15 @@ export const DEMO_ACCOUNTS: Record<UserRole, User> = {
     avatar: 'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?auto=format&fit=crop&w=150&q=80',
     createdAt: '2025-02-15T00:00:00Z',
   },
+  DRIVER: {
+    id: 'drv_demo_01',
+    name: 'Ahmed Shire (Driver)',
+    email: 'ahmed.driver@demo.marketspace.so',
+    phone: '+252 61 511 2233',
+    role: 'DRIVER',
+    avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?auto=format&fit=crop&w=150&q=80',
+    createdAt: '2026-01-10T10:00:00Z',
+  },
   ADMIN: {
     id: 'user_admin_01',
     name: 'MarketSpace Manager',

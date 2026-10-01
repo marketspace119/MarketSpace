@@ -1,7 +1,21 @@
 import { initializeApp, getApps, cert, type App } from 'firebase-admin/app';
 import { getAuth, type Auth, type DecodedIdToken } from 'firebase-admin/auth';
 import { getFirestore, type Firestore } from 'firebase-admin/firestore';
-import config from '../firebase-applet-config.json' with { type: 'json' };
+import * as fs from 'fs';
+import * as path from 'path';
+
+let config: { projectId: string; firestoreDatabaseId?: string } = {
+  projectId: 'marketspace-applet',
+  firestoreDatabaseId: '(default)',
+};
+try {
+  const configPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+  if (fs.existsSync(configPath)) {
+    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  }
+} catch {
+  // Use default fallback
+}
 
 let adminApp: App | null = null;
 let adminAuth: Auth | null = null;

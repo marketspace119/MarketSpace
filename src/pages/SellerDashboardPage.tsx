@@ -35,16 +35,19 @@ import {
   X,
   Zap,
   Sparkles,
+  ShieldAlert,
 } from 'lucide-react';
 import { useLanguage } from '../i18n/LanguageContext';
 import { useAuth } from '../context/AuthContext';
-import { Product, Store, VendorSubOrder, ServiceBooking, Review, PayoutRequest } from '../types';
+import { Product, Store, VendorSubOrder, ServiceBooking, Review, PayoutRequest, OrderDispute, DeliveryAssignment, DriverProfile } from '../types';
 import { storeService } from '../services/storeService';
 import { productService } from '../services/productService';
 import { orderService } from '../services/orderService';
 import { bookingService } from '../services/bookingService';
 import { reviewService } from '../services/reviewService';
 import { payoutService } from '../services/payoutService';
+import { disputeService } from '../services/disputeService';
+import { deliveryService } from '../services/deliveryService';
 import { ImageUploadWidget } from '../components/ImageUploadWidget';
 import { SellerMonetizationTab } from '../components/monetization/SellerMonetizationTab';
 
@@ -62,7 +65,7 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
   const showDevRoleSwitcher = !isProd || isDevExplicitlyAllowed;
 
   const [activeTab, setActiveTab] = useState<
-    'overview' | 'products' | 'orders' | 'bookings' | 'reviews' | 'payouts' | 'monetization' | 'settings'
+    'overview' | 'products' | 'orders' | 'bookings' | 'reviews' | 'payouts' | 'monetization' | 'settings' | 'disputes' | 'deliveries'
   >('overview');
 
   const [store, setStore] = useState<Store | null>(null);
@@ -71,6 +74,27 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
   const [bookings, setBookings] = useState<ServiceBooking[]>([]);
   const [reviews, setReviews] = useState<Review[]>([]);
   const [payouts, setPayouts] = useState<PayoutRequest[]>([]);
+  const [deliveries, setDeliveries] = useState<DeliveryAssignment[]>([]);
+  const [sellerDisputes, setSellerDisputes] = useState<OrderDispute[]>([]);
+  const [availableDrivers, setAvailableDrivers] = useState<DriverProfile[]>([]);
+
+  // Dispute Response Modal
+  const [selectedDisputeToRespond, setSelectedDisputeToRespond] = useState<OrderDispute | null>(null);
+  const [disputeResponseText, setDisputeResponseText] = useState('');
+  const [disputeProposedResolution, setDisputeProposedResolution] = useState<'refund' | 'replacement' | 'decline'>('refund');
+  const [isSubmittingDisputeResponse, setIsSubmittingDisputeResponse] = useState(false);
+
+  // Delivery Driver Assignment Modal
+  const [selectedDeliveryToAssign, setSelectedDeliveryToAssign] = useState<DeliveryAssignment | null>(null);
+  const [selectedDriverIdToAssign, setSelectedDriverIdToAssign] = useState('');
+  const [isAssigningDriver, setIsAssigningDriver] = useState(false);
+
+  // Feedback Toast
+  const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const showToast = (text: string, type: 'success' | 'error' = 'success') => {
+    setToastMessage({ text, type });
+    setTimeout(() => setToastMessage(null), 3500);
+  };
 
   // Product Filter & Search
   const [productSearch, setProductSearch] = useState('');
@@ -168,6 +192,16 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
       const sellerPayouts = payoutService.getPayoutRequestsBySeller(user.id);
       setPayouts(sellerPayouts);
 
+      // Load disputes for this seller
+      const sellerDisps = disputeService.getDisputesBySeller(user.id);
+      setSellerDisputes(sellerDisps);
+
+      // Load deliveries & fleet for this store
+      deliveryService.ensureAssignmentsFromOrders(sellerOrders.map(o => o.order));
+      const storeDelivs = deliveryService.getAssignmentsByStore(targetStore.id);
+      setDeliveries(storeDelivs.length > 0 ? storeDelivs : deliveryService.getAssignmentsBySeller(user.id));
+      setAvailableDrivers(deliveryService.getAvailableDrivers());
+
       // FIN-01 / FIN-02: Authoritative Server Financial Summary
       payoutService.getFinancialSummary(user.id).then(summary => {
         setFinancialSummary(summary);
@@ -181,6 +215,8 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
       setBookings([]);
       setReviews([]);
       setPayouts([]);
+      setDeliveries([]);
+      setSellerDisputes([]);
       setFinancialSummary(null);
     }
   }, [user]);
@@ -463,9 +499,10 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
       );
       setOrders(orderService.getOrdersBySellerId(user.id, user.id, user.role));
       setSelectedFulfillment(null);
+      showToast(language === 'ar' ? 'تم تحديث حالة الطلب بنجاح' : 'Order status updated successfully', 'success');
     } catch (err: any) {
       console.error('Failed to update vendor order status:', err);
-      alert(err?.message || 'Failed to update order status');
+      showToast(err?.message || 'Failed to update order status', 'error');
     }
   };
 
@@ -474,6 +511,7 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
     if (!user) return;
     bookingService.updateBookingStatus(bookingId, newStatus, user.id, user.role);
     setBookings(bookingService.getBookingsBySellerId(user.id, user.id, user.role));
+    showToast(language === 'ar' ? 'تم تحديث حالة الحجز' : 'Booking status updated', 'success');
   };
 
   // Review reply
@@ -484,8 +522,109 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
       setReviews(reviews.map(r => (r.id === reviewId ? updated : r)));
       setReplyingReviewId(null);
       setReplyText('');
+      showToast(language === 'ar' ? 'تم إرسال ردك على التقييم بنجاح' : 'Review reply submitted', 'success');
     } catch (err: any) {
-      alert(err.message || 'فشل إرسال الرد');
+      showToast(err.message || 'فشل إرسال الرد', 'error');
+    }
+  };
+
+  // Dispute response handler
+  const handleRespondToDispute = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user || !selectedDisputeToRespond || !disputeResponseText.trim()) return;
+
+    setIsSubmittingDisputeResponse(true);
+    try {
+      disputeService.sellerRespond({
+        disputeId: selectedDisputeToRespond.id,
+        sellerId: user.id,
+        message: disputeResponseText.trim(),
+        proposedAction:
+          disputeProposedResolution === 'refund'
+            ? 'accept_refund'
+            : disputeProposedResolution === 'replacement'
+            ? 'send_replacement'
+            : 'reject',
+      });
+      setSellerDisputes(disputeService.getDisputesBySeller(user.id));
+      setSelectedDisputeToRespond(null);
+      setDisputeResponseText('');
+      showToast(language === 'ar' ? 'تم إرسال ردك على النزاع بنجاح' : 'Response submitted successfully', 'success');
+    } catch (err: any) {
+      showToast(err.message || 'فشل إرسال الرد على النزاع', 'error');
+    } finally {
+      setIsSubmittingDisputeResponse(false);
+    }
+  };
+
+  // Driver assignment handler
+  const handleAssignDriver = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user || !selectedDeliveryToAssign || !selectedDriverIdToAssign) return;
+
+    const drv = availableDrivers.find(d => d.id === selectedDriverIdToAssign);
+    if (!drv) {
+      showToast(language === 'ar' ? 'يرجى اختيار مندوب' : 'Please select driver', 'error');
+      return;
+    }
+
+    setIsAssigningDriver(true);
+    try {
+      await deliveryService.assignDriver({
+        assignmentId: selectedDeliveryToAssign.id,
+        deliveryType: 'PLATFORM_DELIVERY',
+        driverId: drv.id,
+        driverName: drv.name,
+        driverPhone: drv.phone,
+        vehicleInfo: `${drv.vehicleType} (${drv.plateNumber})`,
+        actorId: user.id,
+        actorRole: user.role,
+      });
+
+      if (store) {
+        setDeliveries(deliveryService.getAssignmentsByStore(store.id));
+      } else {
+        setDeliveries(deliveryService.getAssignmentsBySeller(user.id));
+      }
+      setSelectedDeliveryToAssign(null);
+      setSelectedDriverIdToAssign('');
+      showToast(
+        language === 'ar'
+          ? `تم إسناد الشحنة بنجاح إلى المندوب: ${drv.name}`
+          : `Driver ${drv.name} assigned to delivery`,
+        'success'
+      );
+    } catch (err: any) {
+      showToast(err.message || 'فشل إسناد المندوب', 'error');
+    } finally {
+      setIsAssigningDriver(false);
+    }
+  };
+
+  // Fast shipment transition
+  const handleMarkShipmentStatus = async (assignmentId: string, targetStatus: 'READY' | 'PICKED_UP') => {
+    if (!user) return;
+    try {
+      await deliveryService.updateStatus({
+        assignmentId,
+        status: targetStatus,
+        actorId: user.id,
+        actorRole: user.role,
+        notes: `Seller updated status to ${targetStatus}`,
+      });
+      if (store) {
+        setDeliveries(deliveryService.getAssignmentsByStore(store.id));
+      } else {
+        setDeliveries(deliveryService.getAssignmentsBySeller(user.id));
+      }
+      showToast(
+        language === 'ar'
+          ? `تم تحديث حالة الشحنة إلى: ${targetStatus}`
+          : `Shipment updated to ${targetStatus}`,
+        'success'
+      );
+    } catch (err: any) {
+      showToast(err.message || 'Failed to update shipment status', 'error');
     }
   };
 
@@ -494,7 +633,7 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
     e.preventDefault();
     if (!user || !store || isSubmittingPayout) return;
     if (payoutFormData.amount <= 0 || payoutFormData.amount > availableBalance) {
-      alert('المبلغ المطلوب غير صالح أو يتجاوز الرصيد المتاح.');
+      showToast(language === 'ar' ? 'المبلغ المطلوب غير صالح أو يتجاوز الرصيد المتاح.' : 'Invalid payout amount', 'error');
       return;
     }
 
@@ -512,9 +651,9 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
       setPayouts([newPayout, ...payouts]);
       setIsPayoutModalOpen(false);
       payoutService.getFinancialSummary(user.id).then(s => setFinancialSummary(s)).catch(() => {});
-      alert('تم تقديم طلب السحب بنجاح، وستتم معالجته خلال 24 ساعة.');
+      showToast(language === 'ar' ? 'تم تقديم طلب السحب بنجاح، وستتم معالجته خلال 24 ساعة.' : 'Payout request submitted', 'success');
     } catch (err: any) {
-      alert(err.message || 'فشل تقديم طلب السحب');
+      showToast(err.message || 'فشل تقديم طلب السحب', 'error');
     } finally {
       setIsSubmittingPayout(false);
     }
@@ -602,14 +741,16 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
       <div className="max-w-7xl mx-auto px-4 sm:px-8 mt-6">
         <div className="flex items-center gap-2 border-b border-gray-200 dark:border-gray-800 pb-2 overflow-x-auto scrollbar-none">
           {[
-            { id: 'overview', label: 'نظرة عامة (Overview)', icon: LayoutDashboard },
-            { id: 'products', label: `المنتجات والخدمات (${products.length})`, icon: Package },
-            { id: 'orders', label: `الطلبات الواردة (${orders.length})`, icon: ShoppingBag },
-            { id: 'bookings', label: `الحجوزات (${bookings.length})`, icon: Calendar },
-            { id: 'reviews', label: `التقييمات (${reviews.length})`, icon: Star },
-            { id: 'payouts', label: `المالية والسحوبات (${payouts.length})`, icon: DollarSign },
-            { id: 'monetization', label: language === 'ar' ? 'الخطط والترويج (Monetization)' : 'Plans & Promotions', icon: Zap },
-            { id: 'settings', label: 'إعدادات المتجر', icon: Settings },
+            { id: 'overview', label: language === 'ar' ? 'نظرة عامة' : 'Overview', icon: LayoutDashboard },
+            { id: 'products', label: `${language === 'ar' ? 'المنتجات والخدمات' : 'Catalog'} (${products.length})`, icon: Package },
+            { id: 'orders', label: `${language === 'ar' ? 'الطلبات الواردة' : 'Orders'} (${orders.length})`, icon: ShoppingBag },
+            { id: 'deliveries', label: `${language === 'ar' ? 'الشحنات والتوصيل' : 'Deliveries'} (${deliveries.length})`, icon: Truck },
+            { id: 'disputes', label: `${language === 'ar' ? 'النزاعات والشكاوى' : 'Disputes'} (${sellerDisputes.length})`, icon: ShieldAlert },
+            { id: 'bookings', label: `${language === 'ar' ? 'الحجوزات' : 'Bookings'} (${bookings.length})`, icon: Calendar },
+            { id: 'reviews', label: `${language === 'ar' ? 'التقييمات' : 'Reviews'} (${reviews.length})`, icon: Star },
+            { id: 'payouts', label: `${language === 'ar' ? 'المالية والسحوبات' : 'Payouts'} (${payouts.length})`, icon: DollarSign },
+            { id: 'monetization', label: language === 'ar' ? 'الخطط والترويج' : 'Plans & Promotions', icon: Zap },
+            { id: 'settings', label: language === 'ar' ? 'إعدادات المتجر' : 'Settings', icon: Settings },
           ].map(tab => {
             const Icon = tab.icon;
             const isActive = activeTab === tab.id;
@@ -1115,6 +1256,290 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
                     )}
                   </div>
                 ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Tab: Deliveries & Fleet */}
+        {activeTab === 'deliveries' && (
+          <div className="space-y-4">
+            <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3 shadow-xs">
+              <div>
+                <h3 className="font-bold text-sm">
+                  {language === 'ar' ? 'الشحنات وعمليات التوصيل والأسطول' : 'Deliveries & Logistics'}
+                </h3>
+                <p className="text-xs text-gray-500">
+                  {language === 'ar'
+                    ? 'إسناد مناديب التوصيل، متابعة خط السير، وتحديث جاهزية الطرود'
+                    : 'Assign delivery couriers, track dispatch stages, and manage handover.'}
+                </p>
+              </div>
+              <span className="text-xs font-bold text-gray-500">
+                {language === 'ar' ? 'إجمالي الشحنات:' : 'Total Deliveries:'} {deliveries.length}
+              </span>
+            </div>
+
+            {deliveries.length === 0 ? (
+              <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-12 text-center text-gray-400 text-xs">
+                <Truck className="w-12 h-12 mx-auto mb-2 opacity-30 text-cyan-600" />
+                <p>{language === 'ar' ? 'لا توجد شحنات مسجلة لمتجرك حتى الآن.' : 'No delivery shipments found.'}</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {deliveries.map(deliv => {
+                  const isAssigned = !!deliv.assignedDriver || !!deliv.driverName;
+                  const isReady = deliv.status === 'READY';
+                  const isPreparing = deliv.status === 'PREPARING';
+
+                  return (
+                    <div
+                      key={deliv.id}
+                      className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-5 shadow-xs text-xs space-y-3 flex flex-col justify-between"
+                    >
+                      <div>
+                        <div className="flex items-center justify-between pb-2 border-b border-gray-100 dark:border-gray-800">
+                          <span className="font-mono font-bold text-[#0E11B7] dark:text-cyan-400">
+                            #{deliv.subOrderId || deliv.orderId}
+                          </span>
+                          <span
+                            className={`text-[10px] font-bold px-2 py-0.5 rounded-full uppercase ${
+                              deliv.status === 'DELIVERED'
+                                ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300'
+                                : deliv.status === 'CANCELLED'
+                                ? 'bg-red-100 dark:bg-red-950 text-red-700 dark:text-red-300'
+                                : 'bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300'
+                            }`}
+                          >
+                            {deliv.status}
+                          </span>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2 mt-3 text-gray-600 dark:text-gray-300">
+                          <div>
+                            <span className="text-gray-400 block text-[10px] uppercase">
+                              {language === 'ar' ? 'العميل المستلم:' : 'Customer:'}
+                            </span>
+                            <span className="font-bold text-gray-900 dark:text-white block truncate">
+                              {deliv.customerName}
+                            </span>
+                            <span className="text-[11px] text-gray-500">{deliv.customerPhone}</span>
+                          </div>
+
+                          <div>
+                            <span className="text-gray-400 block text-[10px] uppercase">
+                              {language === 'ar' ? 'عنوان التسليم:' : 'Destination:'}
+                            </span>
+                            <span className="font-bold text-gray-900 dark:text-white block truncate">
+                              {deliv.city}
+                            </span>
+                            <span className="text-[11px] text-gray-500 truncate block">{deliv.address}</span>
+                          </div>
+                        </div>
+
+                        {/* Driver info */}
+                        <div className="mt-3 p-2.5 rounded-xl bg-gray-50 dark:bg-gray-800/60 flex items-center justify-between">
+                          <div>
+                            <span className="text-[10px] text-gray-400 block font-semibold">
+                              {language === 'ar' ? 'مندوب التوصيل:' : 'Assigned Courier:'}
+                            </span>
+                            <span className="font-bold text-gray-800 dark:text-gray-200">
+                              {deliv.driverName || (language === 'ar' ? 'لم يتم الإسناد بعد' : 'Unassigned')}
+                            </span>
+                          </div>
+                          {deliv.driverPhone && (
+                            <a
+                              href={`tel:${deliv.driverPhone}`}
+                              className="text-[11px] font-bold text-emerald-600 hover:underline flex items-center gap-1"
+                            >
+                              <Phone className="w-3 h-3" />
+                              <span>{deliv.driverPhone}</span>
+                            </a>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Action buttons */}
+                      <div className="pt-2 flex flex-wrap items-center gap-2 border-t border-gray-100 dark:border-gray-800">
+                        {!isAssigned && deliv.status !== 'DELIVERED' && deliv.status !== 'CANCELLED' && (
+                          <button
+                            onClick={() => {
+                              setSelectedDeliveryToAssign(deliv);
+                              setSelectedDriverIdToAssign(availableDrivers[0]?.id || '');
+                            }}
+                            className="flex-1 bg-cyan-600 hover:bg-cyan-700 text-white py-2 rounded-xl font-bold text-xs flex items-center justify-center gap-1.5 shadow"
+                          >
+                            <Truck className="w-3.5 h-3.5" />
+                            <span>{language === 'ar' ? 'إسناد مندوب' : 'Assign Courier'}</span>
+                          </button>
+                        )}
+
+                        {isPreparing && (
+                          <button
+                            onClick={() => handleMarkShipmentStatus(deliv.id, 'READY')}
+                            className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white py-2 rounded-xl font-bold text-xs"
+                          >
+                            {language === 'ar' ? 'جاهز للتسليم للمندوب' : 'Mark Ready'}
+                          </button>
+                        )}
+
+                        {isReady && (
+                          <button
+                            onClick={() => handleMarkShipmentStatus(deliv.id, 'PICKED_UP')}
+                            className="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white py-2 rounded-xl font-bold text-xs"
+                          >
+                            {language === 'ar' ? 'تم تسليم الطرد للمندوب' : 'Mark Handed Over'}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Tab: Customer Disputes */}
+        {activeTab === 'disputes' && (
+          <div className="space-y-4">
+            <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3 shadow-xs">
+              <div>
+                <h3 className="font-bold text-sm">
+                  {language === 'ar' ? 'النزاعات والشكاوى على الطلبات' : 'Customer Disputes'}
+                </h3>
+                <p className="text-xs text-gray-500">
+                  {language === 'ar'
+                    ? 'مراجعة شكاوى العملاء بخصوص المنتجات أو الشحن وتقديم ردود وتسويات مباشرة'
+                    : 'Review claims regarding damaged, missing items, or delays and submit solutions.'}
+                </p>
+              </div>
+              <span className="text-xs font-bold text-gray-500">
+                {language === 'ar' ? 'إجمالي الشكاوى:' : 'Total Disputes:'} {sellerDisputes.length}
+              </span>
+            </div>
+
+            {sellerDisputes.length === 0 ? (
+              <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-12 text-center text-gray-400 text-xs">
+                <ShieldCheck className="w-12 h-12 mx-auto mb-2 text-emerald-500 opacity-60" />
+                <h4 className="font-bold text-sm text-gray-800 dark:text-gray-200 mb-1">
+                  {language === 'ar' ? 'سجلك نظيف ومميز!' : 'Clean Record!'}
+                </h4>
+                <p>{language === 'ar' ? 'لا توجد نزاعات أو شكاوى مفتوحة ضد متجرك حالياً.' : 'No customer disputes on your store.'}</p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {sellerDisputes.map(disp => {
+                  const canRespond = disp.status === 'OPEN' || disp.status === 'SELLER_RESPONDED' || disp.status === 'UNDER_ADMIN_REVIEW';
+
+                  return (
+                    <div
+                      key={disp.id}
+                      className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-2xl p-5 shadow-xs text-xs space-y-3"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-gray-100 dark:border-gray-800">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-[#0E11B7] dark:text-blue-400">
+                            #{disp.orderId}
+                          </span>
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-300 uppercase">
+                            {disp.reason.replace('_', ' ')}
+                          </span>
+                        </div>
+
+                        <span
+                          className={`text-[10px] font-bold px-2.5 py-1 rounded-full uppercase ${
+                            disp.status === 'RESOLVED_REFUND'
+                              ? 'bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-300'
+                              : disp.status === 'RESOLVED_REJECTED'
+                              ? 'bg-red-100 dark:bg-red-950 text-red-700 dark:text-red-300'
+                              : 'bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-300'
+                          }`}
+                        >
+                          {disp.status}
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-gray-600 dark:text-gray-300">
+                        <div>
+                          <span className="text-gray-400 block text-[10px]">
+                            {language === 'ar' ? 'العميل المشتكي:' : 'Complainant:'}
+                          </span>
+                          <p className="font-bold text-gray-900 dark:text-white">
+                            {disp.customerName} ({disp.customerPhone || 'N/A'})
+                          </p>
+                          <span className="text-gray-400 block text-[10px] mt-2">
+                            {language === 'ar' ? 'الإجراء المطلوب من العميل:' : 'Requested Action:'}
+                          </span>
+                          <p className="font-semibold text-rose-600 uppercase">
+                            {disp.requestedAction.replace('_', ' ')}
+                          </p>
+                        </div>
+
+                        <div>
+                          <span className="text-gray-400 block text-[10px]">
+                            {language === 'ar' ? 'شرح العميل للمشكلة:' : 'Customer Description:'}
+                          </span>
+                          <p className="bg-gray-50 dark:bg-gray-800 p-2.5 rounded-xl text-[11px] text-gray-700 dark:text-gray-200 mt-1">
+                            {disp.description}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Seller response if already provided */}
+                      {disp.sellerResponse && (
+                        <div className="bg-blue-50/50 dark:bg-blue-950/20 border border-blue-100 dark:border-blue-900/40 p-3 rounded-xl">
+                          <span className="text-[10px] font-bold text-blue-700 dark:text-blue-300 block mb-1">
+                            {language === 'ar' ? 'رد متجرك السابق والحل المقترح:' : 'Your Response:'}
+                          </span>
+                          <p className="text-[11px] text-gray-800 dark:text-gray-200">{disp.sellerResponse.message}</p>
+                          {disp.sellerResponse.proposedAction && (
+                            <span className="inline-block mt-1 text-[10px] font-bold text-cyan-600 uppercase">
+                              {language === 'ar' ? 'الحل المقترح:' : 'Proposed Solution:'} {disp.sellerResponse.proposedAction}
+                            </span>
+                          )}
+                        </div>
+                      )}
+
+                      {/* Admin resolution if closed */}
+                      {disp.adminResolution?.resolutionNotes && (
+                        <div className="bg-emerald-50/50 dark:bg-emerald-950/20 border border-emerald-100 dark:border-emerald-900/40 p-3 rounded-xl">
+                          <span className="text-[10px] font-bold text-emerald-700 dark:text-emerald-300 block mb-1">
+                            {language === 'ar' ? 'قرار الإدارة النهائي:' : 'Admin Final Decision:'}
+                          </span>
+                          <p className="text-[11px] text-gray-800 dark:text-gray-200">{disp.adminResolution.resolutionNotes}</p>
+                        </div>
+                      )}
+
+                      {/* Action */}
+                      {canRespond && (
+                        <div className="pt-2 flex justify-end">
+                          <button
+                            onClick={() => {
+                              setSelectedDisputeToRespond(disp);
+                              setDisputeResponseText(disp.sellerResponse?.message || '');
+                              setDisputeProposedResolution(
+                                disp.sellerResponse?.proposedAction === 'accept_refund'
+                                  ? 'refund'
+                                  : disp.sellerResponse?.proposedAction === 'send_replacement'
+                                  ? 'replacement'
+                                  : 'decline'
+                              );
+                            }}
+                            className="bg-[#0E11B7] hover:bg-[#0c0ea3] text-white px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 shadow"
+                          >
+                            <Reply className="w-3.5 h-3.5" />
+                            <span>
+                              {disp.sellerResponse
+                                ? language === 'ar' ? 'تعديل رد المتجر' : 'Edit Response'
+                                : language === 'ar' ? 'الرد على الشكوى وتقديم حل' : 'Respond & Propose Solution'}
+                            </span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
@@ -1928,6 +2353,163 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
               </div>
             </form>
           </div>
+        </div>
+      )}
+
+      {/* Seller Dispute Response Modal */}
+      {selectedDisputeToRespond && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="bg-white dark:bg-gray-900 rounded-3xl max-w-md w-full border border-gray-200 dark:border-gray-800 p-6 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-gray-100 dark:border-gray-800">
+              <h3 className="font-bold text-sm text-gray-900 dark:text-white flex items-center gap-2">
+                <Reply className="w-4 h-4 text-[#0E11B7]" />
+                <span>{language === 'ar' ? 'الرد على نزاع العميل' : 'Respond to Dispute'}</span>
+              </h3>
+              <button
+                onClick={() => setSelectedDisputeToRespond(null)}
+                className="text-gray-400 hover:text-gray-600 font-bold text-sm"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="my-3 p-3 bg-gray-50 dark:bg-gray-800/60 rounded-xl text-xs space-y-1">
+              <p><strong>{language === 'ar' ? 'الطلب:' : 'Order:'}</strong> #{selectedDisputeToRespond.orderId}</p>
+              <p><strong>{language === 'ar' ? 'العميل:' : 'Customer:'}</strong> {selectedDisputeToRespond.customerName}</p>
+              <p><strong>{language === 'ar' ? 'السبب:' : 'Reason:'}</strong> {selectedDisputeToRespond.reason}</p>
+              <p className="text-gray-500 italic mt-1">"{selectedDisputeToRespond.description}"</p>
+            </div>
+
+            <form onSubmit={handleRespondToDispute} className="space-y-4 text-xs">
+              <div>
+                <label className="block font-semibold mb-1">
+                  {language === 'ar' ? 'رد المتجر وتوضيح الموقف *' : 'Merchant Statement *'}
+                </label>
+                <textarea
+                  rows={3}
+                  required
+                  placeholder={language === 'ar' ? 'اشرح وجهة نظر المتجر أو اعتذر وقدم الحل المناسب...' : 'Provide details and proposed resolution...'}
+                  value={disputeResponseText}
+                  onChange={e => setDisputeResponseText(e.target.value)}
+                  className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-xl p-2.5 text-xs text-gray-900 dark:text-white"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold mb-1">
+                  {language === 'ar' ? 'التسوية المقترحة من طرفك:' : 'Proposed Resolution:'}
+                </label>
+                <select
+                  value={disputeProposedResolution}
+                  onChange={e => setDisputeProposedResolution(e.target.value as any)}
+                  className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-xl p-2.5 text-xs text-gray-900 dark:text-white"
+                >
+                  <option value="refund">{language === 'ar' ? 'موافقة على الاسترداد المالي (Refund)' : 'Accept Refund'}</option>
+                  <option value="replacement">{language === 'ar' ? 'إرسال منتج بديل مجاناً (Replacement)' : 'Free Replacement'}</option>
+                  <option value="decline">{language === 'ar' ? 'رفض الشكوى مع التوضيح (Decline with Reason)' : 'Decline Claim'}</option>
+                </select>
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setSelectedDisputeToRespond(null)}
+                  className="flex-1 py-2.5 rounded-xl border border-gray-300 dark:border-gray-700 font-bold"
+                >
+                  {language === 'ar' ? 'إلغاء' : 'Cancel'}
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmittingDisputeResponse}
+                  className="flex-1 bg-[#0E11B7] hover:bg-[#0c0ea3] disabled:opacity-50 text-white py-2.5 rounded-xl font-bold shadow"
+                >
+                  {isSubmittingDisputeResponse
+                    ? language === 'ar' ? 'جاري الإرسال...' : 'Submitting...'
+                    : language === 'ar' ? 'إرسال الرد للإدارة والعميل' : 'Submit Response'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Driver Assignment Modal */}
+      {selectedDeliveryToAssign && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="bg-white dark:bg-gray-900 rounded-3xl max-w-md w-full border border-gray-200 dark:border-gray-800 p-6 shadow-2xl">
+            <div className="flex items-center justify-between pb-3 border-b border-gray-100 dark:border-gray-800">
+              <h3 className="font-bold text-sm text-gray-900 dark:text-white flex items-center gap-2">
+                <Truck className="w-4 h-4 text-cyan-600" />
+                <span>{language === 'ar' ? 'إسناد مندوب توصيل للشحنة' : 'Assign Delivery Courier'}</span>
+              </h3>
+              <button
+                onClick={() => setSelectedDeliveryToAssign(null)}
+                className="text-gray-400 hover:text-gray-600 font-bold text-sm"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="my-3 p-3 bg-gray-50 dark:bg-gray-800/60 rounded-xl text-xs space-y-1">
+              <p><strong>{language === 'ar' ? 'الشحنة رقم:' : 'Shipment:'}</strong> #{selectedDeliveryToAssign.subOrderId || selectedDeliveryToAssign.orderId}</p>
+              <p><strong>{language === 'ar' ? 'العميل المستلم:' : 'Customer:'}</strong> {selectedDeliveryToAssign.customerName}</p>
+              <p><strong>{language === 'ar' ? 'العنوان:' : 'Address:'}</strong> {selectedDeliveryToAssign.address}, {selectedDeliveryToAssign.city}</p>
+            </div>
+
+            <form onSubmit={handleAssignDriver} className="space-y-4 text-xs">
+              <div>
+                <label className="block font-semibold mb-1">
+                  {language === 'ar' ? 'اختر المندوب المتاح حالياً *' : 'Select Available Courier *'}
+                </label>
+                <select
+                  required
+                  value={selectedDriverIdToAssign}
+                  onChange={e => setSelectedDriverIdToAssign(e.target.value)}
+                  className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-xl p-2.5 text-xs text-gray-900 dark:text-white"
+                >
+                  <option value="">{language === 'ar' ? '-- اختر مندوباً من القائمة --' : '-- Select Driver --'}</option>
+                  {availableDrivers.map(drv => (
+                    <option key={drv.id} value={drv.id}>
+                      {drv.name} ({drv.vehicleType} - {drv.plateNumber}) • {drv.currentZone}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setSelectedDeliveryToAssign(null)}
+                  className="flex-1 py-2.5 rounded-xl border border-gray-300 dark:border-gray-700 font-bold"
+                >
+                  {language === 'ar' ? 'إلغاء' : 'Cancel'}
+                </button>
+                <button
+                  type="submit"
+                  disabled={isAssigningDriver || !selectedDriverIdToAssign}
+                  className="flex-1 bg-cyan-600 hover:bg-cyan-700 disabled:opacity-50 text-white py-2.5 rounded-xl font-bold shadow"
+                >
+                  {isAssigningDriver
+                    ? language === 'ar' ? 'جاري الإسناد...' : 'Assigning...'
+                    : language === 'ar' ? 'تأكيد إسناد المندوب' : 'Confirm Assignment'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Floating In-App Toast Banner */}
+      {toastMessage && (
+        <div
+          className={`fixed bottom-6 end-6 z-50 px-4 py-3 rounded-2xl shadow-xl border text-xs font-bold flex items-center gap-2 transition-all ${
+            toastMessage.type === 'success'
+              ? 'bg-emerald-600 text-white border-emerald-500'
+              : 'bg-rose-600 text-white border-rose-500'
+          }`}
+        >
+          {toastMessage.type === 'success' ? <Check className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
+          <span>{toastMessage.text}</span>
         </div>
       )}
     </div>

@@ -71,10 +71,11 @@ export const AdminDeliverySection: React.FC<AdminDeliverySectionProps> = ({
         address: assigningOrder.address,
         deliveryType: deliveryModel === 'customer_pickup' ? 'pickup' : (deliveryModel as any),
         assignedDriver: driverName.trim() || null,
+        driverName: driverName.trim() || undefined,
         driverPhone: driverPhone.trim(),
         vehicleInfo: vehicleInfo.trim(),
         trackingCode: assigningOrder.deliveryTrackingCode,
-        status: driverName.trim() ? 'ready' : 'pending_fulfillment',
+        status: driverName.trim() ? 'ASSIGNED' : 'PENDING',
       });
 
       setAssigningOrder(null);
@@ -199,7 +200,7 @@ export const AdminDeliverySection: React.FC<AdminDeliverySectionProps> = ({
                       <td className="px-4 py-3">
                         {assignment ? (
                           <div>
-                            <p className="font-bold text-gray-900">{assignment.driverName}</p>
+                            <p className="font-bold text-gray-900">{assignment.driverName || assignment.assignedDriver}</p>
                             <p className="text-[11px] text-gray-500 font-mono">{assignment.driverPhone} • {assignment.vehicleInfo}</p>
                           </div>
                         ) : (
@@ -208,20 +209,22 @@ export const AdminDeliverySection: React.FC<AdminDeliverySectionProps> = ({
                       </td>
                       <td className="px-4 py-3">
                         <span className="px-2 py-0.5 rounded-md bg-gray-100 text-gray-700 font-medium text-[10px] capitalize">
-                          {(assignment?.deliveryModel || 'platform_delivery').replace('_', ' ')}
+                          {(assignment?.deliveryModel || assignment?.deliveryType || 'platform_delivery').replace('_', ' ')}
                         </span>
                       </td>
                       <td className="px-4 py-3">
                         <span
                           className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
-                            order.status === 'delivered'
+                            order.status === 'delivered' || assignment?.status === 'DELIVERED'
                               ? 'bg-emerald-100 text-emerald-800'
-                              : order.status === 'shipped'
+                              : order.status === 'shipped' || assignment?.status === 'OUT_FOR_DELIVERY' || assignment?.status === 'PICKED_UP'
                               ? 'bg-indigo-100 text-indigo-800'
+                              : assignment?.status === 'FAILED'
+                              ? 'bg-red-100 text-red-800'
                               : 'bg-amber-100 text-amber-800'
                           }`}
                         >
-                          {order.status.toUpperCase()}
+                          {(assignment?.status || order.status).toUpperCase()}
                         </span>
                       </td>
                       <td className="px-4 py-3 text-right">
@@ -233,15 +236,37 @@ export const AdminDeliverySection: React.FC<AdminDeliverySectionProps> = ({
                             <Plus className="w-3.5 h-3.5" />
                             <span>Assign Driver</span>
                           </button>
-                        ) : assignment.status !== 'delivered' ? (
+                        ) : assignment.status === 'OUT_FOR_DELIVERY' || assignment.status === 'PICKED_UP' ? (
+                          <div className="flex items-center justify-end gap-1.5">
+                            <button
+                              onClick={() => handleUpdateStatus(assignment.id, 'DELIVERED')}
+                              className="px-2.5 py-1 text-[11px] font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-lg"
+                            >
+                              Mark Delivered
+                            </button>
+                            <button
+                              onClick={() => handleUpdateStatus(assignment.id, 'FAILED')}
+                              className="px-2 py-1 text-[10px] font-semibold bg-red-50 hover:bg-red-100 text-red-600 rounded-lg"
+                            >
+                              Failed
+                            </button>
+                          </div>
+                        ) : assignment.status === 'FAILED' ? (
                           <button
-                            onClick={() => handleUpdateStatus(assignment.id, 'delivered')}
-                            className="px-2.5 py-1 text-[11px] font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-700 rounded-lg"
+                            onClick={() => handleUpdateStatus(assignment.id, 'RESCHEDULED')}
+                            className="px-2.5 py-1 text-[11px] font-semibold bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg"
                           >
-                            Mark Delivered
+                            Reschedule
+                          </button>
+                        ) : assignment.status !== 'DELIVERED' && (assignment.status as string) !== 'delivered' ? (
+                          <button
+                            onClick={() => handleUpdateStatus(assignment.id, 'OUT_FOR_DELIVERY')}
+                            className="px-2.5 py-1 text-[11px] font-semibold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg"
+                          >
+                            Dispatch Out
                           </button>
                         ) : (
-                          <span className="text-[11px] text-emerald-600 font-bold">Done</span>
+                          <span className="text-[11px] text-emerald-600 font-bold">Delivered ✓</span>
                         )}
                       </td>
                     </tr>

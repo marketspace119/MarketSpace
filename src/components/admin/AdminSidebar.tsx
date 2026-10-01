@@ -35,6 +35,7 @@ export type AdminTab =
   | 'services'
   | 'products'
   | 'orders'
+  | 'disputes'
   | 'bookings'
   | 'payments'
   | 'payouts'
@@ -93,6 +94,7 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({
     { id: 'services', label: t('adminNavServices'), icon: Wrench },
     { id: 'products', label: t('adminNavProducts'), icon: Package },
     { id: 'orders', label: t('adminNavOrders'), icon: ShoppingBag, badge: effectiveCounts.orders },
+    { id: 'disputes', label: t('adminNavDisputes'), icon: ShieldAlert, badge: effectiveCounts.disputes },
     { id: 'bookings', label: t('adminNavBookings'), icon: CalendarCheck },
     { id: 'payments', label: t('adminNavPayments'), icon: CreditCard, badge: effectiveCounts.payments },
     { id: 'payouts', label: t('adminNavPayouts'), icon: Banknote, badge: effectiveCounts.payouts },

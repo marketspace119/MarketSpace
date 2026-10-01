@@ -4,6 +4,7 @@ import { Product, UserRole } from '../types';
 import { seedProducts } from '../data/seedProducts';
 import { auditLogService } from './auditLogService';
 import { normalizeProduct } from '../lib/dataNormalization';
+import { subscriptionService } from './subscriptionService';
 
 const PRODUCTS_STORAGE_KEY = 'marketspace_products_v1';
 const PRODUCTS_COLLECTION = 'products';
@@ -52,6 +53,18 @@ function initProducts(): Product[] {
     memoryProducts = seedProducts.map(normalizeProduct);
     return memoryProducts;
   }
+}
+
+function cleanForFirestore<T extends Record<string, any>>(obj: T): any {
+  if (!obj || typeof obj !== 'object') return obj;
+  if (Array.isArray(obj)) return obj.map(item => cleanForFirestore(item));
+  const cleaned: Record<string, any> = {};
+  for (const [k, v] of Object.entries(obj)) {
+    if (v !== undefined) {
+      cleaned[k] = typeof v === 'object' && v !== null ? cleanForFirestore(v) : v;
+    }
+  }
+  return cleaned;
 }
 
 type ProductListener = () => void;
@@ -173,6 +186,26 @@ export const productService = {
     return products.find(p => p.id === id);
   },
 
+  searchProducts(query: string): Product[] {
+    const q = query.trim().toLowerCase();
+    if (!q) return this.getAllProducts({ onlyPublished: true });
+    return this.getAllProducts({ onlyPublished: true }).filter(p => {
+      const title = `${p.title?.ar || ''} ${p.title?.en || ''} ${p.title?.so || ''}`.toLowerCase();
+      const desc = `${p.description?.ar || ''} ${p.description?.en || ''} ${p.description?.so || ''}`.toLowerCase();
+      const cat = (p.category || '').toLowerCase();
+      return title.includes(q) || desc.includes(q) || cat.includes(q);
+    });
+  },
+
+  toggleProductStatus(
+    id: string,
+    status: Product['status'],
+    currentUserId: string,
+    userRole: string
+  ): Product {
+    return this.updateProduct(id, { status, isPublished: status === 'published' }, currentUserId, userRole);
+  },
+
   getOffers(): Product[] {
     const products = this.getAllProducts({ onlyPublished: true });
     return products.filter(p => p.isOffer || (p.discount && p.discount > 0) || (p.oldPrice && p.oldPrice > p.price));
@@ -191,6 +224,26 @@ export const productService = {
     currentStoreId: string
   ): Product {
     const products = initProducts();
+
+    // Subscription plan product quota enforcement (Phase 10 & Phase 4)
+    if (currentUserId && currentStoreId) {
+      try {
+        const activeSub = subscriptionService.getSellerActiveSubscription(currentUserId);
+        const plans = subscriptionService.getPlans();
+        const plan = (activeSub ? plans.find(p => p.id === activeSub.planId || p.tier === activeSub.planTier) : undefined) || plans.find(p => p.id === 'plan_free');
+        if (plan && plan.maxProducts) {
+          const currentCount = products.filter(p => p.storeId === currentStoreId).length;
+          if (currentCount >= plan.maxProducts) {
+            throw new Error(
+              `لقد بلغت الحد الأقصى للمنتجات المسموح بها (${plan.maxProducts}) في باقتك الحالية (${plan.name.ar || plan.name.en}). يرجى ترقية الباقة لتتمكن من إضافة المزيد من المنتجات.`
+            );
+          }
+        }
+      } catch (err: any) {
+        if (err.message?.includes('الحد الأقصى')) throw err;
+      }
+    }
+
     const newProduct: Product = {
       ...productData,
       id: `prod_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
@@ -220,7 +273,7 @@ export const productService = {
     persistLocal(products);
 
     // Persist to Cloud Firestore
-    setDoc(doc(db, PRODUCTS_COLLECTION, newProduct.id), newProduct).catch(err => {
+    setDoc(doc(db, PRODUCTS_COLLECTION, newProduct.id), cleanForFirestore(newProduct)).catch(err => {
       console.warn('Could not write product to Firestore immediately:', err);
     });
 
@@ -297,7 +350,7 @@ export const productService = {
     persistLocal(products);
 
     // Persist to Cloud Firestore
-    setDoc(doc(db, PRODUCTS_COLLECTION, id), updated, { merge: true }).catch(err => {
+    setDoc(doc(db, PRODUCTS_COLLECTION, id), cleanForFirestore(updated), { merge: true }).catch(err => {
       handleFirestoreError(err, OperationType.UPDATE, `${PRODUCTS_COLLECTION}/${id}`);
     });
 

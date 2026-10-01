@@ -25,24 +25,28 @@ import {
 import { useLanguage } from '../i18n/LanguageContext';
 import { useAuth } from '../context/AuthContext';
 import { useCart } from '../context/CartContext';
-import { OrderDetails, VendorSubOrder, DeliveryAssignment, OrderDispute, DisputeReason, DisputeRequestedAction } from '../types';
+import { OrderDetails, VendorSubOrder, DeliveryAssignment, OrderDispute, DisputeReason, DisputeRequestedAction, ServiceBooking } from '../types';
 import { orderService } from '../services/orderService';
 import { reviewService } from '../services/reviewService';
 import { deliveryService } from '../services/deliveryService';
 import { messagingService } from '../services/messagingService';
 import { disputeService } from '../services/disputeService';
+import { bookingService } from '../services/bookingService';
 
 interface OrdersPageProps {
   onNavigate: (path: string) => void;
   orderIdFromRoute?: string;
+  initialTab?: 'orders' | 'bookings';
 }
 
-export const OrdersPage: React.FC<OrdersPageProps> = ({ onNavigate, orderIdFromRoute }) => {
+export const OrdersPage: React.FC<OrdersPageProps> = ({ onNavigate, orderIdFromRoute, initialTab }) => {
   const { language, t, isRTL } = useLanguage();
   const { user } = useAuth();
   const { addItem } = useCart();
 
   const [orders, setOrders] = useState<OrderDetails[]>([]);
+  const [mainTab, setMainTab] = useState<'orders' | 'bookings'>(initialTab || 'orders');
+  const [bookings, setBookings] = useState<ServiceBooking[]>([]);
   const [selectedOrder, setSelectedOrder] = useState<OrderDetails | null>(null);
   const [searchId, setSearchId] = useState(orderIdFromRoute || '');
   const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'processing' | 'shipped' | 'delivered'>('all');
@@ -267,17 +271,143 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ onNavigate, orderIdFromR
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 animate-fadeIn">
       {/* Header */}
-      <div className="mb-8">
+      <div className="mb-6">
         <h1 className="text-2xl sm:text-3xl font-black text-gray-900 dark:text-white flex items-center gap-3">
           <Package className="w-7 h-7 text-[#0E11B7]" />
-          <span>{language === 'ar' ? 'طلباتي وتتبع الشحنات' : language === 'so' ? 'Dalbkayga & Raadinta' : 'My Orders & Tracking'}</span>
+          <span>{language === 'ar' ? 'طلباتي وسجل المشتريات والحجوزات' : language === 'so' ? 'Dalbkayga & Ballamaha' : 'My Orders & Bookings'}</span>
         </h1>
         <p className="text-xs text-gray-500 mt-1">
           {language === 'ar'
-            ? 'تابع حالة طلباتك، المتاجر المجهزة، وأكواد الشحنات في الوقت الفعلي.'
-            : 'Track your orders, vendor shipments, and dispatch timeline in real-time.'}
+            ? 'تابع حالة طلباتك، المتاجر المجهزة، وأكواد الشحنات وحجوزات الخدمات في الوقت الفعلي.'
+            : 'Track your orders, vendor shipments, dispatch timeline, and service bookings in real-time.'}
         </p>
       </div>
+
+      {/* Primary Tab Switcher */}
+      <div className="flex items-center gap-3 mb-6 border-b border-gray-200 dark:border-gray-800 pb-3">
+        <button
+          onClick={() => setMainTab('orders')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-2xl text-xs font-bold transition-all ${
+            mainTab === 'orders'
+              ? 'bg-[#0E11B7] text-white shadow-md'
+              : 'bg-white dark:bg-[#151A23] text-gray-700 dark:text-gray-300 border border-gray-200 dark:border-[#293142]'
+          }`}
+        >
+          <Package className="w-4 h-4" />
+          <span>{language === 'ar' ? 'طلبات السلع والمطاعم' : 'Product & Food Orders'}</span>
+          <span className="ms-1 px-2 py-0.5 rounded-full text-[10px] bg-black/10 dark:bg-white/10">{orders.length}</span>
+        </button>
+
+        <button
+          onClick={() => {
+            setMainTab('bookings');
+            if (user?.id) {
+              setBookings(bookingService.getAllBookings(user.id));
+            }
+          }}
+          className={`flex items-center gap-2 px-4 py-2 rounded-2xl text-xs font-bold transition-all ${
+            mainTab === 'bookings'
+              ? 'bg-[#0E11B7] text-white shadow-md'
+              : 'bg-white dark:bg-[#151A23] text-gray-700 dark:text-gray-300 border border-gray-200 dark:border-[#293142]'
+          }`}
+        >
+          <Calendar className="w-4 h-4" />
+          <span>{language === 'ar' ? 'حجوزات الخدمات الفنية' : 'Service Bookings'}</span>
+          <span className="ms-1 px-2 py-0.5 rounded-full text-[10px] bg-black/10 dark:bg-white/10">{bookings.length}</span>
+        </button>
+      </div>
+
+      {mainTab === 'bookings' ? (
+        <div className="space-y-4">
+          {bookings.length === 0 ? (
+            <div className="text-center py-16 bg-white dark:bg-[#151A23] rounded-3xl border border-gray-200 dark:border-[#293142] p-8">
+              <Calendar className="w-16 h-16 text-gray-300 dark:text-gray-600 mx-auto mb-3" />
+              <h3 className="text-base font-bold text-gray-900 dark:text-white">
+                {language === 'ar' ? 'لا توجد حجوزات خدمات مسجلة' : 'No service bookings found'}
+              </h3>
+              <p className="text-xs text-gray-500 mt-1 mb-5">
+                {language === 'ar'
+                  ? 'يمكنك استكشاف دليل الخدمات وحجز استشارة أو صيانة أو برمجة احترافية بسهولة.'
+                  : 'Explore available professional services, consultants, and technicians.'}
+              </p>
+              <button
+                onClick={() => onNavigate('/services')}
+                className="px-5 py-2.5 bg-[#0E11B7] hover:bg-[#070A86] text-white rounded-2xl text-xs font-bold shadow-md transition-all"
+              >
+                {language === 'ar' ? 'استعراض دليل الخدمات' : 'Explore Services'}
+              </button>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {bookings.map((b) => (
+                <div
+                  key={b.id}
+                  className="p-5 bg-white dark:bg-[#151A23] rounded-3xl border border-gray-200 dark:border-[#293142] shadow-sm space-y-3"
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-blue-50 dark:bg-blue-950/60 text-[#0E11B7] dark:text-blue-400 font-bold">
+                        {b.bookingCode}
+                      </span>
+                      <h4 className="text-sm font-bold text-gray-900 dark:text-white mt-1">{b.serviceTitle}</h4>
+                      <p className="text-xs text-gray-500">{b.storeName}</p>
+                    </div>
+                    <span
+                      className={`px-2.5 py-1 rounded-full text-[10px] font-bold uppercase ${
+                        b.status === 'completed'
+                          ? 'bg-emerald-100 text-emerald-800'
+                          : b.status === 'cancelled'
+                          ? 'bg-red-100 text-red-800'
+                          : b.status === 'in_progress' || b.status === 'scheduled'
+                          ? 'bg-blue-100 text-blue-800'
+                          : 'bg-amber-100 text-amber-800'
+                      }`}
+                    >
+                      {b.status}
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 text-xs text-gray-600 dark:text-gray-300 bg-gray-50 dark:bg-[#111722] p-3 rounded-2xl">
+                    <div>
+                      <span className="text-[10px] text-gray-400 block">{language === 'ar' ? 'التاريخ والوقت:' : 'Date & Time:'}</span>
+                      <span className="font-semibold">{b.date} • {b.time}</span>
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-gray-400 block">{language === 'ar' ? 'التكلفة التقديرية:' : 'Estimated Price:'}</span>
+                      <span className="font-bold text-emerald-600">${Number(b.price || 0).toFixed(2)}</span>
+                    </div>
+                    <div className="col-span-2 pt-1">
+                      <span className="text-[10px] text-gray-400 block">{language === 'ar' ? 'الموقع / طريقة التقديم:' : 'Location:'}</span>
+                      <span className="font-medium text-gray-700 dark:text-gray-200">{b.location}</span>
+                    </div>
+                  </div>
+
+                  {b.status !== 'completed' && b.status !== 'cancelled' && (
+                    <div className="flex justify-end pt-1">
+                      <button
+                        onClick={() => {
+                          if (user?.id) {
+                            try {
+                              bookingService.updateBookingStatus(b.id, 'cancelled', user.id, user.role || 'CUSTOMER');
+                              setBookings(bookingService.getAllBookings(user.id));
+                            } catch (e: any) {
+                              alert(e.message);
+                            }
+                          }
+                        }}
+                        className="px-3 py-1.5 text-xs font-semibold text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/40 rounded-xl transition-colors"
+                      >
+                        {language === 'ar' ? 'إلغاء الموعد' : 'Cancel Booking'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : (
+      <>
 
       {/* Direct Order ID Search Bar */}
       <div className="mb-8 p-4 sm:p-5 rounded-3xl bg-white dark:bg-[#151A23] border border-gray-200 dark:border-[#293142] shadow-sm">
@@ -738,6 +868,8 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ onNavigate, orderIdFromR
           </div>
         )}
       </div>
+      </>
+      )}
 
       {/* Product / Store Review Modal */}
       {reviewModalData && (

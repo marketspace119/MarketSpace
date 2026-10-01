@@ -231,4 +231,151 @@ export const bookingService = {
     );
     return STANDARD_SLOTS.filter(slot => !bookedTimes.has(slot));
   },
+
+  /**
+   * Cancel booking by customer, service provider, or admin
+   */
+  cancelBooking(
+    bookingId: string,
+    actorId: string,
+    actorRole: string,
+    reason?: string
+  ): ServiceBooking {
+    const bookings = initBookings();
+    const index = bookings.findIndex(b => b.id === bookingId);
+    if (index === -1) throw new Error('Booking not found');
+
+    const booking = bookings[index];
+    const isAdmin = actorRole === 'ADMIN' || actorRole === 'SUPER_ADMIN';
+    const isCustomer = booking.customerId === actorId;
+    const isProvider = booking.sellerId === actorId;
+
+    if (!isAdmin && !isCustomer && !isProvider) {
+      throw new Error('Forbidden: You can only cancel bookings associated with your account');
+    }
+
+    if (booking.status === 'completed' || booking.status === 'cancelled') {
+      throw new Error(`Cannot cancel booking in terminal "${booking.status}" state`);
+    }
+
+    booking.status = 'cancelled';
+    booking.notes = reason ? `${booking.notes || ''} [Cancelled: ${reason}]`.trim() : booking.notes;
+    bookings[index] = booking;
+    persistLocal(bookings);
+
+    updateDoc(doc(db, BOOKINGS_COLLECTION, bookingId), {
+      status: 'cancelled',
+      notes: booking.notes,
+    }).catch(err => {
+      handleFirestoreError(err, OperationType.UPDATE, `${BOOKINGS_COLLECTION}/${bookingId}`);
+    });
+
+    const notifyRecipient = isCustomer ? booking.sellerId : booking.customerId;
+    notificationService.createNotification({
+      userId: notifyRecipient,
+      type: 'booking',
+      title: {
+        ar: `تم إلغاء الحجز #${booking.bookingCode}`,
+        en: `Booking #${booking.bookingCode} Cancelled`,
+        so: `Ballantii #${booking.bookingCode} waa la joojiyay`,
+      },
+      message: {
+        ar: `تم إلغاء حجز الخدمة: ${reason || 'بواسطة الطرف الآخر'}`,
+        en: `Service booking cancelled: ${reason || 'by the other party'}`,
+        so: `Ballantii adeegga waa la joojiyay: ${reason || 'dhanka kale'}`,
+      },
+      link: isCustomer ? `/seller/bookings` : `/account/bookings`,
+    }).catch(() => {});
+
+    return booking;
+  },
+
+  /**
+   * Reschedule booking with double-booking collision protection
+   */
+  rescheduleBooking(params: {
+    bookingId: string;
+    newDate: string;
+    newTime: string;
+    actorId: string;
+    actorRole: string;
+    reason?: string;
+  }): ServiceBooking {
+    const bookings = initBookings();
+    const index = bookings.findIndex(b => b.id === params.bookingId);
+    if (index === -1) throw new Error('Booking not found');
+
+    const booking = bookings[index];
+    const isAdmin = params.actorRole === 'ADMIN' || params.actorRole === 'SUPER_ADMIN';
+    const isCustomer = booking.customerId === params.actorId;
+    const isProvider = booking.sellerId === params.actorId;
+
+    if (!isAdmin && !isCustomer && !isProvider) {
+      throw new Error('Forbidden: You can only reschedule bookings associated with your account');
+    }
+
+    if (booking.status === 'completed' || booking.status === 'cancelled') {
+      throw new Error(`Cannot reschedule booking in terminal "${booking.status}" state`);
+    }
+
+    // Double-booking collision protection
+    const conflict = bookings.some(
+      b =>
+        b.id !== params.bookingId &&
+        b.sellerId === booking.sellerId &&
+        b.date === params.newDate &&
+        b.time === params.newTime &&
+        ['requested', 'accepted', 'confirmed', 'scheduled', 'in_progress'].includes(b.status)
+    );
+    if (conflict) {
+      throw new Error(`الموعد الجديد (${params.newDate} في ${params.newTime}) غير متاح ومحجوز مسبقاً.`);
+    }
+
+    booking.date = params.newDate;
+    booking.time = params.newTime;
+    booking.status = isCustomer ? 'requested' : 'scheduled';
+    booking.notes = params.reason ? `${booking.notes || ''} [Rescheduled: ${params.reason}]`.trim() : booking.notes;
+
+    bookings[index] = booking;
+    persistLocal(bookings);
+
+    updateDoc(doc(db, BOOKINGS_COLLECTION, params.bookingId), {
+      date: params.newDate,
+      time: params.newTime,
+      status: booking.status,
+      notes: booking.notes,
+    }).catch(err => {
+      handleFirestoreError(err, OperationType.UPDATE, `${BOOKINGS_COLLECTION}/${params.bookingId}`);
+    });
+
+    const notifyRecipient = isCustomer ? booking.sellerId : booking.customerId;
+    notificationService.createNotification({
+      userId: notifyRecipient,
+      type: 'booking',
+      title: {
+        ar: `تم إعادة جدولة الحجز #${booking.bookingCode}`,
+        en: `Booking #${booking.bookingCode} Rescheduled`,
+        so: `Waqtiga ballanta #${booking.bookingCode} waa la beddelay`,
+      },
+      message: {
+        ar: `تم تحديد موعد جديد: ${params.newDate} في ${params.newTime}`,
+        en: `New timeslot: ${params.newDate} at ${params.newTime}`,
+        so: `Waqti cusub: ${params.newDate} saacadda ${params.newTime}`,
+      },
+      link: isCustomer ? `/seller/bookings` : `/account/bookings`,
+    }).catch(() => {});
+
+    return booking;
+  },
+
+  /**
+   * Complete booking by provider or admin
+   */
+  completeBooking(
+    bookingId: string,
+    actorId: string,
+    actorRole: string
+  ): ServiceBooking {
+    return this.updateBookingStatus(bookingId, 'completed', actorId, actorRole);
+  },
 };

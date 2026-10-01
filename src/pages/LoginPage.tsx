@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { LogIn, UserPlus, Shield, CheckCircle2, AlertCircle, Eye, EyeOff, Store, Utensils, Wrench, User as UserIcon } from 'lucide-react';
+import { LogIn, UserPlus, Shield, CheckCircle2, AlertCircle, Eye, EyeOff, Store, Utensils, Wrench, User as UserIcon, Truck } from 'lucide-react';
 import { useAuth, DEMO_ACCOUNTS } from '../context/AuthContext';
 import { useLanguage } from '../i18n/LanguageContext';
 import { UserRole } from '../types';
@@ -84,6 +84,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({ onNavigate }) => {
     SELLER: <Store className="w-3.5 h-3.5 text-blue-500" />,
     RESTAURANT: <Utensils className="w-3.5 h-3.5 text-amber-500" />,
     SERVICE_PROVIDER: <Wrench className="w-3.5 h-3.5 text-emerald-500" />,
+    DRIVER: <Truck className="w-3.5 h-3.5 text-cyan-500" />,
     ADMIN: <Shield className="w-3.5 h-3.5 text-rose-500" />,
     SUPER_ADMIN: <Shield className="w-3.5 h-3.5 text-purple-500" />,
   };

@@ -21,6 +21,7 @@ import { StorePage } from './pages/StorePage';
 import { RestaurantPage } from './pages/RestaurantPage';
 import { ServiceProviderPage } from './pages/ServiceProviderPage';
 import { SellerDashboardPage } from './pages/SellerDashboardPage';
+import { DriverDashboardPage } from './pages/DriverDashboardPage';
 import { AdminDashboardPage } from './pages/AdminDashboardPage';
 import { StoresDirectoryPage } from './pages/StoresDirectoryPage';
 import { RestaurantsDirectoryPage } from './pages/RestaurantsDirectoryPage';
@@ -361,6 +362,11 @@ function AppContent() {
       return <OrdersPage onNavigate={navigate} orderIdFromRoute={orderIdParam} />;
     }
 
+    // 14.01 Customer Service Bookings: /bookings or /account/bookings
+    if (pathOnly === '/bookings' || pathOnly === '/account/bookings') {
+      return <OrdersPage onNavigate={navigate} initialTab="bookings" />;
+    }
+
     // 14.1 Notifications Center: /notifications
     if (pathOnly === '/notifications') {
       return <NotificationsPage onNavigate={navigate} />;
@@ -399,6 +405,11 @@ function AppContent() {
     // 16. Seller Dashboard & Sub-routes: /seller-dashboard or /seller/*
     if (pathOnly === '/seller-dashboard' || pathOnly === '/seller' || pathOnly.startsWith('/seller/')) {
       return <SellerDashboardPage onNavigate={navigate} />;
+    }
+
+    // 16.1 Driver Portal: /driver or /driver-dashboard
+    if (pathOnly === '/driver' || pathOnly === '/driver-dashboard') {
+      return <DriverDashboardPage onNavigate={navigate} />;
     }
 
     // 17. Admin Central Dashboard: /admin

@@ -36,10 +36,15 @@ export const ServiceProviderPage: React.FC<ServiceProviderPageProps> = ({ slug, 
   const [selectedService, setSelectedService] = useState<Product | null>(null);
   const [isBookingModalOpen, setIsBookingModalOpen] = useState(false);
   const [bookingSuccess, setBookingSuccess] = useState<ServiceBooking | null>(null);
+  const [bookingError, setBookingError] = useState<string | null>(null);
 
   // Booking Form State
-  const [bookingDate, setBookingDate] = useState<string>('2025-04-10');
-  const [bookingTime, setBookingTime] = useState<string>('10:00 AM');
+  const [bookingDate, setBookingDate] = useState<string>(() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    return d.toISOString().split('T')[0];
+  });
+  const [bookingTime, setBookingTime] = useState<string>('10:00');
   const [customerName, setCustomerName] = useState<string>(user?.name || '');
   const [customerPhone, setCustomerPhone] = useState<string>(user?.phone || '+252 61');
   const [locationType, setLocationType] = useState<'on_site' | 'remote'>('remote');
@@ -97,30 +102,36 @@ export const ServiceProviderPage: React.FC<ServiceProviderPageProps> = ({ slug, 
     if (service) setSelectedService(service);
     setIsBookingModalOpen(true);
     setBookingSuccess(null);
+    setBookingError(null);
   };
 
   const handleSubmitBooking = (e: React.FormEvent) => {
     e.preventDefault();
     if (!customerName || !customerPhone) return;
+    setBookingError(null);
 
-    const newBooking = bookingService.createBooking({
-      serviceId: selectedService?.id || 'service_general',
-      serviceTitle: selectedService?.title?.[language] || 'استشارة وخدمة فنية',
-      sellerId: provider.sellerId,
-      storeId: provider.id,
-      storeName: provider.name,
-      customerId: user?.id || `cust_${Date.now()}`,
-      customerName,
-      customerPhone,
-      customerEmail: user?.email,
-      date: bookingDate,
-      time: bookingTime,
-      location: locationType === 'remote' ? 'عن بُعد (Online / Remote)' : `${provider.city} - موقع العميل`,
-      notes: bookingNotes,
-      price: selectedService?.price || 0,
-    });
+    try {
+      const newBooking = bookingService.createBooking({
+        serviceId: selectedService?.id || 'service_general',
+        serviceTitle: selectedService?.title?.[language] || 'استشارة وخدمة فنية',
+        sellerId: provider.sellerId,
+        storeId: provider.id,
+        storeName: provider.name,
+        customerId: user?.id || `cust_${Date.now()}`,
+        customerName,
+        customerPhone,
+        customerEmail: user?.email,
+        date: bookingDate,
+        time: bookingTime,
+        location: locationType === 'remote' ? 'عن بُعد (Online / Remote)' : `${provider.city} - موقع العميل`,
+        notes: bookingNotes,
+        price: selectedService?.price || 0,
+      });
 
-    setBookingSuccess(newBooking);
+      setBookingSuccess(newBooking);
+    } catch (err: any) {
+      setBookingError(err.message || (language === 'ar' ? 'حدث خطأ أثناء حجز الموعد. يرجى تجربة موعد آخر.' : 'Booking conflict. Please choose another date or timeslot.'));
+    }
   };
 
   return (
@@ -291,15 +302,33 @@ export const ServiceProviderPage: React.FC<ServiceProviderPageProps> = ({ slug, 
                 <p className="text-xs text-gray-500 max-w-xs mx-auto mb-6">
                   سيقوم مقدم الخدمة بالتواصل معك هاتفياً أو عبر الواتساب لتأكيد الموعد والتفاصيل الفنية.
                 </p>
-                <button
-                  onClick={() => setIsBookingModalOpen(false)}
-                  className="bg-[#0E11B7] text-white px-6 py-2 rounded-xl text-xs font-bold"
-                >
-                  حسناً، تم
-                </button>
+                <div className="flex items-center justify-center gap-2">
+                  <button
+                    onClick={() => setIsBookingModalOpen(false)}
+                    className="border border-gray-300 dark:border-gray-700 text-gray-700 dark:text-gray-300 px-5 py-2 rounded-xl text-xs font-bold"
+                  >
+                    {language === 'ar' ? 'إغلاق' : 'Close'}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setIsBookingModalOpen(false);
+                      onNavigate('/bookings');
+                    }}
+                    className="bg-[#0E11B7] hover:bg-[#0c0ea3] text-white px-5 py-2 rounded-xl text-xs font-bold shadow"
+                  >
+                    {language === 'ar' ? 'عرض تفاصيل حجوزاتي' : 'View My Bookings'}
+                  </button>
+                </div>
               </div>
             ) : (
               <form onSubmit={handleSubmitBooking} className="space-y-4 mt-4 text-xs">
+                {bookingError && (
+                  <div className="p-3 bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 rounded-xl flex items-center gap-2">
+                    <span className="font-bold">⚠️</span>
+                    <span>{bookingError}</span>
+                  </div>
+                )}
+
                 <div>
                   <label className="block font-semibold text-gray-700 dark:text-gray-300 mb-1">الخدمة المختارة:</label>
                   <select
@@ -331,14 +360,21 @@ export const ServiceProviderPage: React.FC<ServiceProviderPageProps> = ({ slug, 
                   </div>
 
                   <div>
-                    <label className="block font-semibold text-gray-700 dark:text-gray-300 mb-1">الوقت المفضل:</label>
-                    <input
-                      type="text"
+                    <label className="block font-semibold text-gray-700 dark:text-gray-300 mb-1">الوقت المتاح:</label>
+                    <select
                       value={bookingTime}
                       onChange={e => setBookingTime(e.target.value)}
-                      placeholder="10:00 AM"
                       className="w-full bg-gray-50 dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-xl p-2.5 text-xs text-gray-900 dark:text-white"
-                    />
+                    >
+                      {['09:00', '10:00', '11:00', '12:00', '14:00', '15:00', '16:00', '17:00'].map(slot => {
+                        const isAvail = bookingService.isTimeslotAvailable(provider.sellerId, bookingDate, slot);
+                        return (
+                          <option key={slot} value={slot} disabled={!isAvail}>
+                            {slot} {isAvail ? '' : (language === 'ar' ? '(محجوز مسبقاً)' : '(Booked)')}
+                          </option>
+                        );
+                      })}
+                    </select>
                   </div>
                 </div>
 

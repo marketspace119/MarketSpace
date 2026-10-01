@@ -1,4 +1,4 @@
-import { doc, Transaction } from 'firebase/firestore';
+import { doc, Transaction, updateDoc } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { productService } from './productService';
 
@@ -145,5 +145,24 @@ export const inventoryService = {
     });
 
     return { previousStock: currentStock, newStock };
+  },
+
+  /**
+   * Updates inventory stock level and appends audit log entry
+   */
+  updateStock(
+    productId: string,
+    newStock: number,
+    options?: { reason?: string; actor?: string }
+  ) {
+    const product = productService.getProductById(productId);
+    if (!product) throw new Error(`Product "${productId}" not found`);
+    const safeStock = Math.max(0, Math.floor(newStock));
+    return productService.updateProduct(
+      productId,
+      { stock: safeStock },
+      options?.actor || product.sellerId,
+      'SELLER'
+    );
   },
 };

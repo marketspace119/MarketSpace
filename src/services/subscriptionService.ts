@@ -222,7 +222,13 @@ export const subscriptionService = {
 
   getSellerSubscription(sellerId: string): SellerSubscription | undefined {
     const subs = loadSubscriptions();
-    return subs.find(s => s.sellerId === sellerId && (s.status === 'ACTIVE' || s.status === 'TRIAL'));
+    const sub = subs.find(s => s.sellerId === sellerId && (s.status === 'ACTIVE' || s.status === 'TRIAL'));
+    if (!sub) return undefined;
+    if (sub.endDate && new Date(sub.endDate).getTime() < Date.now()) {
+      sub.status = 'EXPIRED';
+      return undefined;
+    }
+    return sub;
   },
 
   /**

@@ -3,6 +3,7 @@ import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { OrderDispute, DisputeReason, DisputeRequestedAction, UserRole } from '../types';
 import { notificationService } from './notificationService';
 import { auditLogService } from './auditLogService';
+import { orderService } from './orderService';
 
 const DISPUTES_STORAGE_KEY = 'marketspace_disputes_v1';
 const DISPUTES_COLLECTION = 'disputes';
@@ -246,6 +247,14 @@ export const disputeService = {
 
     disputes[idx] = updated;
     persistLocal(disputes);
+
+    if (params.actionTaken === 'REFUND_APPROVED') {
+      try {
+        orderService.updateOrderRefundStatus(dispute.orderId, 'approved', params.refundAmount);
+      } catch (e) {
+        console.warn('Dispute refund sync notice:', e);
+      }
+    }
 
     updateDoc(doc(db, DISPUTES_COLLECTION, params.disputeId), {
       status: updated.status,

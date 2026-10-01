@@ -2,6 +2,7 @@ import { initializeApp } from 'firebase/app';
 import { getAuth, connectAuthEmulator } from 'firebase/auth';
 import { getFirestore, connectFirestoreEmulator, doc, getDocFromServer } from 'firebase/firestore';
 import { getStorage, connectStorageEmulator } from 'firebase/storage';
+import { defaultFirebaseConfig } from './firebaseConfigFallback';
 import firebaseConfig from '../../firebase-applet-config.json';
 
 // P0-01 Remediation: Prioritize real environment variables to guarantee browser and backend connect to the exact same Firebase project
@@ -9,14 +10,16 @@ const env: Record<string, any> = typeof import.meta !== 'undefined' && (import.m
   ? (import.meta as any).env
   : (typeof process !== 'undefined' ? process.env : {});
 
+const appletConfig = (typeof firebaseConfig !== 'undefined' && firebaseConfig) ? firebaseConfig : defaultFirebaseConfig;
+
 const resolvedConfig = {
-  apiKey: env.VITE_FIREBASE_API_KEY || (firebaseConfig as any)?.apiKey,
-  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || (firebaseConfig as any)?.authDomain,
-  projectId: env.VITE_FIREBASE_PROJECT_ID || (firebaseConfig as any)?.projectId,
-  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || (firebaseConfig as any)?.storageBucket,
-  messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || (firebaseConfig as any)?.messagingSenderId,
-  appId: env.VITE_FIREBASE_APP_ID || (firebaseConfig as any)?.appId,
-  firestoreDatabaseId: env.VITE_FIREBASE_DATABASE_ID || (firebaseConfig as any)?.firestoreDatabaseId || '(default)',
+  apiKey: env.VITE_FIREBASE_API_KEY || (appletConfig as any)?.apiKey || defaultFirebaseConfig.apiKey,
+  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || (appletConfig as any)?.authDomain || defaultFirebaseConfig.authDomain,
+  projectId: env.VITE_FIREBASE_PROJECT_ID || (appletConfig as any)?.projectId || defaultFirebaseConfig.projectId,
+  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || (appletConfig as any)?.storageBucket || defaultFirebaseConfig.storageBucket,
+  messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || (appletConfig as any)?.messagingSenderId || defaultFirebaseConfig.messagingSenderId,
+  appId: env.VITE_FIREBASE_APP_ID || (appletConfig as any)?.appId || defaultFirebaseConfig.appId,
+  firestoreDatabaseId: env.VITE_FIREBASE_DATABASE_ID || (appletConfig as any)?.firestoreDatabaseId || defaultFirebaseConfig.firestoreDatabaseId,
 };
 
 // Fail-closed invariant in production: prohibit demo configuration in production environments
