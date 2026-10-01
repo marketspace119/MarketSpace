@@ -15,6 +15,8 @@
     "test:security": "tsx tests/security_financial_audit.ts",
     "test:adversarial": "firebase emulators:exec --only firestore,storage \"tsx tests/security_adversarial_suite.ts\"",
     "test:incremental": "firebase emulators:exec --only firestore,storage \"tsx tests/incremental_security_regression_suite.ts\"",
+    "test:rules": "firebase emulators:exec --only firestore,storage \"tsx tests/live_production_validation_suite.ts\"",
+    "test:image": "firebase emulators:exec --only firestore \"tsx tests/image_security_suite.ts\"",
     "test:ai": "tsx tests/ai_security_suite.ts",
     "test:gap": "tsx tests/gap_closure_suite.ts"
   },
@@ -47,6 +49,8 @@
     "vite": "^6.2.3"
   },
   "overrides": {
+    "@grpc/grpc-js": "^1.14.0",
+    "@opentelemetry/core": "^2.8.0",
     "qs": "^6.16.0",
     "uuid": "^11.1.1"
   }

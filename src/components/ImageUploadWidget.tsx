@@ -40,7 +40,7 @@ export const ImageUploadWidget: React.FC<ImageUploadWidgetProps> = ({
 
   const processUpload = async (file: File) => {
     setError(null);
-    const validation = imageUploadService.validateFile(file);
+    const validation = await imageUploadService.validateFile(file);
     if (!validation.isValid) {
       setError(validation.error || 'الملف غير صالح');
       return;

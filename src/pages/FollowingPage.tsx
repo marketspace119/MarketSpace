@@ -34,8 +34,11 @@ export const FollowingPage: React.FC<FollowingPageProps> = ({ onNavigate }) => {
   const [loading, setLoading] = useState(true);
 
   // Load followed stores
-  const loadData = () => {
+  const loadData = async () => {
     setLoading(true);
+    if (userId && userId !== 'guest_user') {
+      await storeService.syncUserFollows(userId);
+    }
     const followed = storeService.getFollowedStores(userId);
     setFollowedStores(followed);
 

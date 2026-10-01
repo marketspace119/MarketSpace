@@ -1785,7 +1785,7 @@ async function runDeterministicAuditSuite() {
       size: 1024,
     } as any;
 
-    const validation = imageUploadService.validateFile(invalidFile);
+    const validation = await imageUploadService.validateFile(invalidFile);
     assert(!validation.isValid, 'Invalid MIME type must be rejected');
     assert(validation.error?.includes('Only JPG, PNG, WEBP, and GIF'), 'Must return MIME type error message');
 
@@ -1795,7 +1795,7 @@ async function runDeterministicAuditSuite() {
       type: 'image/png',
       size: 10 * 1024 * 1024, // 10MB
     } as any;
-    const sizeValidation = imageUploadService.validateFile(oversizedFile);
+    const sizeValidation = await imageUploadService.validateFile(oversizedFile);
     assert(!sizeValidation.isValid, 'Oversized file (>5MB) must be rejected');
     assert(sizeValidation.error?.includes('5MB'), 'Must return 5MB size limit error');
 

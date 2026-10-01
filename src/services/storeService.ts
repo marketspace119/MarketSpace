@@ -1,4 +1,4 @@
-import { doc, getDocs, collection, setDoc, updateDoc } from 'firebase/firestore';
+import { doc, getDoc, getDocs, collection, setDoc, updateDoc } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { Store, SellerStatus, UserRole } from '../types';
 import { seedStores } from '../data/seedStores';
@@ -241,6 +241,17 @@ export const storeService = {
       follows[userId] = newFollows;
       localStorage.setItem(FOLLOWS_STORAGE_KEY, JSON.stringify(follows));
 
+      // Authoritative Cloud Firestore persistence for logged-in accounts
+      if (userId && userId !== 'guest_user') {
+        setDoc(doc(db, 'userFollows', userId), {
+          userId,
+          storeIds: newFollows,
+          updatedAt: new Date().toISOString(),
+        }).catch(err => {
+          console.warn('[storeService] Failed to persist userFollows to Firestore:', err.message);
+        });
+      }
+
       // Update store count
       const stores = initStores();
       const sIdx = stores.findIndex(s => s.id === storeId);
@@ -292,6 +303,27 @@ export const storeService = {
     } catch {
       return [];
     }
+  },
+
+  async syncUserFollows(userId: string): Promise<string[]> {
+    if (!userId || userId === 'guest_user') return [];
+    try {
+      const snap = await getDoc(doc(db, 'userFollows', userId));
+      if (snap.exists()) {
+        const data = snap.data();
+        const serverFollows = Array.isArray(data?.storeIds) ? data.storeIds : [];
+        if (typeof window !== 'undefined') {
+          const raw = localStorage.getItem(FOLLOWS_STORAGE_KEY);
+          const follows: Record<string, string[]> = raw ? JSON.parse(raw) : {};
+          follows[userId] = serverFollows;
+          localStorage.setItem(FOLLOWS_STORAGE_KEY, JSON.stringify(follows));
+        }
+        return serverFollows;
+      }
+    } catch (e: any) {
+      console.warn('[storeService] syncUserFollows error:', e.message);
+    }
+    return [];
   },
 
   updateStoreRating(storeId: string, rating: number, reviewsCount: number): void {

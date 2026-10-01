@@ -771,5 +771,27 @@ service cloud.firestore {
       allow create: if false;
       allow update, delete: if isSuperAdmin();
     }
+
+    // 29. Authoritative User Favorites Collection (Cross-device, persisted, user-isolated)
+    match /userFavorites/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+      allow create, update: if isActiveUser() && request.auth.uid == userId &&
+        incoming().userId == userId &&
+        incoming().productIds is list &&
+        incoming().productIds.size() <= 500;
+      allow delete: if isActiveUser() && (request.auth.uid == userId || isAdmin());
+    }
+
+    // 30. Authoritative User Followed Stores Collection (Cross-device, persisted, user-isolated)
+    match /userFollows/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+      allow create, update: if isActiveUser() && request.auth.uid == userId &&
+        incoming().userId == userId &&
+        incoming().storeIds is list &&
+        incoming().storeIds.size() <= 500;
+      allow delete: if isActiveUser() && (request.auth.uid == userId || isAdmin());
+    }
   }
 }

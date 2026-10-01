@@ -72,6 +72,12 @@ export const SearchPage: React.FC<SearchPageProps> = ({
 
   const [filters, setFilters] = useState<SearchFilters>(parseUrlParams);
   const [isMobileFilterOpen, setIsMobileFilterOpen] = useState(false);
+  const [visibleCount, setVisibleCount] = useState(24);
+
+  // Reset pagination when query or filters change
+  useEffect(() => {
+    setVisibleCount(24);
+  }, [filters]);
 
   // Sync state back to URL query parameters when filters change
   useEffect(() => {
@@ -789,15 +795,28 @@ export const SearchPage: React.FC<SearchPageProps> = ({
             /* DEDICATED DOMAIN RESULTS VIEW */
             <div>
               {filters.domain === 'products' && (
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3.5 sm:gap-4">
-                  {searchResults.products.map(p => (
-                    <ProductCard
-                      key={p.id}
-                      product={p}
-                      onQuickView={onQuickView}
-                      onNavigate={slug => onNavigate(`/product/${slug}`)}
-                    />
-                  ))}
+                <div className="space-y-6">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-3.5 sm:gap-4">
+                    {searchResults.products.slice(0, visibleCount).map(p => (
+                      <ProductCard
+                        key={p.id}
+                        product={p}
+                        onQuickView={onQuickView}
+                        onNavigate={slug => onNavigate(`/product/${slug}`)}
+                      />
+                    ))}
+                  </div>
+                  {searchResults.products.length > visibleCount && (
+                    <div className="text-center pt-4">
+                      <button
+                        type="button"
+                        onClick={() => setVisibleCount(prev => prev + 24)}
+                        className="px-6 py-2.5 rounded-2xl bg-[#0E11B7] hover:bg-[#070A86] text-white text-xs font-bold transition shadow-xs"
+                      >
+                        {language === 'ar' ? `عرض المزيد (${searchResults.products.length - visibleCount} متبقي)` : `Load More (${searchResults.products.length - visibleCount} remaining)`}
+                      </button>
+                    </div>
+                  )}
                 </div>
               )}
 

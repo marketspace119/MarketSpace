@@ -5,8 +5,8 @@ import { getStorage, connectStorageEmulator } from 'firebase/storage';
 import { defaultFirebaseConfig } from './firebaseConfigFallback';
 
 // Optional static config via glob (does not fail build if file is absent)
-const configModules = typeof import.meta !== 'undefined' && import.meta.glob
-  ? import.meta.glob('/firebase-applet-config.json', { eager: true })
+const configModules = typeof import.meta !== 'undefined' && (import.meta as any).glob
+  ? (import.meta as any).glob('/firebase-applet-config.json', { eager: true })
   : {};
 const firebaseConfig = (configModules['/firebase-applet-config.json'] as any)?.default || null;
 

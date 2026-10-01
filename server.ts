@@ -8,6 +8,7 @@ import { processSubscriptionReviewGateway } from './server/subscriptionGateway';
 import { processRefundGateway } from './server/refundGateway';
 import { processPaymentReferenceSubmissionGateway, processPaymentReviewGateway } from './server/paymentGateway';
 import { processUserRoleUpdateGateway, processUserStatusUpdateGateway } from './server/userGateway';
+import { processImageVerificationGateway } from './server/imageGateway';
 import { createRateLimiter } from './server/rateLimiter';
 import { getAdminDb, requireAuthenticatedCaller, requireVerifiedPlatformAdmin, verifyFirebaseBearerToken } from './server/firebaseAdmin';
 import {
@@ -29,7 +30,6 @@ async function startServer() {
   // F-43 & P2-SEC-01: Comprehensive HTTP Security Headers & Content Security Policy
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('X-XSS-Protection', '0');
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
@@ -39,12 +39,14 @@ async function startServer() {
       : "'self' 'unsafe-inline' 'unsafe-eval' https://apis.google.com";
     res.setHeader(
       'Content-Security-Policy',
-      `default-src 'self'; script-src ${scriptSrc}; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self' https: wss:; frame-ancestors 'self' https://*.google.com;`
+      `default-src 'self'; script-src ${scriptSrc}; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self' https: wss:; frame-ancestors 'self' https://*.google.com https://*.run.app;`
     );
     next();
   });
 
-  // Protect against huge payload attacks
+  // Allow up to 6MB for image endpoints, protect others with 100kb
+  app.use('/api/images', express.json({ limit: '6mb' }));
+  app.use('/api/upload', express.json({ limit: '6mb' }));
   app.use(express.json({ limit: '100kb' }));
 
   // CSRF / Origin Verification Middleware for Mutating Endpoints
@@ -318,6 +320,25 @@ async function startServer() {
       return res.status(statusCode).json({
         success: false,
         error: err.message || 'Failed to update user status',
+      });
+    }
+  });
+
+  // 9c. Authoritative Binary Image Verification Gateway (Deep Magic-Byte Inspection)
+  app.post('/api/images/verify', async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processImageVerificationGateway(payload, authHeader);
+      return res.status(200).json({ success: true, ...result });
+    } catch (err: any) {
+      console.error('[API /api/images/verify] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = err.statusCode || (isForbidden ? 403 : isAuth ? 401 : 400);
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Image verification failed',
       });
     }
   });

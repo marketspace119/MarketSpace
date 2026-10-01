@@ -48,19 +48,35 @@ jobs:
       - name: Run AI Security & RBAC Policy Suite
         run: npx tsx tests/ai_security_suite.ts
 
+      - name: Run Security Financial Audit Suite
+        run: npx tsx tests/security_financial_audit.ts
+
+      - name: Run E2E Forensic Invariant Test Suite
+        run: npx tsx tests/e2e_forensic_invariant_suite.ts
+
+      - name: Run Marketplace All Features Lifecycle Journeys Suite
+        run: npx tsx tests/marketplace_all_features_verification_suite.ts
+
+      - name: Run Marketplace Product Completeness Suite
+        run: npx tsx tests/marketplace_completeness_suite.ts
+
       - name: Run Firebase Emulator Rules & Storage Integration Tests
         run: npm run test:integration
-        env:
-          NODE_ENV: test
-          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8085
-          FIREBASE_STORAGE_EMULATOR_HOST: 127.0.0.1:9199
 
       - name: Run Adversarial Security Negative Test Suite
         run: npm run test:adversarial
-        env:
-          NODE_ENV: test
-          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8085
-          FIREBASE_STORAGE_EMULATOR_HOST: 127.0.0.1:9199
+
+      - name: Run Live Production Validation & Rules Suite
+        run: npm run test:rules
+
+      - name: Run Incremental Security Regression Suite
+        run: npm run test:incremental
+
+      - name: Run Image Content Security Suite
+        run: npm run test:image
+
+      - name: Run V3 Forensic Audit & Regression Suite
+        run: npm run test:v3
 
       - name: Security Sign-Off Verification
         run: echo "CI Release Gate PASSED with 0 Critical, 0 High vulnerabilities."
