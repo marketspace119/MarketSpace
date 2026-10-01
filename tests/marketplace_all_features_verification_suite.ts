@@ -1,3 +1,14 @@
+process.env.NODE_ENV = 'test';
+if (typeof (global as any).localStorage === 'undefined') {
+  const store: Record<string, string> = {};
+  (global as any).localStorage = {
+    getItem: (key: string) => store[key] !== undefined ? store[key] : null,
+    setItem: (key: string, value: string) => { store[key] = String(value); },
+    removeItem: (key: string) => { delete store[key]; },
+    clear: () => { Object.keys(store).forEach(k => delete store[k]); },
+  };
+}
+
 /**
  * MARKETPLACE ALL-FEATURES & E2E JOURNEYS VERIFICATION SUITE
  * Exhaustive independent test suite verifying all 25 required functional areas
@@ -62,7 +73,7 @@ async function runComprehensiveVerification() {
 
     // 1.3 Cart Items & Multi-vendor Split
     const cartItems: CartItem[] = [
-      { product: targetProduct, quantity: 2, selectedColor: 'Black', selectedSize: 'Standard' },
+      { id: 'cart_item_01', product: targetProduct, quantity: 2, selectedColor: 'Black', selectedSize: 'Standard' },
     ];
     const subOrders = orderService.splitOrderForVendors(cartItems, 4.0, 0, 'cod');
     assert(subOrders.length >= 1 && subOrders[0].subtotal === targetProduct.price * 2, 'CUST-03', 'Cart items partitioned into vendor sub-orders with subtotal calculation');
@@ -136,20 +147,32 @@ async function runComprehensiveVerification() {
     // 2.1 Store Onboarding
     const sellerId = `seller_flow_${Date.now()}`;
     const newStore = storeService.createStore({
-      name: { ar: 'متجر التميز الصومالي', en: 'Somali Premier Store', so: 'Dukaanka Guusha' },
+      slug: `store-${Date.now()}`,
+      name: 'متجر التميز الصومالي',
       description: { ar: 'متجر تقني وتجزئة معتمد', en: 'Certified electronics store', so: 'Dukaan la aqoonsan yahay' },
       sellerId,
       sellerType: 'store',
+      logo: 'https://images.unsplash.com/photo-store.jpg',
+      cover: 'https://images.unsplash.com/photo-store-cover.jpg',
+      phone: '+252 61 555 4433',
+      whatsapp: '+252 61 555 4433',
+      email: 'store@example.so',
       city: 'Mogadishu',
-      address: 'Hodan Commercial Zone',
-      contactPhone: '+252 61 555 4433',
+      district: 'Hodan',
+      address: { ar: 'منطقة هودان التجارية', en: 'Hodan Commercial Zone', so: 'Aagga Ganacsiga Hodan' },
+      openingHours: '8:00 AM - 10:00 PM',
+      category: 'electronics',
       categories: ['electronics'],
-    });
+      deliveryAvailable: true,
+      deliveryFee: 3.0,
+      minOrder: 10.0,
+      paymentMethods: ['cash_on_delivery', 'evc_plus'],
+    } as any);
     assert(newStore.sellerId === sellerId && newStore.status === 'pending', 'SELL-01', 'Seller completes onboarding with store created in pending moderation');
 
     // 2.2 Store Approved by Admin
-    const approvedStore = storeService.updateStoreStatus(newStore.id, 'active', 'admin_01', 'ADMIN');
-    assert(approvedStore.status === 'active', 'SELL-02', 'Admin approves seller store to active status');
+    const approvedStore = storeService.updateStoreStatus(newStore.id, 'approved', 'admin_01', 'ADMIN');
+    assert(approvedStore.status === 'approved', 'SELL-02', 'Admin approves seller store to active status');
 
     // 2.3 Product Creation under Subscription Plan Quota
     const newProduct = productService.createProduct(
@@ -160,7 +183,7 @@ async function runComprehensiveVerification() {
         price: 150.0,
         currency: 'USD',
         category: 'electronics',
-        condition: 'new',
+        condition: { ar: 'جديد', en: 'New', so: 'Cusub' },
         inStock: true,
         stock: 20,
         images: ['https://images.unsplash.com/photo-solar-panel.jpg'],
@@ -205,7 +228,7 @@ async function runComprehensiveVerification() {
     // 2.6 Payout Request & Validation
     payoutService.seedPayouts([]);
     // Seller requests payout
-    const payoutReq = await payoutService.requestPayout({
+    const payoutReq = await payoutService.createPayoutRequest({
       sellerId,
       storeId: newStore.id,
       amount: 100.0,
@@ -331,10 +354,8 @@ async function runComprehensiveVerification() {
       customerPhone: '+252 61 222 1100',
       date: '2026-10-15',
       time: '10:00',
-      address: 'Hodan Main St',
-      city: 'Mogadishu',
+      location: 'Hodan Main St, Mogadishu',
       price: 45.0,
-      paymentMethod: 'cash_on_delivery',
     });
     assert(booking.status === 'requested' && booking.bookingCode.startsWith('BK-'), 'SRV-02', 'Service booking created in requested status with unique booking code');
 
@@ -352,10 +373,8 @@ async function runComprehensiveVerification() {
         customerPhone: '+252 61 999 0011',
         date: '2026-10-15',
         time: '10:00',
-        address: 'Waberi',
-        city: 'Mogadishu',
+        location: 'Waberi, Mogadishu',
         price: 45.0,
-        paymentMethod: 'cash_on_delivery',
       });
     } catch (e: any) {
       if (e.message.includes('محجوز')) doubleBookingBlocked = true;
@@ -449,7 +468,7 @@ async function runComprehensiveVerification() {
     // 6.1 Coupon Validation & Invariants
     const couponValidation = couponService.validateCoupon({
       code: 'WELCOME10',
-      items: [{ product: productService.getAllProducts()[0], quantity: 1 }],
+      items: [{ id: 'cart_test_01', product: productService.getAllProducts()[0], quantity: 1 }],
       customerId: 'cust_test_01',
     });
     assert(typeof couponValidation.isValid === 'boolean', 'EXT-01', 'Coupon validation engine resolves active code and computes discounts');

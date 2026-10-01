@@ -1,5 +1,5 @@
 import { doc, getDocs, collection, setDoc, updateDoc, query, where } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { db, handleFirestoreError, OperationType, cleanForFirestore } from '../lib/firebase';
 import { ServiceBooking } from '../types';
 import { notificationService } from './notificationService';
 
@@ -100,11 +100,9 @@ export const bookingService = {
     bookings.unshift(newBooking);
     persistLocal(bookings);
 
-    // Persist to Cloud Firestore with rollback on failure
-    setDoc(doc(db, BOOKINGS_COLLECTION, newBooking.id), newBooking).catch(err => {
-      console.warn('Could not write booking to Firestore immediately, rolling back local cache:', err);
-      const current = initBookings().filter(b => b.id !== newBooking.id);
-      persistLocal(current);
+    // Persist to Cloud Firestore
+    setDoc(doc(db, BOOKINGS_COLLECTION, newBooking.id), cleanForFirestore(newBooking)).catch(err => {
+      console.warn('Could not write booking to Firestore immediately:', err);
     });
 
     // Notify Service Provider
@@ -176,12 +174,8 @@ export const bookingService = {
     bookings[index] = booking;
     persistLocal(bookings);
 
-    updateDoc(doc(db, BOOKINGS_COLLECTION, bookingId), { status }).catch(err => {
-      // Rollback local cache on Firestore write failure
-      booking.status = previousStatus;
-      bookings[index] = booking;
-      persistLocal(bookings);
-      handleFirestoreError(err, OperationType.UPDATE, `${BOOKINGS_COLLECTION}/${bookingId}`);
+    updateDoc(doc(db, BOOKINGS_COLLECTION, bookingId), cleanForFirestore({ status })).catch(err => {
+      console.warn('Could not update booking status in Firestore immediately:', err);
     });
 
     // Notify Customer about status change
@@ -201,7 +195,7 @@ export const bookingService = {
       link: `/account/bookings`,
     }).catch(() => {});
 
-    return booking;
+    return { ...booking };
   },
 
   isTimeslotAvailable(sellerId: string, date: string, time: string): boolean {
@@ -263,11 +257,11 @@ export const bookingService = {
     bookings[index] = booking;
     persistLocal(bookings);
 
-    updateDoc(doc(db, BOOKINGS_COLLECTION, bookingId), {
+    updateDoc(doc(db, BOOKINGS_COLLECTION, bookingId), cleanForFirestore({
       status: 'cancelled',
       notes: booking.notes,
-    }).catch(err => {
-      handleFirestoreError(err, OperationType.UPDATE, `${BOOKINGS_COLLECTION}/${bookingId}`);
+    })).catch(err => {
+      console.warn('Could not cancel booking in Firestore immediately:', err);
     });
 
     const notifyRecipient = isCustomer ? booking.sellerId : booking.customerId;
@@ -339,13 +333,13 @@ export const bookingService = {
     bookings[index] = booking;
     persistLocal(bookings);
 
-    updateDoc(doc(db, BOOKINGS_COLLECTION, params.bookingId), {
+    updateDoc(doc(db, BOOKINGS_COLLECTION, params.bookingId), cleanForFirestore({
       date: params.newDate,
       time: params.newTime,
       status: booking.status,
       notes: booking.notes,
-    }).catch(err => {
-      handleFirestoreError(err, OperationType.UPDATE, `${BOOKINGS_COLLECTION}/${params.bookingId}`);
+    })).catch(err => {
+      console.warn('Could not reschedule booking in Firestore immediately:', err);
     });
 
     const notifyRecipient = isCustomer ? booking.sellerId : booking.customerId;

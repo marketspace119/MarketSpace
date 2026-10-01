@@ -9,7 +9,7 @@ import {
   onSnapshot,
   writeBatch,
 } from 'firebase/firestore';
-import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
+import { db, auth, handleFirestoreError, OperationType, cleanForFirestore } from '../lib/firebase';
 import { NotificationItem, NotificationEventType, LocalizedString } from '../types';
 
 const NOTIFICATIONS_STORAGE_KEY = 'marketspace_notifications_v1';
@@ -195,11 +195,10 @@ export const notificationService = {
     list.unshift(newNotif);
     persistStorage(list);
 
-    try {
-      await setDoc(doc(db, NOTIFICATIONS_COLLECTION, id), newNotif);
-    } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, `${NOTIFICATIONS_COLLECTION}/${id}`);
-    }
+    // Persist to Cloud Firestore
+    setDoc(doc(db, NOTIFICATIONS_COLLECTION, id), cleanForFirestore(newNotif)).catch(err => {
+      console.warn('Could not write notification to Firestore immediately:', err);
+    });
     return newNotif;
   },
 

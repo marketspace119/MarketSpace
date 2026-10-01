@@ -165,7 +165,8 @@ export const refundService = {
     }
 
     const idToken = await currentUser.getIdToken();
-    const res = await fetch('/api/refunds/create', {
+    const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || '');
+    const res = await fetch(`${baseUrl}/api/refunds/create`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

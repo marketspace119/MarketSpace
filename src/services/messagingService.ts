@@ -8,7 +8,7 @@ import {
   where,
   onSnapshot,
 } from 'firebase/firestore';
-import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
+import { db, auth, handleFirestoreError, OperationType, cleanForFirestore } from '../lib/firebase';
 import { Conversation, ChatMessage, UserRole } from '../types';
 import { notificationService } from './notificationService';
 
@@ -259,11 +259,10 @@ export const messagingService = {
     list.unshift(newConv);
     persistConversations(list);
 
-    try {
-      await setDoc(doc(db, CONVERSATIONS_COLLECTION, id), newConv);
-    } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, `${CONVERSATIONS_COLLECTION}/${id}`);
-    }
+    // Persist to Cloud Firestore
+    setDoc(doc(db, CONVERSATIONS_COLLECTION, id), cleanForFirestore(newConv)).catch(err => {
+      console.warn('Could not write conversation to Firestore immediately:', err);
+    });
 
     return newConv;
   },
@@ -332,18 +331,18 @@ export const messagingService = {
     persistMessages(params.conversationId, localMsgs);
 
     // Write message & update conversation in Firestore
-    try {
-      await setDoc(doc(db, MESSAGES_COLLECTION, msgId), newMsg);
-      await updateDoc(doc(db, CONVERSATIONS_COLLECTION, params.conversationId), {
-        lastMessage: text,
-        lastMessageAt: now,
-        lastSenderId: params.senderId,
-        unreadCount,
-        updatedAt: now,
-      });
-    } catch (err) {
+    setDoc(doc(db, MESSAGES_COLLECTION, msgId), cleanForFirestore(newMsg)).catch(err => {
       console.warn('Firestore message save error:', err);
-    }
+    });
+    updateDoc(doc(db, CONVERSATIONS_COLLECTION, params.conversationId), cleanForFirestore({
+      lastMessage: text,
+      lastMessageAt: now,
+      lastSenderId: params.senderId,
+      unreadCount,
+      updatedAt: now,
+    })).catch(err => {
+      console.warn('Firestore conversation update error:', err);
+    });
 
     // Trigger Notification for recipients
     recipientIds.forEach(rId => {

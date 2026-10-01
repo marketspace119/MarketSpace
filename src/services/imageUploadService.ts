@@ -1,5 +1,6 @@
 import { ref, uploadBytesResumable, getDownloadURL, deleteObject } from 'firebase/storage';
 import { storage } from '../lib/firebase';
+import { sniffImageMagicBytes, inspectFileContent } from '../lib/imageSecurity';
 
 const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
 const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024; // 5MB
@@ -10,9 +11,9 @@ export interface UploadProgressCallback {
 
 export const imageUploadService = {
   /**
-   * Validates file MIME type and size boundaries
+   * Validates file MIME type, size boundaries, and binary magic bytes
    */
-  validateFile(file: File): { isValid: boolean; error?: string } {
+  async validateFile(file: File): Promise<{ isValid: boolean; error?: string }> {
     if (!ALLOWED_MIME_TYPES.includes(file.type)) {
       return {
         isValid: false,
@@ -27,7 +28,27 @@ export const imageUploadService = {
       };
     }
 
+    // Binary content inspection (Magic-Byte verification)
+    const inspection = await inspectFileContent(file);
+    if (!inspection.isValid) {
+      return {
+        isValid: false,
+        error: inspection.error || 'Invalid or malformed image binary structure.',
+      };
+    }
+
     return { isValid: true };
+  },
+
+  /**
+   * Synchronous validation for buffer or when binary array is provided directly
+   */
+  validateBuffer(buffer: Uint8Array | ArrayBuffer): { isValid: boolean; error?: string } {
+    const inspection = sniffImageMagicBytes(buffer);
+    return {
+      isValid: inspection.isValid,
+      error: inspection.error,
+    };
   },
 
   /**
@@ -39,7 +60,7 @@ export const imageUploadService = {
     subfolder = 'products',
     onProgress?: UploadProgressCallback
   ): Promise<{ downloadUrl: string; storagePath: string }> {
-    const validation = this.validateFile(file);
+    const validation = await this.validateFile(file);
     if (!validation.isValid) {
       throw new Error(validation.error || 'Invalid image file');
     }

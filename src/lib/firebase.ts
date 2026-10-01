@@ -3,7 +3,12 @@ import { getAuth, connectAuthEmulator } from 'firebase/auth';
 import { getFirestore, connectFirestoreEmulator, doc, getDocFromServer } from 'firebase/firestore';
 import { getStorage, connectStorageEmulator } from 'firebase/storage';
 import { defaultFirebaseConfig } from './firebaseConfigFallback';
-import firebaseConfig from '../../firebase-applet-config.json';
+
+// Optional static config via glob (does not fail build if file is absent)
+const configModules = typeof import.meta !== 'undefined' && import.meta.glob
+  ? import.meta.glob('/firebase-applet-config.json', { eager: true })
+  : {};
+const firebaseConfig = (configModules['/firebase-applet-config.json'] as any)?.default || null;
 
 // P0-01 Remediation: Prioritize real environment variables to guarantee browser and backend connect to the exact same Firebase project
 const env: Record<string, any> = typeof import.meta !== 'undefined' && (import.meta as any).env

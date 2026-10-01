@@ -1,5 +1,5 @@
 import { doc, getDocs, collection, setDoc, updateDoc } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { db, handleFirestoreError, OperationType, cleanForFirestore } from '../lib/firebase';
 import { OrderDispute, DisputeReason, DisputeRequestedAction, UserRole } from '../types';
 import { notificationService } from './notificationService';
 import { auditLogService } from './auditLogService';
@@ -130,7 +130,7 @@ export const disputeService = {
     persistLocal(disputes);
 
     // Persist to Cloud Firestore
-    setDoc(doc(db, DISPUTES_COLLECTION, newDispute.id), newDispute).catch(err => {
+    setDoc(doc(db, DISPUTES_COLLECTION, newDispute.id), cleanForFirestore(newDispute)).catch(err => {
       console.warn('Could not write dispute to Firestore immediately:', err);
     });
 
@@ -184,12 +184,12 @@ export const disputeService = {
     disputes[idx] = updated;
     persistLocal(disputes);
 
-    updateDoc(doc(db, DISPUTES_COLLECTION, params.disputeId), {
+    updateDoc(doc(db, DISPUTES_COLLECTION, params.disputeId), cleanForFirestore({
       status: updated.status,
       sellerResponse: updated.sellerResponse,
       updatedAt: now,
-    }).catch(err => {
-      handleFirestoreError(err, OperationType.UPDATE, `${DISPUTES_COLLECTION}/${params.disputeId}`);
+    })).catch(err => {
+      console.warn('Could not update dispute in Firestore immediately:', err);
     });
 
     // Notify Customer
@@ -256,12 +256,12 @@ export const disputeService = {
       }
     }
 
-    updateDoc(doc(db, DISPUTES_COLLECTION, params.disputeId), {
+    updateDoc(doc(db, DISPUTES_COLLECTION, params.disputeId), cleanForFirestore({
       status: updated.status,
       adminResolution: updated.adminResolution,
       updatedAt: now,
-    }).catch(err => {
-      handleFirestoreError(err, OperationType.UPDATE, `${DISPUTES_COLLECTION}/${params.disputeId}`);
+    })).catch(err => {
+      console.warn('Could not update dispute resolution in Firestore immediately:', err);
     });
 
     auditLogService.logAction({
