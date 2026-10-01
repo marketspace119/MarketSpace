@@ -25,6 +25,7 @@ import { ProductCard } from '../components/common/ProductCard';
 import { updatePageSEO } from '../services/seo';
 import { discoveryService } from '../services/discoveryService';
 import { reviewService } from '../services/reviewService';
+import { orderService } from '../services/orderService';
 import { useAuth } from '../context/AuthContext';
 import { Review } from '../types';
 
@@ -160,7 +161,7 @@ export const ProductDetailPage: React.FC<ProductDetailPageProps> = ({
     );
   };
 
-  const handleReviewSubmit = (e: React.FormEvent) => {
+  const handleReviewSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user) {
       onNavigate('/login');
@@ -174,16 +175,28 @@ export const ProductDetailPage: React.FC<ProductDetailPageProps> = ({
       return;
     }
 
+    const orderId = orderService.getUserOrderForTarget(user.id, product.id);
+    if (!orderId) {
+      setReviewMessage({
+        text: language === 'ar'
+          ? 'يجب إتمام شراء هذا المنتج أولاً لتتمكن من كتابة تقييم موثق.'
+          : 'You must purchase this product first to submit a verified review.',
+        type: 'error',
+      });
+      return;
+    }
+
     try {
       setReviewSubmitting(true);
       setReviewMessage(null);
-      const newRev = reviewService.addReview({
+      const newRev = await reviewService.addReview({
         targetType: 'product',
         targetId: product.id,
         userId: user.id,
         userName: user.name || user.email.split('@')[0],
         rating: reviewRating,
         comment: reviewComment.trim(),
+        orderId,
       });
       setReviews(prev => [newRev, ...prev]);
       setReviewComment('');

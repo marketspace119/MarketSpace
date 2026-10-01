@@ -852,4 +852,20 @@ export const orderService = {
       return hasProduct || hasStore;
     });
   },
+
+  getUserOrderForTarget(userId: string, targetId: string): string | undefined {
+    if (!userId) return undefined;
+    const orders = initOrders();
+    const userOrders = orders.filter(
+      o => (o.customerId === userId || (o as any).userId === userId) && o.status !== 'cancelled'
+    );
+    const match = userOrders.find(o => {
+      const hasProduct = o.items.some(
+        it => it.product?.id === targetId || it.id === targetId || it.product?.slug === targetId
+      );
+      const hasStore = o.vendorOrders?.some(vo => vo.storeId === targetId) || o.items.some(it => it.storeId === targetId);
+      return hasProduct || hasStore;
+    });
+    return match?.orderId;
+  },
 };

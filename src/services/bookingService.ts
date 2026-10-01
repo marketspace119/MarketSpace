@@ -1,4 +1,4 @@
-import { doc, getDocs, collection, setDoc, updateDoc, query, where } from 'firebase/firestore';
+import { doc, getDoc, getDocs, collection, setDoc, updateDoc, query, where, runTransaction } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType, cleanForFirestore } from '../lib/firebase';
 import { ServiceBooking } from '../types';
 import { notificationService } from './notificationService';
@@ -74,36 +74,78 @@ export const bookingService = {
     return initBookings();
   },
 
-  createBooking(data: Omit<ServiceBooking, 'id' | 'bookingCode' | 'createdAt' | 'status'>): ServiceBooking {
-    const bookings = initBookings();
+  async createBooking(data: Omit<ServiceBooking, 'id' | 'bookingCode' | 'createdAt' | 'status'>): Promise<ServiceBooking> {
+    const cleanDate = (data.date || '').replace(/[^a-zA-Z0-9]/g, '-');
+    const cleanTime = (data.time || '').replace(/[^a-zA-Z0-9]/g, '-');
+    const slotId = `${data.sellerId}_${cleanDate}_${cleanTime}`;
 
-    // Double-booking conflict validation (Phase 6)
-    const hasConflict = bookings.some(
-      b =>
-        b.sellerId === data.sellerId &&
-        b.date === data.date &&
-        b.time === data.time &&
-        ['requested', 'accepted', 'confirmed', 'scheduled', 'in_progress'].includes(b.status)
-    );
-    if (hasConflict) {
-      throw new Error(`الموعد المطلوب (${data.date} في ${data.time}) محجوز مسبقاً لدى مقدم الخدمة. يرجى اختيار موعد آخر.`);
+    // Authoritative Service verification
+    let authoritativePrice = data.price;
+    try {
+      const prodDoc = await getDoc(doc(db, 'products', data.serviceId));
+      if (prodDoc.exists()) {
+        const prodData = prodDoc.data();
+        if (prodData.sellerId && prodData.sellerId !== data.sellerId) {
+          throw new Error('Service does not belong to specified provider');
+        }
+        if (prodData.isPublished === false || prodData.status === 'suspended' || prodData.status === 'rejected') {
+          throw new Error('Service is not active or available for booking');
+        }
+        if (typeof prodData.price === 'number') {
+          authoritativePrice = prodData.price;
+        }
+      }
+    } catch (err: any) {
+      if (err.message?.includes('does not belong') || err.message?.includes('not active')) {
+        throw err;
+      }
     }
 
     const newBooking: ServiceBooking = {
       ...data,
+      price: authoritativePrice,
       id: `book_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       bookingCode: `BK-${Math.floor(10000 + Math.random() * 90000)}`,
       status: 'requested',
       createdAt: new Date().toISOString(),
     };
 
+    // Atomic Slot Reservation & Booking Transaction (V3-04 Double-Booking Prevention)
+    try {
+      await runTransaction(db, async (t) => {
+        const slotRef = doc(db, 'booking_slots', slotId);
+        const slotSnap = await t.get(slotRef);
+        if (slotSnap.exists()) {
+          const slot = slotSnap.data();
+          if (slot?.status === 'booked' || slot?.status === 'confirmed' || slot?.status === 'requested') {
+            throw new Error(`الموعد المطلوب (${data.date} في ${data.time}) محجوز مسبقاً لدى مقدم الخدمة. يرجى اختيار موعد آخر.`);
+          }
+        }
+
+        t.set(slotRef, {
+          slotId,
+          sellerId: data.sellerId,
+          date: data.date,
+          time: data.time,
+          bookingId: newBooking.id,
+          customerId: data.customerId,
+          status: 'booked',
+          createdAt: newBooking.createdAt,
+        });
+
+        t.set(doc(db, BOOKINGS_COLLECTION, newBooking.id), cleanForFirestore(newBooking));
+      });
+    } catch (err: any) {
+      if (err.message?.includes('محجوز مسبقاً')) {
+        throw err;
+      }
+      // If transaction failed due to network / emulator offline in local test, fallback to backend gateway
+      throw err;
+    }
+
+    const bookings = initBookings();
     bookings.unshift(newBooking);
     persistLocal(bookings);
-
-    // Persist to Cloud Firestore
-    setDoc(doc(db, BOOKINGS_COLLECTION, newBooking.id), cleanForFirestore(newBooking)).catch(err => {
-      console.warn('Could not write booking to Firestore immediately:', err);
-    });
 
     // Notify Service Provider
     notificationService.createNotification({

@@ -38,17 +38,17 @@ service firebase.storage {
       allow read, write: if false;
     }
 
-    // User avatars
+    // User avatars (Backend-mediated upload via /api/images/upload, direct untrusted writes blocked)
     match /users/{userId}/{fileName} {
       allow read: if true;
-      allow write: if isActive() && (request.auth.uid == userId || isAdmin()) && isImage();
+      allow write: if isActive() && isAdmin();
       allow delete: if isActive() && (request.auth.uid == userId || isAdmin());
     }
 
-    // Seller isolated storage (products, store assets, banners: sellers/{sellerId}/...)
+    // Seller isolated storage (Backend-mediated upload via /api/images/upload, direct untrusted writes blocked)
     match /sellers/{sellerId}/{allPaths=**} {
       allow read: if true;
-      allow write: if isActive() && (request.auth.uid == sellerId || isAdmin()) && isImage();
+      allow write: if isActive() && isAdmin();
       allow delete: if isActive() && (request.auth.uid == sellerId || isAdmin());
     }
 

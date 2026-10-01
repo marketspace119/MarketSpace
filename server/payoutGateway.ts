@@ -57,13 +57,14 @@ export interface SellerFinancialLedgerDoc {
   lifetimeSettledRefunds: number;
   lifetimeSettledPayouts: number;
   lastReconciledAt: string;
+  reconciledDocIdsAtTimestamp?: string[];
   version: number;
 }
 
 /**
- * Authoritative Seller Financial Summary Calculation (P0-03, F-30, Finding F)
- * Implements an authoritative ledger-based accounting strategy with bounded incremental queries
- * to guarantee complete, auditable, and deterministic financial reconciliation without unbounded table scans.
+ * Authoritative Seller Financial Summary Calculation (P0-03, F-30, Finding F, V3-08)
+ * Implements a deterministic ledger cursor combining updatedAt + documentId
+ * to guarantee complete, auditable financial reconciliation with identical timestamps.
  */
 export async function calculateSellerFinancialSummary(
   sellerId: string,
@@ -88,16 +89,21 @@ export async function calculateSellerFinancialSummary(
       refundedAmount = Number(ledger.lifetimeSettledRefunds) || 0;
       settledPayout = Number(ledger.lifetimeSettledPayouts) || 0;
       const lastReconciledAt = ledger.lastReconciledAt || '1970-01-01T00:00:00.000Z';
+      const previouslyReconciledDocIds: string[] = Array.isArray(ledger.reconciledDocIdsAtTimestamp)
+        ? ledger.reconciledDocIdsAtTimestamp
+        : [];
 
-      // 1. Complete incremental pagination for orders updated since last reconciliation (OPEN-04)
+      // 1. Complete deterministic incremental reconciliation with cursor safety (V3-08)
       let latestProcessedUpdatedAt = lastReconciledAt;
+      let currentProcessedDocIds: string[] = [];
+
       try {
         let currentCursor: any = undefined;
         while (true) {
           let q = adminDb
             .collection('orders')
             .where('sellerIds', 'array-contains', sellerId)
-            .where('updatedAt', '>', lastReconciledAt)
+            .where('updatedAt', '>=', lastReconciledAt)
             .orderBy('updatedAt', 'asc')
             .limit(100);
           if (currentCursor) {
@@ -109,9 +115,20 @@ export async function calculateSellerFinancialSummary(
           deltaOrdersSnap.forEach((doc) => {
             const order = doc.data();
             const orderUp = order.updatedAt || '';
+            const docId = doc.id;
+
+            // Safe cursor deduplication for identical timestamps
+            if (orderUp === lastReconciledAt && previouslyReconciledDocIds.includes(docId)) {
+              return;
+            }
+
             if (orderUp > latestProcessedUpdatedAt) {
               latestProcessedUpdatedAt = orderUp;
+              currentProcessedDocIds = [docId];
+            } else if (orderUp === latestProcessedUpdatedAt) {
+              currentProcessedDocIds.push(docId);
             }
+
             if (Array.isArray(order.vendorOrders) && order.vendorOrders.length > 0) {
               order.vendorOrders.forEach((vo: any) => {
                 if (vo.sellerId === sellerId && isSubOrderEligibleForPayout(order, vo)) {
@@ -127,7 +144,7 @@ export async function calculateSellerFinancialSummary(
           if (deltaOrdersSnap.docs.length < 100) break;
         }
       } catch {
-        // Fallback for mock in-memory db without composite orderBy
+        // Fallback for in-memory db / test harness without composite indexes
         const deltaOrdersSnap = await adminDb
           .collection('orders')
           .where('sellerIds', 'array-contains', sellerId)
@@ -137,22 +154,35 @@ export async function calculateSellerFinancialSummary(
           deltaOrdersSnap.forEach((doc) => {
             const order = doc.data();
             const orderUp = order.updatedAt || '';
-            if (orderUp > lastReconciledAt) {
-              if (orderUp > latestProcessedUpdatedAt) {
-                latestProcessedUpdatedAt = orderUp;
-              }
-              if (Array.isArray(order.vendorOrders) && order.vendorOrders.length > 0) {
-                order.vendorOrders.forEach((vo: any) => {
-                  if (vo.sellerId === sellerId && isSubOrderEligibleForPayout(order, vo)) {
-                    grossEarned += (vo.sellerRevenue ?? (vo.subtotal - (vo.commissionAmount || 0)));
-                  }
-                });
-              } else if ((order.sellerId === sellerId || (Array.isArray(order.sellerIds) && order.sellerIds.includes(sellerId))) && isSubOrderEligibleForPayout(order)) {
-                grossEarned += (order.sellerRevenue ?? (order.subtotal - (order.platformCommission || 0)));
-              }
+            const docId = doc.id;
+
+            if (orderUp < lastReconciledAt) return;
+            if (orderUp === lastReconciledAt && previouslyReconciledDocIds.includes(docId)) {
+              return;
+            }
+
+            if (orderUp > latestProcessedUpdatedAt) {
+              latestProcessedUpdatedAt = orderUp;
+              currentProcessedDocIds = [docId];
+            } else if (orderUp === latestProcessedUpdatedAt) {
+              currentProcessedDocIds.push(docId);
+            }
+
+            if (Array.isArray(order.vendorOrders) && order.vendorOrders.length > 0) {
+              order.vendorOrders.forEach((vo: any) => {
+                if (vo.sellerId === sellerId && isSubOrderEligibleForPayout(order, vo)) {
+                  grossEarned += (vo.sellerRevenue ?? (vo.subtotal - (vo.commissionAmount || 0)));
+                }
+              });
+            } else if ((order.sellerId === sellerId || (Array.isArray(order.sellerIds) && order.sellerIds.includes(sellerId))) && isSubOrderEligibleForPayout(order)) {
+              grossEarned += (order.sellerRevenue ?? (order.subtotal - (order.platformCommission || 0)));
             }
           });
         }
+      }
+
+      if (latestProcessedUpdatedAt === lastReconciledAt) {
+        currentProcessedDocIds = Array.from(new Set([...previouslyReconciledDocIds, ...currentProcessedDocIds]));
       }
 
       // 2. Complete active in-flight refunds query (OPEN-05)
@@ -181,19 +211,22 @@ export async function calculateSellerFinancialSummary(
         });
       }
 
-      // Update the authoritative ledger state with reconciled totals (advance to last document timestamp - OPEN-04)
+      // Update the authoritative ledger state with reconciled totals (V3-08 deterministic cursor)
       await ledgerRef.set({
         sellerId,
         lifetimeGrossEarned: Number(grossEarned.toFixed(2)),
         lifetimeSettledRefunds: Number(refundedAmount.toFixed(2)),
         lifetimeSettledPayouts: Number(settledPayout.toFixed(2)),
         lastReconciledAt: latestProcessedUpdatedAt,
+        reconciledDocIdsAtTimestamp: currentProcessedDocIds,
         version: (ledger.version || 1) + 1,
       }, { merge: true });
 
     } else {
-      // First-time seller initialization: Compute complete authoritative baseline (OPEN-06)
+      // First-time seller initialization: Compute complete authoritative baseline (OPEN-06 & V3-08)
       let latestInitUpdatedAt = '1970-01-01T00:00:00.000Z';
+      let initDocIdsAtLatestTimestamp: string[] = [];
+
       const ordersSnap = await adminDb
         .collection('orders')
         .where('sellerIds', 'array-contains', sellerId)
@@ -203,9 +236,15 @@ export async function calculateSellerFinancialSummary(
         ordersSnap.forEach((doc) => {
           const order = doc.data();
           const orderUp = order.updatedAt || order.createdAt || '';
+          const docId = doc.id;
+
           if (orderUp > latestInitUpdatedAt) {
             latestInitUpdatedAt = orderUp;
+            initDocIdsAtLatestTimestamp = [docId];
+          } else if (orderUp === latestInitUpdatedAt) {
+            initDocIdsAtLatestTimestamp.push(docId);
           }
+
           if (Array.isArray(order.vendorOrders) && order.vendorOrders.length > 0) {
             order.vendorOrders.forEach((vo: any) => {
               if (vo.sellerId === sellerId && isSubOrderEligibleForPayout(order, vo)) {
@@ -252,13 +291,14 @@ export async function calculateSellerFinancialSummary(
         });
       }
 
-      // Persist the initial authoritative ledger document (OPEN-06)
+      // Persist the initial authoritative ledger document (OPEN-06 & V3-08)
       await ledgerRef.set({
         sellerId,
         lifetimeGrossEarned: Number(grossEarned.toFixed(2)),
         lifetimeSettledRefunds: Number(refundedAmount.toFixed(2)),
         lifetimeSettledPayouts: Number(settledPayout.toFixed(2)),
         lastReconciledAt: latestInitUpdatedAt,
+        reconciledDocIdsAtTimestamp: initDocIdsAtLatestTimestamp,
         version: 1,
       });
     }

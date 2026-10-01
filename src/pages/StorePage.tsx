@@ -22,6 +22,7 @@ import { Store, Product, Review } from '../types';
 import { storeService } from '../services/storeService';
 import { productService } from '../services/productService';
 import { reviewService } from '../services/reviewService';
+import { orderService } from '../services/orderService';
 import { ProductCard } from '../components/common/ProductCard';
 import { updatePageSEO } from '../services/seo';
 
@@ -106,24 +107,40 @@ export const StorePage: React.FC<StorePageProps> = ({ slug, onNavigate, onQuickV
     setStore(prev => prev ? { ...prev, followersCount: Math.max(0, prev.followersCount + (newState ? 1 : -1)) } : null);
   };
 
-  const handleAddReview = (e: React.FormEvent) => {
+  const handleAddReview = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newComment.trim()) return;
 
-    setIsSubmittingReview(true);
-    const rev = reviewService.addReview({
-      targetType: 'store',
-      targetId: store.id,
-      userId: user?.id || 'guest_customer',
-      userName: user?.name || 'زائر السوق',
-      rating: newRating,
-      comment: newComment.trim(),
-      isVerifiedPurchase: true,
-    });
+    if (!user) {
+      alert(language === 'ar' ? 'يرجى تسجيل الدخول أولاً لإضافة تقييم' : 'Please login first to submit a review');
+      return;
+    }
 
-    setReviews(prev => [rev, ...prev]);
-    setNewComment('');
-    setIsSubmittingReview(false);
+    const orderId = orderService.getUserOrderForTarget(user.id, store.id);
+    if (!orderId) {
+      alert(language === 'ar' ? 'يجب إتمام طلب من هذا المتجر أولاً لتتمكن من كتابة تقييم موثق.' : 'You must complete an order from this store first to submit a review.');
+      return;
+    }
+
+    try {
+      setIsSubmittingReview(true);
+      const rev = await reviewService.addReview({
+        targetType: 'store',
+        targetId: store.id,
+        userId: user.id,
+        userName: user.name || user.email.split('@')[0],
+        rating: newRating,
+        comment: newComment.trim(),
+        orderId,
+      });
+
+      setReviews(prev => [rev, ...prev]);
+      setNewComment('');
+    } catch (err: any) {
+      alert(err.message || 'Failed to submit review');
+    } finally {
+      setIsSubmittingReview(false);
+    }
   };
 
   const filteredProducts = selectedCategory === 'all'

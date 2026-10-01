@@ -239,6 +239,24 @@ console.log('================================================================\n'
   });
 }
 
+// 12. v3_forensic_audit_suite
+{
+  const output = execSync('npx tsx tests/v3_forensic_audit_suite.ts', { encoding: 'utf8' });
+  const passes = (output.match(/\[PASS\]/g) || []).length;
+  const fails = (output.match(/\[FAIL\]/g) || []).length;
+  suites.push({
+    suiteName: 'tests/v3_forensic_audit_suite.ts',
+    command: 'npx tsx tests/v3_forensic_audit_suite.ts',
+    total: passes + fails,
+    passed: passes,
+    failed: fails,
+    skipped: 0,
+    unverified: 0,
+    category: 'RUNTIME VERIFIED',
+    details: '10 forensic audit invariants (V3-01 to V3-10: lockfile CI, magic-bytes, disputes, bookings, reviews, messaging, drivers, ledger cursor, scalability, prod isolation)',
+  });
+}
+
 console.log('================================================================');
 console.log('AUDITED TEST EXECUTION SUMMARY TABLE');
 console.log('================================================================');

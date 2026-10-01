@@ -1,6 +1,7 @@
 import { initializeApp, getApps, cert, type App } from 'firebase-admin/app';
 import { getAuth, type Auth, type DecodedIdToken } from 'firebase-admin/auth';
 import { getFirestore, type Firestore } from 'firebase-admin/firestore';
+import { getStorage, type Storage } from 'firebase-admin/storage';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -20,6 +21,7 @@ try {
 let adminApp: App | null = null;
 let adminAuth: Auth | null = null;
 let adminDb: Firestore | null = null;
+let adminStorage: Storage | null = null;
 
 /**
  * Lazy initialization of Firebase Admin Application
@@ -105,6 +107,23 @@ export function getAdminDb(): Firestore {
  */
 export function setAdminDbForTesting(mock: any): void {
   adminDb = mock;
+}
+
+/**
+ * Returns Admin Storage instance
+ */
+export function getAdminStorage(): Storage {
+  if (!adminStorage) {
+    adminStorage = getStorage(getAdminApp());
+  }
+  return adminStorage;
+}
+
+/**
+ * Sets Admin Storage instance for testing
+ */
+export function setAdminStorageForTesting(mock: any): void {
+  adminStorage = mock;
 }
 
 /**

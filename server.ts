@@ -8,7 +8,7 @@ import { processSubscriptionReviewGateway } from './server/subscriptionGateway';
 import { processRefundGateway } from './server/refundGateway';
 import { processPaymentReferenceSubmissionGateway, processPaymentReviewGateway } from './server/paymentGateway';
 import { processUserRoleUpdateGateway, processUserStatusUpdateGateway } from './server/userGateway';
-import { processImageVerificationGateway } from './server/imageGateway';
+import { processImageVerificationGateway, processImageUploadGateway } from './server/imageGateway';
 import { createRateLimiter } from './server/rateLimiter';
 import { getAdminDb, requireAuthenticatedCaller, requireVerifiedPlatformAdmin, verifyFirebaseBearerToken } from './server/firebaseAdmin';
 import {
@@ -339,6 +339,304 @@ async function startServer() {
       return res.status(statusCode).json({
         success: false,
         error: err.message || 'Image verification failed',
+      });
+    }
+  });
+
+  // 9d. Authoritative Binary Image Upload Gateway (V3-02 Remediation)
+  app.post('/api/images/upload', async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processImageUploadGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/images/upload] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = err.statusCode || (isForbidden ? 403 : isAuth ? 401 : 400);
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Image upload failed',
+      });
+    }
+  });
+
+  // 9e. Authoritative Atomic Booking Reservation Gateway (V3-04 Remediation)
+  app.post('/api/bookings/create', financialRateLimiter, async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      const caller = await requireAuthenticatedCaller(authHeader);
+      const { serviceId, sellerId, date, time, customerName, customerPhone, notes } = req.body || {};
+
+      if (!serviceId || typeof serviceId !== 'string') {
+        return res.status(400).json({ success: false, error: 'serviceId is required' });
+      }
+      if (!date || typeof date !== 'string' || !time || typeof time !== 'string') {
+        return res.status(400).json({ success: false, error: 'date and time are required' });
+      }
+
+      const adminDb = getAdminDb();
+
+      // 1. Authoritative Service Lookup and Validation
+      const serviceDoc = await adminDb.collection('products').doc(serviceId).get();
+      if (!serviceDoc.exists) {
+        return res.status(404).json({ success: false, error: 'Service not found in catalog' });
+      }
+      const serviceData = serviceDoc.data() || {};
+      if (serviceData.type !== 'services' && serviceData.category !== 'services') {
+        return res.status(400).json({ success: false, error: 'Referenced entity is not a bookable service' });
+      }
+      if (serviceData.isPublished === false || serviceData.status === 'suspended' || serviceData.status === 'rejected') {
+        return res.status(400).json({ success: false, error: 'Service is not active or available for booking' });
+      }
+
+      const authoritativeSellerId = serviceData.sellerId;
+      if (sellerId && sellerId !== authoritativeSellerId) {
+        return res.status(400).json({ success: false, error: 'Service does not belong to specified provider' });
+      }
+
+      const authoritativePrice = Number(serviceData.price) || 0;
+      const serviceTitle = serviceData.title?.ar || serviceData.title?.en || serviceData.name || 'Service';
+      const slotId = `${authoritativeSellerId}_${date.replace(/[^a-zA-Z0-9]/g, '-')}_${time.replace(/[^a-zA-Z0-9]/g, '-')}`;
+      const slotRef = adminDb.collection('booking_slots').doc(slotId);
+      const bookingId = `book_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const bookingCode = `BK-${Math.floor(10000 + Math.random() * 90000)}`;
+      const bookingRef = adminDb.collection('bookings').doc(bookingId);
+
+      const now = new Date().toISOString();
+      const bookingData = {
+        id: bookingId,
+        bookingCode,
+        serviceId,
+        serviceName: serviceTitle,
+        sellerId: authoritativeSellerId,
+        storeId: serviceData.storeId || authoritativeSellerId,
+        customerId: caller.uid,
+        customerName: customerName || caller.email || 'Customer',
+        customerPhone: customerPhone || '',
+        date,
+        time,
+        price: authoritativePrice,
+        status: 'requested',
+        notes: notes ? String(notes).slice(0, 500) : '',
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      // 2. Atomic Slot Reservation Transaction
+      await adminDb.runTransaction(async (t) => {
+        const slotSnap = await t.get(slotRef);
+        if (slotSnap.exists) {
+          const slot = slotSnap.data();
+          if (slot?.status === 'booked' || slot?.status === 'confirmed' || slot?.status === 'requested') {
+            const err = new Error(`الموعد المطلوب (${date} في ${time}) محجوز مسبقاً لدى مقدم الخدمة. يرجى اختيار موعد آخر.`) as any;
+            err.statusCode = 409;
+            throw err;
+          }
+        }
+
+        t.set(slotRef, {
+          slotId,
+          sellerId: authoritativeSellerId,
+          date,
+          time,
+          bookingId,
+          customerId: caller.uid,
+          status: 'booked',
+          createdAt: now,
+          updatedAt: now,
+        });
+
+        t.set(bookingRef, bookingData);
+      });
+
+      return res.status(200).json({ success: true, booking: bookingData });
+    } catch (err: any) {
+      console.error('[API /api/bookings/create] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const isConflict = err.statusCode === 409 || err.message?.includes('محجوز مسبقاً');
+      const statusCode = err.statusCode || (isConflict ? 409 : isForbidden ? 403 : isAuth ? 401 : 400);
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Booking reservation failed',
+      });
+    }
+  });
+
+  // 9f. Authoritative Dispute Workflow Gateways (V3-03 Remediation)
+  app.post('/api/disputes/create', financialRateLimiter, async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      const caller = await requireAuthenticatedCaller(authHeader);
+      const { orderId, subOrderId, sellerId, sellerName, storeId, reason, description, evidenceUrls, requestedAction } = req.body || {};
+
+      if (!orderId || typeof orderId !== 'string') {
+        return res.status(400).json({ success: false, error: 'orderId is required' });
+      }
+      if (!description || typeof description !== 'string' || !description.trim()) {
+        return res.status(400).json({ success: false, error: 'description is required' });
+      }
+
+      const adminDb = getAdminDb();
+
+      // Verify order exists and caller owns order
+      const orderDoc = await adminDb.collection('orders').doc(orderId).get();
+      if (!orderDoc.exists) {
+        return res.status(404).json({ success: false, error: 'Referenced order not found' });
+      }
+      const orderData = orderDoc.data() || {};
+      if (orderData.customerId !== caller.uid && !caller.isPlatformAdmin) {
+        return res.status(403).json({ success: false, error: 'Forbidden: You can only open disputes for your own orders' });
+      }
+
+      // Check for active open disputes on this order
+      const existingSnap = await adminDb
+        .collection('disputes')
+        .where('orderId', '==', orderId)
+        .where('status', 'in', ['OPEN', 'SELLER_RESPONDED'])
+        .get();
+      if (!existingSnap.empty) {
+        return res.status(409).json({ success: false, error: 'There is already an active dispute open for this order' });
+      }
+
+      const disputeId = `disp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const now = new Date().toISOString();
+      const newDispute = {
+        id: disputeId,
+        orderId,
+        subOrderId: subOrderId || null,
+        customerId: caller.uid,
+        customerName: orderData.customerName || caller.email || 'Customer',
+        customerPhone: orderData.phone || null,
+        sellerId: sellerId || (orderData.sellerIds && orderData.sellerIds[0]) || 'unknown_seller',
+        sellerName: sellerName || 'Merchant',
+        storeId: storeId || null,
+        reason: reason || 'other',
+        description: description.trim().slice(0, 2000),
+        evidenceUrls: Array.isArray(evidenceUrls) ? evidenceUrls.slice(0, 5) : [],
+        requestedAction: requestedAction || 'refund',
+        status: 'OPEN',
+        createdAt: now,
+        updatedAt: now,
+      };
+
+      await adminDb.collection('disputes').doc(disputeId).set(newDispute);
+      return res.status(200).json({ success: true, dispute: newDispute });
+    } catch (err: any) {
+      console.error('[API /api/disputes/create] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to create dispute',
+      });
+    }
+  });
+
+  app.post('/api/disputes/respond', financialRateLimiter, async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      const caller = await requireAuthenticatedCaller(authHeader);
+      const { disputeId, message, proposedAction } = req.body || {};
+
+      if (!disputeId || !message || typeof message !== 'string' || !message.trim()) {
+        return res.status(400).json({ success: false, error: 'disputeId and message are required' });
+      }
+
+      const adminDb = getAdminDb();
+      const disputeRef = adminDb.collection('disputes').doc(disputeId);
+      const disputeSnap = await disputeRef.get();
+      if (!disputeSnap.exists) {
+        return res.status(404).json({ success: false, error: 'Dispute not found' });
+      }
+      const dispute = disputeSnap.data() as any;
+
+      if (!caller.isPlatformAdmin && caller.uid !== dispute.sellerId) {
+        return res.status(403).json({ success: false, error: 'Forbidden: You can only respond to disputes against your own store' });
+      }
+
+      const now = new Date().toISOString();
+      const updateData = {
+        status: 'SELLER_RESPONDED',
+        sellerResponse: {
+          message: message.trim(),
+          respondedAt: now,
+          proposedAction: proposedAction || null,
+        },
+        updatedAt: now,
+      };
+
+      await disputeRef.update(updateData);
+      return res.status(200).json({ success: true, dispute: { ...dispute, ...updateData } });
+    } catch (err: any) {
+      console.error('[API /api/disputes/respond] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to respond to dispute',
+      });
+    }
+  });
+
+  app.post('/api/disputes/resolve', financialRateLimiter, async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization;
+      const caller = await requireVerifiedPlatformAdmin(authHeader);
+      const { disputeId, actionTaken, resolutionNotes, refundAmount } = req.body || {};
+
+      if (!disputeId || !actionTaken || !['REFUND_APPROVED', 'CLAIM_DISMISSED'].includes(actionTaken)) {
+        return res.status(400).json({ success: false, error: 'disputeId and valid actionTaken (REFUND_APPROVED or CLAIM_DISMISSED) are required' });
+      }
+
+      const adminDb = getAdminDb();
+      const disputeRef = adminDb.collection('disputes').doc(disputeId);
+      const disputeSnap = await disputeRef.get();
+      if (!disputeSnap.exists) {
+        return res.status(404).json({ success: false, error: 'Dispute not found' });
+      }
+      const dispute = disputeSnap.data() as any;
+
+      const now = new Date().toISOString();
+      const finalStatus = actionTaken === 'REFUND_APPROVED' ? 'RESOLVED_REFUND' : 'RESOLVED_REJECTED';
+      const resolution = {
+        resolvedBy: caller.uid,
+        actionTaken,
+        resolutionNotes: (resolutionNotes || '').trim(),
+        resolvedAt: now,
+        refundAmount: Number(refundAmount) || 0,
+      };
+
+      await disputeRef.update({
+        status: finalStatus,
+        adminResolution: resolution,
+        updatedAt: now,
+      });
+
+      if (actionTaken === 'REFUND_APPROVED' && dispute.orderId) {
+        await adminDb.collection('orders').doc(dispute.orderId).update({
+          refundStatus: 'approved',
+          refundAmount: Number(refundAmount) || 0,
+          updatedAt: now,
+        }).catch(() => {});
+      }
+
+      return res.status(200).json({
+        success: true,
+        dispute: { ...dispute, status: finalStatus, adminResolution: resolution, updatedAt: now },
+      });
+    } catch (err: any) {
+      console.error('[API /api/disputes/resolve] Error:', err.message);
+      const isForbidden = err.message?.includes('Forbidden');
+      const isAuth = err.message?.includes('Authentication');
+      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      return res.status(statusCode).json({
+        success: false,
+        error: err.message || 'Failed to resolve dispute',
       });
     }
   });

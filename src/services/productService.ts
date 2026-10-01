@@ -1,4 +1,4 @@
-import { doc, getDocs, collection, setDoc, updateDoc, deleteDoc } from 'firebase/firestore';
+import { doc, getDocs, collection, setDoc, updateDoc, deleteDoc, query, limit, startAfter, orderBy, where } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { Product, UserRole } from '../types';
 import { seedProducts } from '../data/seedProducts';
@@ -11,12 +11,24 @@ const PRODUCTS_COLLECTION = 'products';
 
 let memoryProducts: Product[] = [];
 
+function isProductionEnvironment(): boolean {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'production') return true;
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.PROD) return true;
+  return false;
+}
+
 function initProducts(): Product[] {
   if (memoryProducts.length > 0) return memoryProducts;
-  if (typeof window === 'undefined') return seedProducts.map(normalizeProduct);
+  if (typeof window === 'undefined') {
+    return isProductionEnvironment() ? [] : seedProducts.map(normalizeProduct);
+  }
   try {
     const raw = localStorage.getItem(PRODUCTS_STORAGE_KEY);
     if (!raw) {
+      if (isProductionEnvironment()) {
+        memoryProducts = [];
+        return [];
+      }
       const initialized = seedProducts.map((p, idx) => {
         let storeId = 'store_cosmetics_01';
         let sellerId = 'user_seller_01';
@@ -46,11 +58,17 @@ function initProducts(): Product[] {
       return initialized;
     }
     const parsed = JSON.parse(raw);
+    if (isProductionEnvironment()) {
+      memoryProducts = Array.isArray(parsed)
+        ? parsed.filter((p: any) => !p.isSeedData).map(normalizeProduct)
+        : [];
+      return memoryProducts;
+    }
     memoryProducts = Array.isArray(parsed) ? parsed.map(normalizeProduct) : seedProducts.map(normalizeProduct);
     return memoryProducts;
   } catch (err) {
     console.error('Failed to load products from storage', err);
-    memoryProducts = seedProducts.map(normalizeProduct);
+    memoryProducts = isProductionEnvironment() ? [] : seedProducts.map(normalizeProduct);
     return memoryProducts;
   }
 }
@@ -121,11 +139,12 @@ export const productService = {
   },
 
   /**
-   * Syncs products from Cloud Firestore
+   * Bounded sync from Cloud Firestore (V3-09 Scalability & V3-10 Isolation)
    */
   async syncWithFirestore(): Promise<Product[]> {
     try {
-      const snap = await getDocs(collection(db, PRODUCTS_COLLECTION));
+      // Bounded query prevents memory crash at production scale
+      const snap = await getDocs(query(collection(db, PRODUCTS_COLLECTION), limit(100)));
       if (!snap.empty) {
         const cloudProducts: Product[] = [];
         snap.forEach(d => {
@@ -142,6 +161,68 @@ export const productService = {
       console.warn('Firestore products sync skipped or offline:', err);
     }
     return initProducts();
+  },
+
+  /**
+   * Paginated retrieval from Cloud Firestore (V3-09 Query Pagination)
+   */
+  async fetchProductsPage(options?: {
+    pageSize?: number;
+    cursor?: any;
+    type?: string;
+    category?: string;
+    sellerId?: string;
+    storeId?: string;
+    onlyPublished?: boolean;
+  }): Promise<{ products: Product[]; nextCursor: any; hasMore: boolean }> {
+    const pageSize = Math.min(100, Math.max(1, options?.pageSize || 24));
+    try {
+      let q = collection(db, PRODUCTS_COLLECTION) as any;
+      const constraints: any[] = [];
+
+      if (options?.onlyPublished) {
+        constraints.push(where('isPublished', '==', true));
+      }
+      if (options?.sellerId) {
+        constraints.push(where('sellerId', '==', options.sellerId));
+      }
+      if (options?.storeId) {
+        constraints.push(where('storeId', '==', options.storeId));
+      }
+      if (options?.type && options.type !== 'all') {
+        constraints.push(where('type', '==', options.type));
+      }
+      if (options?.category && options.category !== 'all') {
+        constraints.push(where('category', '==', options.category));
+      }
+
+      constraints.push(limit(pageSize));
+      if (options?.cursor) {
+        constraints.push(startAfter(options.cursor));
+      }
+
+      const snap = await getDocs(query(q, ...constraints));
+      const products: Product[] = [];
+      snap.forEach(d => {
+        const raw = d.data() as Record<string, any>;
+        products.push(normalizeProduct({ ...raw, id: d.id || raw.id }));
+      });
+
+      const nextCursor = snap.docs.length > 0 ? snap.docs[snap.docs.length - 1] : null;
+      return {
+        products,
+        nextCursor,
+        hasMore: snap.docs.length === pageSize,
+      };
+    } catch (err) {
+      console.warn('fetchProductsPage fallback to memory:', err);
+      const all = this.getAllProducts(options);
+      return {
+        products: all.slice(0, pageSize),
+        nextCursor: null,
+        hasMore: all.length > pageSize,
+      };
+    }
   },
 
   getAllProducts(filters?: {

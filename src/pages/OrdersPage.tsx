@@ -104,14 +104,14 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ onNavigate, orderIdFromR
     setIsDisputeModalOpen(true);
   };
 
-  const handleSubmitDispute = (e: React.FormEvent) => {
+  const handleSubmitDispute = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user || !selectedOrder || !disputeDesc.trim()) return;
 
     try {
       setIsSubmittingDispute(true);
       const primaryVendor = selectedOrder.vendorOrders?.[0];
-      const created = disputeService.createDispute({
+      const created = await disputeService.createDispute({
         orderId: selectedOrder.orderId,
         subOrderId: primaryVendor?.subOrderId,
         customerId: user.id,
@@ -135,13 +135,13 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ onNavigate, orderIdFromR
     }
   };
 
-  const handleSubmitReview = (e: React.FormEvent) => {
+  const handleSubmitReview = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user || !reviewModalData || !reviewComment.trim()) return;
 
     try {
       setIsSubmittingReview(true);
-      reviewService.addReview({
+      await reviewService.addReview({
         targetType: reviewModalData.targetType,
         targetId: reviewModalData.targetId,
         userId: user.id,

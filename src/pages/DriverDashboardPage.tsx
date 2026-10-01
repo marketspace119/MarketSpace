@@ -87,11 +87,11 @@ export const DriverDashboardPage: React.FC<DriverDashboardPageProps> = ({ onNavi
     loadData();
   }, [user]);
 
-  const handleToggleDriverStatus = (newStatus: DriverStatus) => {
+  const handleToggleDriverStatus = async (newStatus: DriverStatus) => {
     if (!driver || !user) return;
     setStatusUpdating(true);
     try {
-      const updated = deliveryService.updateDriverStatus(driver.id, newStatus, user.id, user.role);
+      const updated = await deliveryService.updateDriverStatus(driver.id, newStatus, user.id, user.role);
       setDriver(updated);
       showToast(
         language === 'ar'

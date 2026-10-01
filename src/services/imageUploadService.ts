@@ -1,5 +1,5 @@
-import { ref, uploadBytesResumable, getDownloadURL, deleteObject } from 'firebase/storage';
-import { storage } from '../lib/firebase';
+import { ref, deleteObject } from 'firebase/storage';
+import { storage, auth } from '../lib/firebase';
 import { sniffImageMagicBytes, inspectFileContent } from '../lib/imageSecurity';
 
 const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
@@ -52,7 +52,7 @@ export const imageUploadService = {
   },
 
   /**
-   * Uploads an image file to Firebase Storage with strict seller path segregation
+   * Uploads an image file mediated by the authoritative server verification gateway (V3-02 Remediation)
    */
   async uploadImage(
     file: File,
@@ -65,39 +65,55 @@ export const imageUploadService = {
       throw new Error(validation.error || 'Invalid image file');
     }
 
-    // Path segregation: sellers/{sellerId}/{subfolder}/{timestamp}_{sanitizedName}
-    const cleanFileName = file.name.replace(/[^a-zA-Z0-9.-]/g, '_');
-    const storagePath = `sellers/${sellerId}/${subfolder}/${Date.now()}_${cleanFileName}`;
-    const storageRef = ref(storage, storagePath);
+    if (onProgress) onProgress(20);
 
-    return new Promise((resolve, reject) => {
-      const uploadTask = uploadBytesResumable(storageRef, file, {
-        contentType: file.type,
-      });
-
-      uploadTask.on(
-        'state_changed',
-        snapshot => {
-          const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-          if (onProgress) {
-            onProgress(Math.round(progress));
-          }
-        },
-        error => {
-          console.error('[ImageUpload:Error] Firebase storage upload failed:', error);
-          reject(new Error(`فشل رفع الصورة إلى خادم التخزين السحابي: ${error.message || 'Storage upload error'}`));
-        },
-        async () => {
-          try {
-            const downloadUrl = await getDownloadURL(uploadTask.snapshot.ref);
-            resolve({ downloadUrl, storagePath });
-          } catch (err: any) {
-            console.error('[ImageUpload:Error] Failed to retrieve download URL:', err);
-            reject(new Error(`فشل استخراج رابط الصورة المعتمد من السحابة: ${err?.message || err}`));
-          }
-        }
-      );
+    // Convert file to base64
+    const base64Data = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = (err) => reject(err);
+      reader.readAsDataURL(file);
     });
+
+    if (onProgress) onProgress(50);
+
+    // Get Auth token if user is signed in
+    let token = '';
+    try {
+      const currentUser = auth.currentUser;
+      if (currentUser) {
+        token = await currentUser.getIdToken();
+      }
+    } catch {}
+
+    const res = await fetch('/api/images/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({
+        data: base64Data,
+        filename: file.name,
+        sellerId,
+        subfolder,
+        declaredMimeType: file.type,
+      }),
+    });
+
+    if (onProgress) onProgress(90);
+
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || 'Image upload rejected by backend verification gateway');
+    }
+
+    if (onProgress) onProgress(100);
+
+    return {
+      downloadUrl: data.downloadUrl,
+      storagePath: data.storagePath,
+    };
   },
 
   /**

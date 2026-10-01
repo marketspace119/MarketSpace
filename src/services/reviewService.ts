@@ -168,9 +168,24 @@ export const reviewService = {
     }
   },
 
-  addReview(data: Omit<Review, 'id' | 'createdAt'>): Review {
+  async addReview(data: Omit<Review, 'id' | 'createdAt'> & { orderId?: string; bookingId?: string }): Promise<Review> {
     if (!data.comment?.trim()) {
       throw new Error('Review comment cannot be empty');
+    }
+
+    if (!data.userId) {
+      throw new Error('Authentication required to submit reviews');
+    }
+
+    // V3-05 Remediation: Proof of purchase or completed booking strictly required
+    if (!data.orderId && !data.bookingId) {
+      throw new Error('Proof of purchase or completed booking is strictly required to submit a review');
+    }
+
+    // Authoritative verified purchase status based on real customer orders
+    const isVerifiedPurchase = orderService.hasUserPurchased(data.userId, data.targetId);
+    if (data.orderId && !isVerifiedPurchase) {
+      throw new Error('Forbidden: You can only review items you have actually purchased and completed');
     }
 
     const reviews = initReviews();
@@ -184,29 +199,25 @@ export const reviewService = {
     // Clamp rating between 1 and 5
     const safeRating = Math.min(5, Math.max(1, Math.round(Number(data.rating) || 5)));
 
-    // Authoritative verified purchase status based on real customer orders
-    const isVerifiedPurchase = data.userId
-      ? orderService.hasUserPurchased(data.userId, data.targetId)
-      : false;
+    // Deterministic ID prevents duplicate review creation races at database level
+    const reviewId = `rev_${data.userId}_${data.targetId}`;
 
     const newReview: Review = {
       ...data,
       userId: data.userId,
-      customerId: data.userId || (data as any).customerId,
+      customerId: data.userId,
       rating: safeRating,
       isVerifiedPurchase,
       comment: data.comment.trim().slice(0, 1000),
-      id: `rev_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      id: reviewId,
       createdAt: new Date().toISOString(),
     };
 
+    // Authoritative Cloud Firestore write
+    await setDoc(doc(db, REVIEWS_COLLECTION, newReview.id), newReview);
+
     reviews.unshift(newReview);
     persistLocal(reviews);
-
-    // Persist to Cloud Firestore
-    setDoc(doc(db, REVIEWS_COLLECTION, newReview.id), newReview).catch(err => {
-      console.warn('Could not write review to Firestore immediately:', err);
-    });
 
     this.recalculateAggregateRating(newReview.targetType, newReview.targetId);
 

@@ -687,7 +687,7 @@ export interface Conversation {
     role: UserRole;
     avatar?: string;
   }[];
-  contextType: 'order' | 'booking' | 'product' | 'store' | 'general';
+  contextType: 'order' | 'booking' | 'product' | 'store' | 'general' | 'support';
   contextId?: string;
   contextTitle?: string;
   lastMessage?: string;

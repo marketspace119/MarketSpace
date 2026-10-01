@@ -105,13 +105,13 @@ export const ServiceProviderPage: React.FC<ServiceProviderPageProps> = ({ slug, 
     setBookingError(null);
   };
 
-  const handleSubmitBooking = (e: React.FormEvent) => {
+  const handleSubmitBooking = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!customerName || !customerPhone) return;
     setBookingError(null);
 
     try {
-      const newBooking = bookingService.createBooking({
+      const newBooking = await bookingService.createBooking({
         serviceId: selectedService?.id || 'service_general',
         serviceTitle: selectedService?.title?.[language] || 'استشارة وخدمة فنية',
         sellerId: provider.sellerId,

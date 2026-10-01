@@ -312,10 +312,10 @@ service cloud.firestore {
         incoming().price is number && incoming().price >= 0 &&
         incoming().sellerId is string &&
         incoming().serviceId is string &&
-        (!exists(/databases/$(database)/documents/products/$(incoming().serviceId)) || (
-          get(/databases/$(database)/documents/products/$(incoming().serviceId)).data.sellerId == incoming().sellerId &&
-          incoming().price == get(/databases/$(database)/documents/products/$(incoming().serviceId)).data.price
-        ));
+        exists(/databases/$(database)/documents/products/$(incoming().serviceId)) &&
+        get(/databases/$(database)/documents/products/$(incoming().serviceId)).data.sellerId == incoming().sellerId &&
+        incoming().price == get(/databases/$(database)/documents/products/$(incoming().serviceId)).data.price &&
+        get(/databases/$(database)/documents/products/$(incoming().serviceId)).data.isPublished != false;
       allow update: if isSignedIn() && (
         isAdmin() ||
         (isActiveUser() &&
@@ -352,7 +352,50 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    // 9. Customer Product & Store Reviews
+    // 8b. Booking Slots Lock Collection (V3-04 Double-Booking Prevention)
+    match /booking_slots/{slotId} {
+      allow get: if isSignedIn();
+      allow list: if isAdmin();
+      allow create: if isActiveUser() &&
+        incoming().slotId == slotId &&
+        incoming().status == 'booked' &&
+        incoming().customerId == request.auth.uid;
+      allow update, delete: if isAdmin();
+    }
+
+    // 8c. Order Disputes Collection (V3-03 Server-Authoritative Workflow)
+    match /disputes/{disputeId} {
+      allow get, list: if isSignedIn() && (
+        resource.data.customerId == request.auth.uid ||
+        resource.data.sellerId == request.auth.uid ||
+        isAdmin()
+      );
+      allow create: if isActiveUser() &&
+        incoming().customerId == request.auth.uid &&
+        incoming().status == 'OPEN' &&
+        incoming().orderId is string &&
+        incoming().sellerId is string &&
+        incoming().reason is string &&
+        incoming().description is string &&
+        exists(/databases/$(database)/documents/orders/$(incoming().orderId)) &&
+        get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.customerId == request.auth.uid;
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (
+          isActiveUser() &&
+          resource.data.sellerId == request.auth.uid &&
+          existing().status == 'OPEN' &&
+          incoming().status == 'SELLER_RESPONDED' &&
+          incoming().customerId == existing().customerId &&
+          incoming().sellerId == existing().sellerId &&
+          incoming().orderId == existing().orderId &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'sellerResponse', 'updatedAt'])
+        )
+      );
+      allow delete: if false;
+    }
+
+    // 9. Customer Product & Store Reviews (V3-05 Strict Proof-of-Purchase/Booking Required)
     match /reviews/{reviewId} {
       allow get: if true;
       allow list: if true;
@@ -360,18 +403,29 @@ service cloud.firestore {
         (!('customerId' in incoming()) || incoming().customerId == request.auth.uid) &&
         (!('userId' in incoming()) || incoming().userId == request.auth.uid) &&
         (('customerId' in incoming()) || ('userId' in incoming())) &&
-        (!('orderId' in incoming()) || (
-          exists(/databases/$(database)/documents/orders/$(incoming().orderId)) &&
-          get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.customerId == request.auth.uid
-        )) &&
+        (
+          ('orderId' in incoming() &&
+           incoming().orderId is string &&
+           exists(/databases/$(database)/documents/orders/$(incoming().orderId)) &&
+           get(/databases/$(database)/documents/orders/$(incoming().orderId)).data.customerId == request.auth.uid) ||
+          ('bookingId' in incoming() &&
+           incoming().bookingId is string &&
+           exists(/databases/$(database)/documents/bookings/$(incoming().bookingId)) &&
+           get(/databases/$(database)/documents/bookings/$(incoming().bookingId)).data.customerId == request.auth.uid)
+        ) &&
         (!('isVerifiedPurchase' in incoming()) || incoming().isVerifiedPurchase == false || isSuperAdmin()) &&
         (!('verifiedPurchase' in incoming()) || incoming().verifiedPurchase == false || isSuperAdmin()) &&
         incoming().targetType in ['product', 'store', 'restaurant', 'service'] &&
         incoming().targetId is string &&
+        (
+          (incoming().targetType == 'product' && exists(/databases/$(database)/documents/products/$(incoming().targetId))) ||
+          (incoming().targetType in ['store', 'restaurant', 'service'] && exists(/databases/$(database)/documents/stores/$(incoming().targetId)))
+        ) &&
         incoming().rating is number &&
         incoming().rating >= 1 &&
         incoming().rating <= 5 &&
         incoming().comment is string &&
+        incoming().comment.size() > 0 &&
         incoming().comment.size() <= 2000;
       allow update: if isSignedIn() && (
         isAdmin() ||
@@ -379,6 +433,8 @@ service cloud.firestore {
          (resource.data.customerId == request.auth.uid || resource.data.userId == request.auth.uid) &&
          (!('customerId' in incoming()) || incoming().customerId == existing().customerId) &&
          (!('userId' in incoming()) || incoming().userId == existing().userId) &&
+         (!('orderId' in incoming()) || incoming().orderId == existing().orderId) &&
+         (!('bookingId' in incoming()) || incoming().bookingId == existing().bookingId) &&
          (!('isVerifiedPurchase' in incoming()) || incoming().isVerifiedPurchase == existing().isVerifiedPurchase) &&
          (!('verifiedPurchase' in incoming()) || incoming().verifiedPurchase == existing().verifiedPurchase) &&
          incoming().diff(existing()).affectedKeys().hasOnly(['rating', 'comment', 'updatedAt'])) ||
@@ -527,7 +583,16 @@ service cloud.firestore {
         incoming().participantIds is list &&
         incoming().participantIds.size() >= 2 &&
         incoming().participantIds.size() <= 10 &&
-        (request.auth.uid in incoming().participantIds)
+        (request.auth.uid in incoming().participantIds) &&
+        incoming().contextType in ['order', 'booking', 'store', 'product', 'general', 'support'] &&
+        (
+          incoming().contextType == 'general' ||
+          incoming().contextType == 'support' ||
+          (incoming().contextType == 'order' && incoming().contextId != null && exists(/databases/$(database)/documents/orders/$(incoming().contextId))) ||
+          (incoming().contextType == 'booking' && incoming().contextId != null && exists(/databases/$(database)/documents/bookings/$(incoming().contextId))) ||
+          (incoming().contextType == 'store' && incoming().contextId != null && exists(/databases/$(database)/documents/stores/$(incoming().contextId))) ||
+          (incoming().contextType == 'product' && incoming().contextId != null && exists(/databases/$(database)/documents/products/$(incoming().contextId)))
+        )
       );
       allow update: if isSignedIn() && (
         isAdmin() ||
@@ -541,7 +606,7 @@ service cloud.firestore {
       allow delete: if isAdmin();
     }
 
-    // 16. Chat Messages Collection (Strict privacy: Only participants can read messages; orphan messages blocked)
+    // 16. Chat Messages Collection (Strict privacy: Only participants can read messages; senderRole verified)
     match /messages/{messageId} {
       allow get, list: if isSignedIn() && (
         resource.data.senderId == request.auth.uid ||
@@ -552,6 +617,7 @@ service cloud.firestore {
       );
       allow create: if isActiveUser() &&
         incoming().senderId == request.auth.uid &&
+        (!('senderRole' in incoming()) || (incoming().senderRole != 'ADMIN' && incoming().senderRole != 'SUPER_ADMIN') || isAdmin()) &&
         incoming().text is string &&
         incoming().text.size() > 0 &&
         incoming().text.size() <= 2000 &&
@@ -562,14 +628,23 @@ service cloud.firestore {
       allow update, delete: if isAdmin();
     }
 
-    // 17. Delivery Drivers Fleet (Restricted to driver, assigned seller, or admin)
+    // 17. Delivery Drivers Fleet (V3-07 Driver shift status persistence allowed)
     match /drivers/{driverId} {
       allow get, list: if isSignedIn() && (
         isAdmin() ||
         request.auth.uid == driverId ||
         (resource.data.sellerId != null && resource.data.sellerId == request.auth.uid)
       );
-      allow write: if isAdmin();
+      allow create: if isAdmin();
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (
+          request.auth.uid == driverId &&
+          incoming().status in ['AVAILABLE', 'OFFLINE'] &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+        )
+      );
+      allow delete: if isAdmin();
     }
 
     // 18. Fleet Vehicles (Restricted to associated seller, driver, or admin)

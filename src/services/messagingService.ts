@@ -215,10 +215,18 @@ export const messagingService = {
       role: UserRole;
       avatar?: string;
     }[];
-    contextType: 'order' | 'booking' | 'product' | 'store' | 'general';
+    contextType: 'order' | 'booking' | 'product' | 'store' | 'general' | 'support';
     contextId?: string;
     contextTitle?: string;
   }): Promise<Conversation> {
+    // V3-06 Remediation: Require legitimate context linking
+    if (!['order', 'booking', 'product', 'store', 'general', 'support'].includes(params.contextType)) {
+      throw new Error('Invalid conversation context type');
+    }
+    if ((params.contextType === 'order' || params.contextType === 'booking' || params.contextType === 'product' || params.contextType === 'store') && !params.contextId) {
+      throw new Error(`Context ID is strictly required for ${params.contextType} conversations`);
+    }
+
     const list = loadConversations();
     // Normalize participantIds sorted
     const sortedIds = [...params.participantIds].sort();
@@ -256,13 +264,11 @@ export const messagingService = {
       unreadCount: {},
     };
 
+    // Authoritative Cloud Firestore write
+    await setDoc(doc(db, CONVERSATIONS_COLLECTION, id), cleanForFirestore(newConv));
+
     list.unshift(newConv);
     persistConversations(list);
-
-    // Persist to Cloud Firestore
-    setDoc(doc(db, CONVERSATIONS_COLLECTION, id), cleanForFirestore(newConv)).catch(err => {
-      console.warn('Could not write conversation to Firestore immediately:', err);
-    });
 
     return newConv;
   },
@@ -283,6 +289,12 @@ export const messagingService = {
     }
     if (text.length > 2000) {
       throw new Error('Message exceeds 2000 character limit');
+    }
+
+    // V3-06 Anti-Spoofing: Ensure caller does not forge admin identity without authorization
+    const currentUid = auth.currentUser?.uid;
+    if (currentUid && currentUid !== params.senderId) {
+      throw new Error('Unauthorized: Sender identity does not match authenticated user');
     }
 
     const convList = loadConversations();
@@ -322,6 +334,16 @@ export const messagingService = {
       updatedAt: now,
     };
 
+    // Authoritative Cloud Firestore write
+    await setDoc(doc(db, MESSAGES_COLLECTION, msgId), cleanForFirestore(newMsg));
+    await updateDoc(doc(db, CONVERSATIONS_COLLECTION, params.conversationId), cleanForFirestore({
+      lastMessage: text,
+      lastMessageAt: now,
+      lastSenderId: params.senderId,
+      unreadCount,
+      updatedAt: now,
+    }));
+
     convList[convIndex] = updatedConv;
     persistConversations(convList);
 
@@ -329,20 +351,6 @@ export const messagingService = {
     const localMsgs = loadMessages(params.conversationId);
     localMsgs.push(newMsg);
     persistMessages(params.conversationId, localMsgs);
-
-    // Write message & update conversation in Firestore
-    setDoc(doc(db, MESSAGES_COLLECTION, msgId), cleanForFirestore(newMsg)).catch(err => {
-      console.warn('Firestore message save error:', err);
-    });
-    updateDoc(doc(db, CONVERSATIONS_COLLECTION, params.conversationId), cleanForFirestore({
-      lastMessage: text,
-      lastMessageAt: now,
-      lastSenderId: params.senderId,
-      unreadCount,
-      updatedAt: now,
-    })).catch(err => {
-      console.warn('Firestore conversation update error:', err);
-    });
 
     // Trigger Notification for recipients
     recipientIds.forEach(rId => {

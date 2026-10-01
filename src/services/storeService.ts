@@ -10,22 +10,40 @@ const STORES_COLLECTION = 'stores';
 
 let memoryStores: Store[] = [];
 
+function isProductionEnvironment(): boolean {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'production') return true;
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.PROD) return true;
+  return false;
+}
+
 function initStores(): Store[] {
   if (memoryStores.length > 0) return memoryStores;
-  if (typeof window === 'undefined') return seedStores;
+  if (typeof window === 'undefined') {
+    return isProductionEnvironment() ? [] : seedStores;
+  }
   try {
     const raw = localStorage.getItem(STORES_STORAGE_KEY);
     if (!raw) {
+      if (isProductionEnvironment()) {
+        memoryStores = [];
+        return [];
+      }
       localStorage.setItem(STORES_STORAGE_KEY, JSON.stringify(seedStores));
       memoryStores = seedStores;
       return seedStores;
     }
-    memoryStores = JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (isProductionEnvironment()) {
+      // In production, reject any stale synthetic seed stores
+      memoryStores = Array.isArray(parsed) ? parsed.filter((s: any) => !s.isSeedData) : [];
+      return memoryStores;
+    }
+    memoryStores = parsed;
     return memoryStores;
   } catch (err) {
     console.error('Failed to load stores from localStorage', err);
-    memoryStores = seedStores;
-    return seedStores;
+    memoryStores = isProductionEnvironment() ? [] : seedStores;
+    return memoryStores;
   }
 }
 
