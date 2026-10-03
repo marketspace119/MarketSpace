@@ -239,7 +239,7 @@ console.log('================================================================\n'
   });
 }
 
-// 12. v3_forensic_audit_suite
+// 13. v3_forensic_audit_suite
 {
   const output = execSync('npx tsx tests/v3_forensic_audit_suite.ts', { encoding: 'utf8' });
   const passes = (output.match(/\[PASS\]/g) || []).length;
@@ -254,6 +254,24 @@ console.log('================================================================\n'
     unverified: 0,
     category: 'RUNTIME VERIFIED',
     details: '10 forensic audit invariants (V3-01 to V3-10: lockfile CI, magic-bytes, disputes, bookings, reviews, messaging, drivers, ledger cursor, scalability, prod isolation)',
+  });
+}
+
+// 14. strict_final_repair_regression_suite
+{
+  const output = execSync('npx tsx tests/strict_final_repair_regression_suite.ts', { encoding: 'utf8' });
+  const passes = (output.match(/\|\s+[A-Z0-9_-]+\s+\|\s+PASS\s+\|/g) || []).length;
+  const fails = (output.match(/\|\s+[A-Z0-9_-]+\s+\|\s+FAIL\s+\|/g) || []).length;
+  suites.push({
+    suiteName: 'tests/strict_final_repair_regression_suite.ts',
+    command: 'npx tsx tests/strict_final_repair_regression_suite.ts',
+    total: passes + fails,
+    passed: passes,
+    failed: fails,
+    skipped: 0,
+    unverified: 0,
+    category: 'RUNTIME VERIFIED',
+    details: '33 strict repair regression invariants covering P0 account states, tokens, tenant isolation, and financial clamping',
   });
 }
 

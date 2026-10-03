@@ -54,6 +54,35 @@ export function isSubOrderEligibleForPayout(order: any, vo?: any): boolean {
 }
 
 /**
+ * Robustly calculates seller earnings from an eligible order.
+ * Strictly guarantees finite positive numeric output and prevents NaN arithmetic poisoning.
+ */
+export function calculateEarnedFromOrder(order: any, sellerId: string): number {
+  if (!order) return 0;
+  let earned = 0;
+  if (Array.isArray(order.vendorOrders) && order.vendorOrders.length > 0) {
+    order.vendorOrders.forEach((vo: any) => {
+      if (vo.sellerId === sellerId && isSubOrderEligibleForPayout(order, vo)) {
+        const itemEarned = typeof vo.sellerRevenue === 'number' && Number.isFinite(vo.sellerRevenue)
+          ? vo.sellerRevenue
+          : (Number(vo.subtotal ?? vo.total ?? 0) - Number(vo.commissionAmount || 0));
+        if (Number.isFinite(itemEarned) && itemEarned > 0) {
+          earned += itemEarned;
+        }
+      }
+    });
+  } else if ((order.sellerId === sellerId || (Array.isArray(order.sellerIds) && order.sellerIds.includes(sellerId))) && isSubOrderEligibleForPayout(order)) {
+    const itemEarned = typeof order.sellerRevenue === 'number' && Number.isFinite(order.sellerRevenue)
+      ? order.sellerRevenue
+      : (Number(order.subtotal ?? order.total ?? 0) - Number(order.platformCommission || 0));
+    if (Number.isFinite(itemEarned) && itemEarned > 0) {
+      earned += itemEarned;
+    }
+  }
+  return Number.isFinite(earned) ? Number(earned.toFixed(2)) : 0;
+}
+
+/**
  * Single Authoritative Financial Engine (Server-Side)
  * Computes exact earnings, refund commitments, payout commitments, and net available balance.
  * Fail-Closed: Throws on database query failure.
@@ -136,15 +165,7 @@ export async function calculateSellerFinancialSummary(
               currentProcessedDocIds.push(docId);
             }
 
-            if (Array.isArray(order.vendorOrders) && order.vendorOrders.length > 0) {
-              order.vendorOrders.forEach((vo: any) => {
-                if (vo.sellerId === sellerId && isSubOrderEligibleForPayout(order, vo)) {
-                  grossEarned += (vo.sellerRevenue ?? (vo.subtotal - (vo.commissionAmount || 0)));
-                }
-              });
-            } else if ((order.sellerId === sellerId || (Array.isArray(order.sellerIds) && order.sellerIds.includes(sellerId))) && isSubOrderEligibleForPayout(order)) {
-              grossEarned += (order.sellerRevenue ?? (order.subtotal - (order.platformCommission || 0)));
-            }
+            grossEarned += calculateEarnedFromOrder(order, sellerId);
           });
 
           currentCursor = deltaOrdersSnap.docs[deltaOrdersSnap.docs.length - 1];
@@ -175,15 +196,7 @@ export async function calculateSellerFinancialSummary(
               currentProcessedDocIds.push(docId);
             }
 
-            if (Array.isArray(order.vendorOrders) && order.vendorOrders.length > 0) {
-              order.vendorOrders.forEach((vo: any) => {
-                if (vo.sellerId === sellerId && isSubOrderEligibleForPayout(order, vo)) {
-                  grossEarned += (vo.sellerRevenue ?? (vo.subtotal - (vo.commissionAmount || 0)));
-                }
-              });
-            } else if ((order.sellerId === sellerId || (Array.isArray(order.sellerIds) && order.sellerIds.includes(sellerId))) && isSubOrderEligibleForPayout(order)) {
-              grossEarned += (order.sellerRevenue ?? (order.subtotal - (order.platformCommission || 0)));
-            }
+            grossEarned += calculateEarnedFromOrder(order, sellerId);
           });
         }
       }
@@ -256,15 +269,7 @@ export async function calculateSellerFinancialSummary(
             initDocIdsAtLatestTimestamp.push(docId);
           }
 
-          if (Array.isArray(order.vendorOrders) && order.vendorOrders.length > 0) {
-            order.vendorOrders.forEach((vo: any) => {
-              if (vo.sellerId === sellerId && isSubOrderEligibleForPayout(order, vo)) {
-                grossEarned += (vo.sellerRevenue ?? (vo.subtotal - (vo.commissionAmount || 0)));
-              }
-            });
-          } else if ((order.sellerId === sellerId || (Array.isArray(order.sellerIds) && order.sellerIds.includes(sellerId))) && isSubOrderEligibleForPayout(order)) {
-            grossEarned += (order.sellerRevenue ?? (order.subtotal - (order.platformCommission || 0)));
-          }
+          grossEarned += calculateEarnedFromOrder(order, sellerId);
         });
       }
 
@@ -322,16 +327,18 @@ export async function calculateSellerFinancialSummary(
     throw new Error('Database query failure while verifying earnings. Operation aborted (Fail-Closed).');
   }
 
-  grossEarned = Number(grossEarned.toFixed(2));
-  refundedAmount = Number(refundedAmount.toFixed(2));
-  pendingRefundAmount = Number(pendingRefundAmount.toFixed(2));
+  grossEarned = Number.isFinite(grossEarned) ? Number(grossEarned.toFixed(2)) : 0;
+  refundedAmount = Number.isFinite(refundedAmount) ? Number(refundedAmount.toFixed(2)) : 0;
+  pendingRefundAmount = Number.isFinite(pendingRefundAmount) ? Number(pendingRefundAmount.toFixed(2)) : 0;
   const totalRefundCommitment = Number((refundedAmount + pendingRefundAmount).toFixed(2));
-  settledPayout = Number(settledPayout.toFixed(2));
-  reservedPayout = Number(reservedPayout.toFixed(2));
+  settledPayout = Number.isFinite(settledPayout) ? Number(settledPayout.toFixed(2)) : 0;
+  reservedPayout = Number.isFinite(reservedPayout) ? Number(reservedPayout.toFixed(2)) : 0;
   const totalPayoutCommitment = Number((settledPayout + reservedPayout).toFixed(2));
 
   // 4. Formula: Available = grossEarned - (settled + pending refunds) - (settled + reserved payouts)
-  const availableBalance = Math.max(0, Number((grossEarned - totalRefundCommitment - totalPayoutCommitment).toFixed(2)));
+  const netEarnings = Math.max(0, grossEarned - totalRefundCommitment);
+  const rawBalance = netEarnings - totalPayoutCommitment;
+  const availableBalance = Number.isFinite(rawBalance) ? Math.max(0, Number(rawBalance.toFixed(2))) : 0;
 
   return {
     sellerId,
@@ -512,9 +519,10 @@ export async function processPayoutGateway(
       // Unified durable accounting: factor in in-flight refund reservations concurrently (OPEN-07)
       const combinedRefunds = Math.max(totalRefunds, totalRefundsReserved);
       const netEarned = Math.max(0, totalEarned - combinedRefunds);
-      const availableBalance = Math.max(0, netEarned - totalReservedOrPaid);
+      const rawBalance = netEarned - totalReservedOrPaid;
+      const availableBalance = Number.isFinite(rawBalance) ? Math.max(0, rawBalance) : 0;
 
-      if (amount > availableBalance + 0.001) {
+      if (!Number.isFinite(availableBalance) || amount > availableBalance + 0.001) {
         throw new Error(
           `قيمة السحب المطلوبة ($${amount.toFixed(2)}) تتجاوز الرصيد المتاح ($${availableBalance.toFixed(2)}). Requested payout amount exceeds verified available balance.`
         );

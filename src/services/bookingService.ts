@@ -79,11 +79,48 @@ export const bookingService = {
       throw new Error(`الموعد المطلوب (${data.date} في ${data.time}) محجوز مسبقاً لدى مقدم الخدمة. يرجى اختيار موعد آخر.`);
     }
 
+    // Production / Client: Delegate directly to trusted backend gateway (/api/bookings/create)
+    // Server enforces atomic slot reservation, active service check, and authoritative pricing
+    const currentUser = auth.currentUser;
+    if (currentUser) {
+      try {
+        const idToken = await currentUser.getIdToken();
+        const res = await fetch('/api/bookings/create', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({
+            serviceId: data.serviceId,
+            sellerId: data.sellerId,
+            date: data.date,
+            time: data.time,
+            customerName: data.customerName,
+            customerPhone: data.customerPhone,
+            notes: data.notes,
+          }),
+        });
+        const resData = await res.json();
+        if (!res.ok || !resData.success) {
+          throw new Error(resData.error || 'Failed to create booking');
+        }
+        const createdBooking: ServiceBooking = resData.booking;
+        const bookings = initBookings();
+        bookings.unshift(createdBooking);
+        persistLocal(bookings);
+        return createdBooking;
+      } catch (err: any) {
+        // Re-throw server errors directly
+        throw err;
+      }
+    }
+
     const cleanDate = (data.date || '').replace(/[^a-zA-Z0-9]/g, '-');
     const cleanTime = (data.time || '').replace(/[^a-zA-Z0-9]/g, '-');
     const slotId = `${data.sellerId}_${cleanDate}_${cleanTime}`;
 
-    // Authoritative Service verification
+    // Authoritative Service verification in local/test environment
     let authoritativePrice = data.price;
     try {
       const prodDoc = await getDoc(doc(db, 'products', data.serviceId));
@@ -113,42 +150,6 @@ export const bookingService = {
       status: 'requested',
       createdAt: new Date().toISOString(),
     };
-
-    // Atomic Slot Reservation & Booking Transaction (V3-04 Double-Booking Prevention)
-    try {
-      await runTransaction(db, async (t) => {
-        const slotRef = doc(db, 'booking_slots', slotId);
-        const slotSnap = await t.get(slotRef);
-        if (slotSnap.exists()) {
-          const slot = slotSnap.data();
-          if (slot?.status === 'booked' || slot?.status === 'confirmed' || slot?.status === 'requested') {
-            throw new Error(`الموعد المطلوب (${data.date} في ${data.time}) محجوز مسبقاً لدى مقدم الخدمة. يرجى اختيار موعد آخر.`);
-          }
-        }
-
-        t.set(slotRef, {
-          slotId,
-          sellerId: data.sellerId,
-          date: data.date,
-          time: data.time,
-          bookingId: newBooking.id,
-          customerId: data.customerId,
-          status: 'booked',
-          createdAt: newBooking.createdAt,
-        });
-
-        t.set(doc(db, BOOKINGS_COLLECTION, newBooking.id), cleanForFirestore(newBooking));
-      });
-    } catch (err: any) {
-      if (err.message?.includes('محجوز مسبقاً')) {
-        throw err;
-      }
-      if (typeof window === 'undefined' && (err?.message?.includes('PERMISSION_DENIED') || err?.code === 7 || err?.message?.includes('fetch failed') || err?.code === 'permission-denied')) {
-        console.warn('[BookingService:Notice] Test/offline environment notice:', err.message);
-      } else {
-        throw err;
-      }
-    }
 
     const bookings = initBookings();
     bookings.unshift(newBooking);

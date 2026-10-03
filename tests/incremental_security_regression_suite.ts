@@ -532,6 +532,7 @@ async function runIncrementalSecurityRegressionSuite() {
     await adminDb.collection('order_refund_locks').doc(orderId).delete();
     await adminDb.collection('seller_payout_locks').doc(FIXTURES.sellerA.uid).delete();
     await adminDb.collection('seller_ledgers').doc(FIXTURES.sellerA.uid).delete();
+    await adminDb.collection('seller_financial_ledgers').doc(FIXTURES.sellerA.uid).delete();
     const prevRefunds = await adminDb.collection('refundRequests').where('orderId', '==', orderId).get();
     for (const d of prevRefunds.docs) {
       await d.ref.delete();

@@ -2157,11 +2157,107 @@ async function runDeterministicAuditSuite() {
     });
   }
 
+  // --------------------------------------------------------------------------
+  // TEST-28: Authoritative NaN, Infinity, and Undefined-Derived Arithmetic Invariant (FIN-01)
+  // Verifies calculateEarnedFromOrder and payout balance guards against NaN/Infinity poisoning
+  // --------------------------------------------------------------------------
+  try {
+    const { calculateEarnedFromOrder } = await import('../server/payoutGateway');
+
+    // 1. Order with only total: 100 (missing subtotal and sellerRevenue)
+    const earned1 = calculateEarnedFromOrder(
+      { status: 'delivered', paymentStatus: 'paid', total: 100, sellerId: FIXTURE_USERS.sellerA.id },
+      FIXTURE_USERS.sellerA.id
+    );
+    assert.strictEqual(earned1, 100, 'Single order with total=100 must evaluate to 100');
+    assert.strictEqual(Number.isFinite(earned1), true, 'earned1 must be finite');
+
+    // 2. Order with completely undefined monetary values
+    const earned2 = calculateEarnedFromOrder(
+      { status: 'delivered', paymentStatus: 'paid', sellerId: FIXTURE_USERS.sellerA.id },
+      FIXTURE_USERS.sellerA.id
+    );
+    assert.strictEqual(earned2, 0, 'Order with undefined values must safely evaluate to 0');
+    assert.strictEqual(Number.isFinite(earned2), true, 'earned2 must be finite');
+
+    // 3. Malicious NaN inputs
+    const earned3 = calculateEarnedFromOrder(
+      { status: 'delivered', paymentStatus: 'paid', total: NaN, sellerRevenue: NaN, sellerId: FIXTURE_USERS.sellerA.id },
+      FIXTURE_USERS.sellerA.id
+    );
+    assert.strictEqual(earned3, 0, 'NaN input must evaluate to 0');
+    assert.strictEqual(Number.isFinite(earned3), true, 'earned3 must be finite');
+
+    // 4. Malicious Infinity inputs
+    const earned4 = calculateEarnedFromOrder(
+      { status: 'delivered', paymentStatus: 'paid', total: Infinity, sellerRevenue: Infinity, sellerId: FIXTURE_USERS.sellerA.id },
+      FIXTURE_USERS.sellerA.id
+    );
+    assert.strictEqual(earned4, 0, 'Infinity input must evaluate to 0');
+    assert.strictEqual(Number.isFinite(earned4), true, 'earned4 must be finite');
+
+    // 5. Multi-vendor order with missing subtotal
+    const earned5 = calculateEarnedFromOrder(
+      {
+        status: 'delivered',
+        paymentStatus: 'paid',
+        vendorOrders: [{
+          sellerId: FIXTURE_USERS.sellerA.id,
+          total: 80,
+          status: 'delivered',
+        }],
+      },
+      FIXTURE_USERS.sellerA.id
+    );
+    assert.strictEqual(earned5, 80, 'Vendor order without subtotal must fall back to total');
+    assert.strictEqual(Number.isFinite(earned5), true, 'earned5 must be finite');
+
+    const assertionExecuted =
+      earned1 === 100 &&
+      earned2 === 0 &&
+      earned3 === 0 &&
+      earned4 === 0 &&
+      earned5 === 80 &&
+      Number.isFinite(earned1) &&
+      Number.isFinite(earned2) &&
+      Number.isFinite(earned3) &&
+      Number.isFinite(earned4) &&
+      Number.isFinite(earned5);
+
+    assert(assertionExecuted, 'All 5 NaN and Infinity arithmetic invariants must hold');
+
+    recordTest({
+      id: 'TEST-28',
+      name: 'Authoritative NaN, Infinity, and Undefined-Derived Arithmetic Invariant (FIN-01)',
+      fixtureCreated: 'Orders with total-only, undefined, NaN, Infinity, and sub-order fallback payloads',
+      preconditionsVerified: true,
+      actionExecuted: 'Evaluated calculateEarnedFromOrder against NaN, Infinity, undefined, and fallback vectors',
+      expectedResult: 'All earnings strictly finite, NaN/Infinity neutralized to 0, total-only evaluated accurately',
+      actualResult: `earned1=${earned1}, earned2=${earned2}, earned3=${earned3}, earned4=${earned4}, earned5=${earned5}`,
+      assertionExecuted,
+      pass: true,
+      details: 'Strictly neutralizes NaN, Infinity, and undefined-derived arithmetic, guaranteeing finite positive seller earnings.',
+    });
+  } catch (err: any) {
+    recordTest({
+      id: 'TEST-28',
+      name: 'Authoritative NaN, Infinity, and Undefined-Derived Arithmetic Invariant (FIN-01)',
+      fixtureCreated: 'NaN / Infinity test orders',
+      preconditionsVerified: false,
+      actionExecuted: 'Evaluated calculateEarnedFromOrder',
+      expectedResult: 'Pass all invariants',
+      actualResult: err.message,
+      assertionExecuted: true,
+      pass: false,
+      details: err.message,
+    });
+  }
+
   // ==========================================
   // FINAL VERIFICATION & OUTPUT GENERATION
   // ==========================================
   console.log('================================================================');
-  console.log('AUDIT TEST RESULTS TABLE (27 DETERMINISTIC TESTS)');
+  console.log('AUDIT TEST RESULTS TABLE (28 DETERMINISTIC TESTS)');
   console.log('================================================================');
   console.log('| TEST ID | Status | Assertion Executed | Test Name | Verification Details |');
   console.log('|---------|--------|-------------------|-----------|----------------------|');
@@ -2180,11 +2276,11 @@ async function runDeterministicAuditSuite() {
   console.log(`FAILED: ${auditResults.length - passedCount}`);
   console.log('================================================================\n');
 
-  if (passedCount !== 27) {
-    console.error(`AUDIT SUITE FAILED: Only ${passedCount}/27 tests passed!`);
+  if (passedCount !== 28) {
+    console.error(`AUDIT SUITE FAILED: Only ${passedCount}/28 tests passed!`);
     process.exit(1);
   } else {
-    console.log('AUDIT SUITE PASSED: All 27 tests executed and verified with REAL assertions.');
+    console.log('AUDIT SUITE PASSED: All 28 tests executed and verified with REAL assertions.');
     process.exit(0);
   }
 }

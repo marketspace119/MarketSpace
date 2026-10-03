@@ -470,7 +470,7 @@ async function startServer() {
     try {
       const authHeader = req.headers.authorization;
       const caller = await requireAuthenticatedCaller(authHeader);
-      const { orderId, subOrderId, sellerId, sellerName, storeId, reason, description, evidenceUrls, requestedAction } = req.body || {};
+      const { orderId, subOrderId, sellerId: clientSellerId, reason, description, evidenceUrls, requestedAction } = req.body || {};
 
       if (!orderId || typeof orderId !== 'string') {
         return res.status(400).json({ success: false, error: 'orderId is required' });
@@ -481,7 +481,7 @@ async function startServer() {
 
       const adminDb = getAdminDb();
 
-      // Verify order exists and caller owns order
+      // 1. Authoritative Order Lookup and Ownership Verification
       const orderDoc = await adminDb.collection('orders').doc(orderId).get();
       if (!orderDoc.exists) {
         return res.status(404).json({ success: false, error: 'Referenced order not found' });
@@ -491,7 +491,51 @@ async function startServer() {
         return res.status(403).json({ success: false, error: 'Forbidden: You can only open disputes for your own orders' });
       }
 
-      // Check for active open disputes on this order
+      // 2. Authoritative Seller and Store Resolution (NEVER trust client-supplied sellerId/storeId)
+      let authoritativeSellerId = '';
+      let authoritativeStoreId: string | null = null;
+      let authoritativeSellerName = 'Merchant';
+
+      if (subOrderId && Array.isArray(orderData.vendorOrders) && orderData.vendorOrders.length > 0) {
+        const vo = orderData.vendorOrders.find((v: any) => v.subOrderId === subOrderId);
+        if (!vo) {
+          return res.status(400).json({ success: false, error: `Sub-order ${subOrderId} not found in this order` });
+        }
+        authoritativeSellerId = vo.sellerId;
+        authoritativeStoreId = vo.storeId || null;
+        authoritativeSellerName = vo.storeName || vo.sellerName || 'Merchant';
+      } else if (Array.isArray(orderData.vendorOrders) && orderData.vendorOrders.length === 1) {
+        const vo = orderData.vendorOrders[0];
+        authoritativeSellerId = vo.sellerId;
+        authoritativeStoreId = vo.storeId || null;
+        authoritativeSellerName = vo.storeName || vo.sellerName || 'Merchant';
+      } else if (Array.isArray(orderData.sellerIds) && orderData.sellerIds.length === 1) {
+        authoritativeSellerId = orderData.sellerIds[0];
+        authoritativeStoreId = (orderData.vendorStoreIds && orderData.vendorStoreIds[0]) || null;
+        authoritativeSellerName = orderData.storeName || 'Merchant';
+      } else if (Array.isArray(orderData.vendorOrders) && orderData.vendorOrders.length > 1) {
+        // Multi-vendor order: must disambiguate seller
+        if (clientSellerId) {
+          const matchingVo = orderData.vendorOrders.find((v: any) => v.sellerId === clientSellerId);
+          if (!matchingVo) {
+            return res.status(400).json({ success: false, error: 'Specified sellerId does not belong to any sub-order in this order' });
+          }
+          authoritativeSellerId = matchingVo.sellerId;
+          authoritativeStoreId = matchingVo.storeId || null;
+          authoritativeSellerName = matchingVo.storeName || matchingVo.sellerName || 'Merchant';
+        } else {
+          return res.status(400).json({ success: false, error: 'subOrderId or sellerId is required to identify the merchant on multi-vendor orders' });
+        }
+      } else {
+        authoritativeSellerId = (orderData.sellerIds && orderData.sellerIds[0]) || orderData.sellerId || '';
+        authoritativeStoreId = (orderData.vendorStoreIds && orderData.vendorStoreIds[0]) || orderData.storeId || null;
+      }
+
+      if (!authoritativeSellerId) {
+        return res.status(400).json({ success: false, error: 'Unable to authoritatively resolve seller for this order' });
+      }
+
+      // 3. Prevent duplicate active disputes for this order
       const existingSnap = await adminDb
         .collection('disputes')
         .where('orderId', '==', orderId)
@@ -510,9 +554,9 @@ async function startServer() {
         customerId: caller.uid,
         customerName: orderData.customerName || caller.email || 'Customer',
         customerPhone: orderData.phone || null,
-        sellerId: sellerId || (orderData.sellerIds && orderData.sellerIds[0]) || 'unknown_seller',
-        sellerName: sellerName || 'Merchant',
-        storeId: storeId || null,
+        sellerId: authoritativeSellerId,
+        sellerName: authoritativeSellerName,
+        storeId: authoritativeStoreId,
         reason: reason || 'other',
         description: description.trim().slice(0, 2000),
         evidenceUrls: Array.isArray(evidenceUrls) ? evidenceUrls.slice(0, 5) : [],
@@ -558,6 +602,20 @@ async function startServer() {
         return res.status(403).json({ success: false, error: 'Forbidden: You can only respond to disputes against your own store' });
       }
 
+      // Strict State Machine: Merchant can ONLY respond to OPEN disputes
+      if (['RESOLVED_REFUND', 'RESOLVED_REJECTED', 'CLOSED'].includes(dispute.status)) {
+        return res.status(409).json({
+          success: false,
+          error: `Cannot respond to dispute: dispute is already in terminal state (${dispute.status})`,
+        });
+      }
+      if (dispute.status !== 'OPEN') {
+        return res.status(409).json({
+          success: false,
+          error: `Only OPEN disputes can be responded to. Current status: ${dispute.status}`,
+        });
+      }
+
       const now = new Date().toISOString();
       const updateData = {
         status: 'SELLER_RESPONDED',
@@ -595,12 +653,6 @@ async function startServer() {
 
       const adminDb = getAdminDb();
       const disputeRef = adminDb.collection('disputes').doc(disputeId);
-      const disputeSnap = await disputeRef.get();
-      if (!disputeSnap.exists) {
-        return res.status(404).json({ success: false, error: 'Dispute not found' });
-      }
-      const dispute = disputeSnap.data() as any;
-
       const now = new Date().toISOString();
       const finalStatus = actionTaken === 'REFUND_APPROVED' ? 'RESOLVED_REFUND' : 'RESOLVED_REJECTED';
       const resolution = {
@@ -611,29 +663,63 @@ async function startServer() {
         refundAmount: Number(refundAmount) || 0,
       };
 
-      await disputeRef.update({
-        status: finalStatus,
-        adminResolution: resolution,
-        updatedAt: now,
-      });
+      // Atomic Transaction: Dispute resolution AND order state mutation execute atomically (Fail-Closed, zero swallowed errors)
+      const updatedDispute = await adminDb.runTransaction(async (transaction) => {
+        const disputeSnap = await transaction.get(disputeRef);
+        if (!disputeSnap.exists) {
+          const err = new Error('Dispute not found') as any;
+          err.statusCode = 404;
+          throw err;
+        }
+        const disputeData = disputeSnap.data() as any;
 
-      if (actionTaken === 'REFUND_APPROVED' && dispute.orderId) {
-        await adminDb.collection('orders').doc(dispute.orderId).update({
-          refundStatus: 'approved',
-          refundAmount: Number(refundAmount) || 0,
+        // Terminal State Protection: Resolved or closed disputes CANNOT be re-resolved
+        if (['RESOLVED_REFUND', 'RESOLVED_REJECTED', 'CLOSED'].includes(disputeData.status)) {
+          const err = new Error(`Dispute is already resolved (${disputeData.status}) and cannot be re-resolved.`) as any;
+          err.statusCode = 409;
+          throw err;
+        }
+
+        if (!['OPEN', 'SELLER_RESPONDED'].includes(disputeData.status)) {
+          const err = new Error(`Invalid dispute transition from ${disputeData.status}`) as any;
+          err.statusCode = 400;
+          throw err;
+        }
+
+        // If refund approved, atomically update order state within the same transaction (NO .catch(() => {}))
+        if (actionTaken === 'REFUND_APPROVED' && disputeData.orderId) {
+          const orderRef = adminDb.collection('orders').doc(disputeData.orderId);
+          const orderSnap = await transaction.get(orderRef);
+          if (!orderSnap.exists) {
+            const err = new Error(`Associated order #${disputeData.orderId} not found in database. Resolution aborted.`) as any;
+            err.statusCode = 404;
+            throw err;
+          }
+          transaction.update(orderRef, {
+            refundStatus: 'approved',
+            refundAmount: Number(refundAmount) || 0,
+            updatedAt: now,
+          });
+        }
+
+        transaction.update(disputeRef, {
+          status: finalStatus,
+          adminResolution: resolution,
           updatedAt: now,
-        }).catch(() => {});
-      }
+        });
+
+        return { ...disputeData, status: finalStatus, adminResolution: resolution, updatedAt: now };
+      });
 
       return res.status(200).json({
         success: true,
-        dispute: { ...dispute, status: finalStatus, adminResolution: resolution, updatedAt: now },
+        dispute: updatedDispute,
       });
     } catch (err: any) {
       console.error('[API /api/disputes/resolve] Error:', err.message);
       const isForbidden = err.message?.includes('Forbidden');
       const isAuth = err.message?.includes('Authentication');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      const statusCode = err.statusCode || (isForbidden ? 403 : isAuth ? 401 : 400);
       return res.status(statusCode).json({
         success: false,
         error: err.message || 'Failed to resolve dispute',
