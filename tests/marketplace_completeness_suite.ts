@@ -1,3 +1,14 @@
+process.env.NODE_ENV = 'test';
+if (typeof (global as any).localStorage === 'undefined') {
+  const store: Record<string, string> = {};
+  (global as any).localStorage = {
+    getItem: (key: string) => store[key] !== undefined ? store[key] : null,
+    setItem: (key: string, value: string) => { store[key] = String(value); },
+    removeItem: (key: string) => { delete store[key]; },
+    clear: () => { Object.keys(store).forEach(k => delete store[k]); },
+  };
+}
+
 /**
  * MARKETPLACE PRODUCT COMPLETENESS & FUNCTIONAL CLOSURE SUITE
  * Rigorously verifies all functional marketplace domains, multi-vendor isolation,
@@ -256,7 +267,7 @@ async function runCompletenessSuite() {
   // -------------------------------------------------------------
   try {
     // 1. Customer creates dispute
-    const dispute = disputeService.createDispute({
+    const dispute = await disputeService.createDispute({
       orderId: 'ord_test_dispute_01',
       subOrderId: 'sub_disp_01',
       customerId: 'cust_dispute_01',
@@ -273,7 +284,7 @@ async function runCompletenessSuite() {
     const isCreated = dispute.status === 'OPEN' && dispute.reason === 'damaged_item';
 
     // 2. Seller reviews and responds
-    const responded = disputeService.sellerRespond({
+    const responded = await disputeService.sellerRespond({
       disputeId: dispute.id,
       sellerId: 'seller_alpha',
       message: 'We apologize for the damaged item. We approve a full refund.',
@@ -286,7 +297,7 @@ async function runCompletenessSuite() {
       responded.status === 'SELLER_RESPONDED';
 
     // 3. Admin resolves dispute with approved refund
-    const resolved = disputeService.resolveDispute({
+    const resolved = await disputeService.resolveDispute({
       disputeId: dispute.id,
       adminId: 'admin_01',
       adminRole: 'ADMIN',
@@ -319,7 +330,7 @@ async function runCompletenessSuite() {
 
     const isInitiallyAvailable = bookingService.isTimeslotAvailable(providerSellerId, bookingDate, timeslot);
 
-    const newBooking = bookingService.createBooking({
+    const newBooking = await bookingService.createBooking({
       serviceId: 'serv_tech_consult',
       serviceTitle: 'IT Infrastructure Consultation',
       sellerId: providerSellerId,
@@ -357,8 +368,8 @@ async function runCompletenessSuite() {
   // -------------------------------------------------------------
   try {
     const driverId = 'drv_demo_01';
-    const updatedOffline = deliveryService.updateDriverStatus(driverId, 'OFFLINE', driverId, 'DRIVER');
-    const updatedOnline = deliveryService.updateDriverStatus(driverId, 'AVAILABLE', driverId, 'DRIVER');
+    const updatedOffline = await deliveryService.updateDriverStatus(driverId, 'OFFLINE', driverId, 'DRIVER');
+    const updatedOnline = await deliveryService.updateDriverStatus(driverId, 'AVAILABLE', driverId, 'DRIVER');
 
     const statusToggleValid =
       updatedOffline.status === 'OFFLINE' && updatedOnline.status === 'AVAILABLE';

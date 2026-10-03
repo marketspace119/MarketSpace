@@ -75,6 +75,10 @@ export const bookingService = {
   },
 
   async createBooking(data: Omit<ServiceBooking, 'id' | 'bookingCode' | 'createdAt' | 'status'>): Promise<ServiceBooking> {
+    if (!this.isTimeslotAvailable(data.sellerId, data.date, data.time)) {
+      throw new Error(`الموعد المطلوب (${data.date} في ${data.time}) محجوز مسبقاً لدى مقدم الخدمة. يرجى اختيار موعد آخر.`);
+    }
+
     const cleanDate = (data.date || '').replace(/[^a-zA-Z0-9]/g, '-');
     const cleanTime = (data.time || '').replace(/[^a-zA-Z0-9]/g, '-');
     const slotId = `${data.sellerId}_${cleanDate}_${cleanTime}`;

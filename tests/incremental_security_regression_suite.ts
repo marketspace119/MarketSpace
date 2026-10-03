@@ -608,7 +608,8 @@ async function runIncrementalSecurityRegressionSuite() {
         sellerToken
       );
     } catch (err: any) {
-      if (err.message.includes('exceeds verified available balance')) {
+      console.log('INC-05 PAYOUT CAUGHT ERROR:', err?.message || err);
+      if (err.message.includes('exceeds verified available balance') || err.message.includes('Requested payout amount exceeds verified available balance')) {
         payoutDoubleExecutionBlocked = true;
       }
     }

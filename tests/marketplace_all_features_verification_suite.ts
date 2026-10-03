@@ -125,11 +125,12 @@ async function runComprehensiveVerification() {
     await orderService.updateOrderStatus(deliveredOrder.orderId, 'delivered', 'admin_sys', 'ADMIN', 'Order completed');
 
     const hasPurchased = orderService.hasUserPurchased('cust_e2e_beta', targetProduct.id);
-    const productReview = reviewService.addReview({
+    const productReview = await reviewService.addReview({
       targetType: 'product',
       targetId: targetProduct.id,
       userId: 'cust_e2e_beta',
       userName: 'Hodan Nur',
+      orderId: deliveredOrder.orderId,
       rating: 5,
       comment: 'Excellent product, arrived fast and works perfectly!',
     });
@@ -253,8 +254,8 @@ async function runComprehensiveVerification() {
     deliveryService.resetMemoryState();
     // 3.1 Driver Shift Availability
     const driverId = 'drv_demo_01';
-    const offlineDriver = deliveryService.updateDriverStatus(driverId, 'OFFLINE', 'admin_sys', 'ADMIN');
-    const onlineDriver = deliveryService.updateDriverStatus(driverId, 'AVAILABLE', driverId, 'DRIVER');
+    const offlineDriver = await deliveryService.updateDriverStatus(driverId, 'OFFLINE', 'admin_sys', 'ADMIN');
+    const onlineDriver = await deliveryService.updateDriverStatus(driverId, 'AVAILABLE', driverId, 'DRIVER');
     assert(offlineDriver.status === 'OFFLINE' && onlineDriver.status === 'AVAILABLE', 'DRV-01', 'Driver toggles shift availability between OFFLINE and AVAILABLE');
 
     // 3.2 Delivery Assignment
@@ -343,7 +344,7 @@ async function runComprehensiveVerification() {
     assert(availableSlots.length > 0 && availableSlots.includes('10:00'), 'SRV-01', 'Available service booking timeslots generated without conflicts');
 
     // 4.2 Customer Creates Booking
-    const booking = bookingService.createBooking({
+    const booking = await bookingService.createBooking({
       serviceId: 'srv_ac_repair',
       serviceTitle: 'صيانة وتكييف تبريد',
       storeId: 'store_service_01',
@@ -362,7 +363,7 @@ async function runComprehensiveVerification() {
     // 4.3 Double-Booking Prevention
     let doubleBookingBlocked = false;
     try {
-      bookingService.createBooking({
+      await bookingService.createBooking({
         serviceId: 'srv_ac_repair',
         serviceTitle: 'صيانة وتكييف تبريد',
         storeId: 'store_service_01',
@@ -398,11 +399,12 @@ async function runComprehensiveVerification() {
     assert(inProgBooking.status === 'in_progress' && completedBooking.status === 'completed', 'SRV-05', 'Provider transitions booking to in_progress and completed');
 
     // 4.6 Customer Reviews Service Provider
-    const serviceReview = reviewService.addReview({
+    const serviceReview = await reviewService.addReview({
       targetType: 'service',
       targetId: 'store_service_01',
       userId: 'cust_serv_01',
       userName: 'Ali Duale',
+      bookingId: booking.id,
       rating: 5,
       comment: 'Arrived promptly and fixed the cooling unit cleanly. Highly recommended!',
     });
@@ -434,7 +436,7 @@ async function runComprehensiveVerification() {
     }
 
     // 5.3 Dispute Resolution
-    const disp = disputeService.createDispute({
+    const disp = await disputeService.createDispute({
       orderId: 'ord_adm_test',
       customerId: 'cust_disp_adm',
       customerName: 'Dahir Shire',
@@ -444,7 +446,7 @@ async function runComprehensiveVerification() {
       description: 'Received wrong color item',
       requestedAction: 'replacement',
     });
-    const resolvedDisp = disputeService.resolveDispute({
+    const resolvedDisp = await disputeService.resolveDispute({
       disputeId: disp.id,
       adminId: 'admin_01',
       adminRole: 'ADMIN',

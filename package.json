@@ -52,6 +52,11 @@
   "overrides": {
     "@grpc/grpc-js": "^1.14.0",
     "@opentelemetry/core": "^2.8.0",
+    "basic-ftp": "^6.2.1",
+    "braces": "^3.0.3",
+    "chokidar": {
+      "braces": "^3.0.3"
+    },
     "qs": "^6.16.0",
     "uuid": "^11.1.1"
   }

@@ -28,6 +28,13 @@ export interface SellerFinancialSummary {
  *    - order.status must be 'delivered' or 'completed'
  * Pre-delivery states (pending, confirmed, processing, preparing, shipped, out_for_delivery) are NOT payout-eligible.
  */
+function applyQueryLimit(q: any, limitCount: number): any {
+  if (q && typeof q.limit === 'function') {
+    return q.limit(limitCount);
+  }
+  return q;
+}
+
 export function isSubOrderEligibleForPayout(order: any, vo?: any): boolean {
   if (!order) return false;
   const pStatus = (order.paymentStatus || '').toLowerCase();
@@ -185,25 +192,29 @@ export async function calculateSellerFinancialSummary(
         currentProcessedDocIds = Array.from(new Set([...previouslyReconciledDocIds, ...currentProcessedDocIds]));
       }
 
-      // 2. Complete active in-flight refunds query (OPEN-05)
-      const activeRefundsSnap = await adminDb
-        .collection('refundRequests')
-        .where('sellerId', '==', sellerId)
-        .where('status', 'in', ['REFUND_REQUESTED', 'REFUND_APPROVED', 'pending'])
-        .get();
+      // 2. Complete active in-flight refunds query (OPEN-05, FIN-02)
+      const activeRefundsSnap = await applyQueryLimit(
+        adminDb
+          .collection('refundRequests')
+          .where('sellerId', '==', sellerId)
+          .where('status', 'in', ['REFUND_REQUESTED', 'REFUND_APPROVED', 'pending']),
+        200
+      ).get();
 
       if (!activeRefundsSnap.empty) {
-        activeRefundsSnap.forEach((doc) => {
+        activeRefundsSnap.forEach((doc: any) => {
           pendingRefundAmount += (Number(doc.data().amount) || 0);
         });
       }
 
-      // 3. Complete active in-flight payouts query (OPEN-05)
-      const activePayoutsSnap = await adminDb
-        .collection('payoutRequests')
-        .where('sellerId', '==', sellerId)
-        .where('status', 'in', ['pending', 'approved'])
-        .get();
+      // 3. Complete active in-flight payouts query (OPEN-05, FIN-02)
+      const activePayoutsSnap = await applyQueryLimit(
+        adminDb
+          .collection('payoutRequests')
+          .where('sellerId', '==', sellerId)
+          .where('status', 'in', ['pending', 'approved']),
+        200
+      ).get();
 
       if (!activePayoutsSnap.empty) {
         activePayoutsSnap.forEach((doc) => {
@@ -257,13 +268,15 @@ export async function calculateSellerFinancialSummary(
         });
       }
 
-      const refundsSnap = await adminDb
-        .collection('refundRequests')
-        .where('sellerId', '==', sellerId)
-        .get();
+      const refundsSnap = await applyQueryLimit(
+        adminDb
+          .collection('refundRequests')
+          .where('sellerId', '==', sellerId),
+        200
+      ).get();
 
       if (!refundsSnap.empty) {
-        refundsSnap.forEach((doc) => {
+        refundsSnap.forEach((doc: any) => {
           const ref = doc.data();
           const amt = Number(ref.amount) || 0;
           if (ref.status === 'REFUNDED') {
@@ -274,10 +287,12 @@ export async function calculateSellerFinancialSummary(
         });
       }
 
-      const payoutsSnap = await adminDb
-        .collection('payoutRequests')
-        .where('sellerId', '==', sellerId)
-        .get();
+      const payoutsSnap = await applyQueryLimit(
+        adminDb
+          .collection('payoutRequests')
+          .where('sellerId', '==', sellerId),
+        200
+      ).get();
 
       if (!payoutsSnap.empty) {
         payoutsSnap.forEach((doc) => {
@@ -348,6 +363,9 @@ export async function getSellerFinancialSummaryGateway(
   }
 
   const caller = await requireAuthenticatedCaller(authHeader);
+  if (!caller.emailVerified) {
+    throw new Error('Forbidden: Access to financial statements requires a verified email address');
+  }
   const isPlatformAdmin = caller.isPlatformAdmin;
   if (!isPlatformAdmin && caller.uid !== sellerId) {
     throw new Error('Forbidden: You can only view financial summary for your own seller account');
@@ -398,6 +416,11 @@ export async function processPayoutGateway(
   const caller = await requireAuthenticatedCaller(authHeader);
   const callerUid = caller.uid;
   const isPlatformAdmin = caller.isPlatformAdmin;
+
+  // SEC-01: Financial operations (payouts) strictly require verified email
+  if (!caller.emailVerified) {
+    throw new Error('Forbidden: Payout requests strictly require a verified email address');
+  }
 
   // Anti-Spoofing: Caller must be the seller or a platform admin
   const targetSellerId = (payload.sellerId || callerUid).trim();
@@ -457,74 +480,11 @@ export async function processPayoutGateway(
       console.warn('[PayoutGateway] Could not read store doc for storeName:', e);
     }
 
-    // 3. Authoritative Balance Verification via Firestore Admin (Strict Fail-Closed)
-    let totalEarned = 0;
-    try {
-      const ordersSnap = await adminDb
-        .collection('orders')
-        .where('sellerIds', 'array-contains', sellerId)
-        .get();
-
-      if (!ordersSnap.empty) {
-        ordersSnap.forEach((doc) => {
-          const order = doc.data();
-          if (Array.isArray(order.vendorOrders) && order.vendorOrders.length > 0) {
-            order.vendorOrders.forEach((vo: any) => {
-              if (vo.sellerId === sellerId && isSubOrderEligibleForPayout(order, vo)) {
-                totalEarned += (vo.sellerRevenue ?? (vo.subtotal - (vo.commissionAmount || 0)));
-              }
-            });
-          } else if (order.sellerId === sellerId && isSubOrderEligibleForPayout(order)) {
-            totalEarned += (order.sellerRevenue ?? (order.subtotal - (order.platformCommission || 0)));
-          }
-        });
-      }
-    } catch (err: any) {
-      console.error('[PayoutGateway:Error] Failed to read orders for balance calculation:', err);
-      throw new Error('Database query failure while verifying earnings. Transaction aborted (Fail-Closed).');
-    }
-
-    // Deduct settled, approved, and in-flight pending refunds for this seller
-    let totalRefunds = 0;
-    try {
-      const refundsSnap = await adminDb
-        .collection('refundRequests')
-        .where('sellerId', '==', sellerId)
-        .get();
-
-      if (!refundsSnap.empty) {
-        refundsSnap.forEach((doc) => {
-          const ref = doc.data();
-          if (['REFUNDED', 'REFUND_APPROVED', 'REFUND_REQUESTED', 'pending'].includes(ref.status)) {
-            totalRefunds += (Number(ref.amount) || 0);
-          }
-        });
-      }
-    } catch (err: any) {
-      console.error('[PayoutGateway:Error] Failed to read refunds for balance calculation:', err);
-      throw new Error('Database query failure while verifying refunds. Transaction aborted (Fail-Closed).');
-    }
-
-    // Query existing historical payouts baseline prior to transaction (P1-12)
-    let baselineHistoricalReservedOrPaid = 0;
-    try {
-      const payoutsSnap = await adminDb
-        .collection('payoutRequests')
-        .where('sellerId', '==', sellerId)
-        .get();
-
-      if (!payoutsSnap.empty) {
-        payoutsSnap.forEach((doc) => {
-          const p = doc.data();
-          if (['pending', 'approved', 'processed', 'paid'].includes(p.status)) {
-            baselineHistoricalReservedOrPaid += (Number(p.amount) || 0);
-          }
-        });
-      }
-    } catch (err: any) {
-      console.error('[PayoutGateway:Error] Failed to read historical payouts baseline:', err);
-      throw new Error('Database query failure while verifying payouts. Operation aborted (Fail-Closed).');
-    }
+    // 3. Authoritative Balance Verification via Single Authoritative Engine (FIN-01, FIN-02)
+    const summary = await calculateSellerFinancialSummary(sellerId, adminDb);
+    const totalEarned = summary.grossEarned;
+    const totalRefunds = summary.totalRefundCommitment;
+    const baselineHistoricalReservedOrPaid = summary.totalPayoutCommitment;
 
     // PART 5: Atomic Payout Reservation using Firestore Transaction on seller lock
     const payoutId = `payout_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
