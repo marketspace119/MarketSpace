@@ -341,21 +341,26 @@ export async function runLiveProductionValidationSuite() {
       const custAStorage = custAContext.storage();
       const custBStorage = custBContext.storage();
 
-      // Customer A uploads valid PNG avatar
       const validPng = Buffer.from([
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
         0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
       ]);
-      await assertSucceeds(uploadBytes(ref(custAStorage, 'users/user_cust_a/avatar.png'), validPng, { contentType: 'image/png' }));
 
-      // Customer B attempting to overwrite Customer A's avatar
+      // Direct untrusted client upload is blocked (V3-02 Gateway Enforcement)
+      await assertFails(uploadBytes(ref(custAStorage, 'users/user_cust_a/avatar.png'), validPng, { contentType: 'image/png' }));
+
+      // Customer B attempting to overwrite Customer A's avatar is blocked
       await assertFails(uploadBytes(ref(custBStorage, 'users/user_cust_a/avatar.png'), validPng, { contentType: 'image/png' }));
 
-      // Customer B attempting to delete Customer A's avatar
+      // Admin-mediated upload succeeds
+      const adminStorage = adminContext.storage();
+      await assertSucceeds(uploadBytes(ref(adminStorage, 'users/user_cust_a/avatar.png'), validPng, { contentType: 'image/png' }));
+
+      // Customer B attempting to delete Customer A's avatar is blocked
       await assertFails(deleteObject(ref(custBStorage, 'users/user_cust_a/avatar.png')));
 
       pass = true;
-      errCode = 'PERMISSION_DENIED: User B blocked from writing or deleting User A avatar in storage';
+      errCode = 'PERMISSION_DENIED: Direct client writes blocked; cross-user deletion blocked; admin upload allowed';
     } catch (e: any) {
       errCode = e.message;
     }
@@ -380,17 +385,21 @@ export async function runLiveProductionValidationSuite() {
         0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
       ]);
 
-      // Seller A uploads product asset to their folder
-      await assertSucceeds(uploadBytes(ref(sellerAStorage, 'sellers/user_seller_a/products/shoe.png'), validPng, { contentType: 'image/png' }));
+      // Direct untrusted seller upload is blocked (V3-02 Gateway Enforcement)
+      await assertFails(uploadBytes(ref(sellerAStorage, 'sellers/user_seller_a/products/shoe.png'), validPng, { contentType: 'image/png' }));
 
-      // Seller B attempting to write to Seller A's directory
+      // Seller B attempting to write to Seller A's directory is blocked
       await assertFails(uploadBytes(ref(sellerBStorage, 'sellers/user_seller_a/products/shoe.png'), validPng, { contentType: 'image/png' }));
 
-      // Seller B attempting to delete Seller A's asset
+      // Admin-mediated upload succeeds
+      const adminStorage = adminContext.storage();
+      await assertSucceeds(uploadBytes(ref(adminStorage, 'sellers/user_seller_a/products/shoe.png'), validPng, { contentType: 'image/png' }));
+
+      // Seller B attempting to delete Seller A's asset is blocked
       await assertFails(deleteObject(ref(sellerBStorage, 'sellers/user_seller_a/products/shoe.png')));
 
       pass = true;
-      errCode = 'PERMISSION_DENIED: Seller B blocked from modifying or deleting Seller A assets in storage';
+      errCode = 'PERMISSION_DENIED: Direct client writes blocked; cross-seller deletion blocked; admin upload allowed';
     } catch (e: any) {
       errCode = e.message;
     }

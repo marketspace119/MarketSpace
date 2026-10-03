@@ -901,18 +901,25 @@ async function runIncrementalSecurityRegressionSuite() {
       })
     );
 
-    // Vector D: Verified purchase integrity in reviewService
-    // Customer B has NOT purchased prod_101 -> isVerifiedPurchase must be false
-    const unverifiedRev = reviewService.addReview({
-      targetType: 'product',
-      targetId: 'prod_unpurchased_999',
-      userId: FIXTURES.customerB.uid,
-      userName: 'Customer B',
-      rating: 4,
-      comment: 'Review without purchase history',
-      isVerifiedPurchase: true, // Attacker attempts to forge verified purchase status
-    });
-    assert.strictEqual(unverifiedRev.isVerifiedPurchase, false, 'Unpurchased product review cannot have isVerifiedPurchase: true');
+    // Vector D: Verified purchase integrity in reviewService (V3-05)
+    // Customer B has NOT purchased prod_unpurchased_999 -> must be strictly rejected
+    let unverifiedRejected = false;
+    try {
+      await reviewService.addReview({
+        targetType: 'product',
+        targetId: 'prod_unpurchased_999',
+        userId: FIXTURES.customerB.uid,
+        userName: 'Customer B',
+        rating: 4,
+        comment: 'Review without purchase history',
+        isVerifiedPurchase: true, // Attacker attempts to forge verified purchase status
+      } as any);
+    } catch (err: any) {
+      if (err.message.includes('Proof of purchase') || err.message.includes('Forbidden')) {
+        unverifiedRejected = true;
+      }
+    }
+    assert.strictEqual(unverifiedRejected, true, 'Unpurchased product review without valid proof must be rejected');
 
     // Verify existing review untouched
     let reviewSnap: any = null;
@@ -1091,7 +1098,7 @@ async function runIncrementalSecurityRegressionSuite() {
     );
 
     // Vector D: Competitor Seller B attempts to alter status of Seller A's booking in bookingService
-    const createdBooking = bookingService.createBooking({
+    const createdBooking = await bookingService.createBooking({
       serviceId: 'srv_consulting_01',
       serviceTitle: 'Consulting',
       price: 100,
@@ -1304,9 +1311,9 @@ async function runIncrementalSecurityRegressionSuite() {
     const productRootRef = ref(sellerBStorage, 'products/prod_101/banner.png');
     await assertFails(uploadBytes(productRootRef, validPngBuffer, { contentType: 'image/png' }));
 
-    // Vector D: Seller B uploading valid PNG to their own isolated path SUCCEEDS
-    const validSelfRef = ref(sellerBStorage, `sellers/${FIXTURES.sellerB.uid}/own_catalog.png`);
-    await assertSucceeds(uploadBytes(validSelfRef, validPngBuffer, { contentType: 'image/png' }));
+    // Vector D: Direct untrusted client write blocked by storage.rules (V3-02 Gateway Enforcement)
+    const directSelfRef = ref(sellerBStorage, `sellers/${FIXTURES.sellerB.uid}/own_catalog.png`);
+    await assertFails(uploadBytes(directSelfRef, validPngBuffer, { contentType: 'image/png' }));
     executed = true;
 
     recordTest({

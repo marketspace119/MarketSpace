@@ -418,9 +418,20 @@ async function runFinalClosurePass() {
     const seller1Context = testEnv.authenticatedContext(seller1Uid, { email: 'seller1@closure.test', email_verified: true });
     const sellerStorage = seller1Context.storage();
 
-    // Own directory valid upload succeeds
-    const goodRef = ref(sellerStorage, `sellers/${seller1Uid}/catalog.png`);
-    await assertSucceeds(uploadBytes(goodRef, Buffer.from([0x89, 0x50, 0x4E, 0x47]), { contentType: 'image/png' }));
+    // Direct untrusted client write blocked (V3-02 Gateway Enforcement)
+    const directRef = ref(sellerStorage, `sellers/${seller1Uid}/catalog.png`);
+    await assertFails(uploadBytes(directRef, Buffer.from([0x89, 0x50, 0x4E, 0x47]), { contentType: 'image/png' }));
+
+    // Admin-mediated upload succeeds
+    const superAdminContext = testEnv.authenticatedContext(superAdminUid, {
+      email: 'spacecompanies119@gmail.com',
+      email_verified: true,
+      admin: true,
+      role: 'SUPER_ADMIN',
+    });
+    const adminStorage = superAdminContext.storage();
+    const adminUploadRef = ref(adminStorage, `sellers/${seller1Uid}/catalog.png`);
+    await assertSucceeds(uploadBytes(adminUploadRef, Buffer.from([0x89, 0x50, 0x4E, 0x47]), { contentType: 'image/png' }));
 
     // Cross-seller directory write fails
     const badRef = ref(sellerStorage, `sellers/${seller2Uid}/stolen.png`);
