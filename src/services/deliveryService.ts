@@ -1,4 +1,4 @@
-import { collection, doc, getDoc, getDocs, setDoc, updateDoc, query, where } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, setDoc, updateDoc, query, where, limit } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import {
   DeliveryAssignment,
@@ -24,6 +24,7 @@ const VEHICLES_COLLECTION = 'vehicles';
 let memoryAssignments: DeliveryAssignment[] = [];
 let memoryDrivers: DriverProfile[] = [];
 let memoryVehicles: Vehicle[] = [];
+const activeAssignmentLocks = new Set<string>();
 
 // Seed Demo Drivers
 const INITIAL_DEMO_DRIVERS: DriverProfile[] = [
@@ -136,79 +137,61 @@ const INITIAL_DEMO_VEHICLES: Vehicle[] = [
   },
 ];
 
+function isProductionEnvironment(): boolean {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'production') return true;
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.PROD) return true;
+  return false;
+}
+
 function initAssignments(): DeliveryAssignment[] {
   if (memoryAssignments.length > 0) return memoryAssignments;
-  if (typeof localStorage === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(DELIVERY_STORAGE_KEY);
-    if (!raw) return [];
-    memoryAssignments = JSON.parse(raw);
-    return memoryAssignments;
-  } catch (err) {
-    console.error('Failed to load delivery assignments:', err);
-    return [];
-  }
+  // F-20: Do not read or trust localStorage for delivery assignment authority
+  return memoryAssignments;
 }
 
 function persistAssignments(items: DeliveryAssignment[]) {
   memoryAssignments = items;
-  if (typeof localStorage === 'undefined') return;
-  try {
-    localStorage.setItem(DELIVERY_STORAGE_KEY, JSON.stringify(items));
-  } catch (err) {
-    console.error('Failed to persist delivery assignments:', err);
-  }
+  // F-20: LocalStorage persistence removed for authoritative delivery assignments
 }
 
 function initDrivers(): DriverProfile[] {
   if (memoryDrivers.length > 0) return memoryDrivers;
-  if (typeof localStorage === 'undefined') return INITIAL_DEMO_DRIVERS;
-  try {
-    const raw = localStorage.getItem(DRIVERS_STORAGE_KEY);
-    if (!raw) {
-      persistDrivers(INITIAL_DEMO_DRIVERS);
-      return INITIAL_DEMO_DRIVERS;
-    }
-    memoryDrivers = JSON.parse(raw);
-    return memoryDrivers;
-  } catch (err) {
-    return INITIAL_DEMO_DRIVERS;
-  }
+  if (isProductionEnvironment()) return [];
+  // F-20: Do not read or trust localStorage for driver authority
+  memoryDrivers = [...INITIAL_DEMO_DRIVERS];
+  return memoryDrivers;
 }
 
 function persistDrivers(items: DriverProfile[]) {
   memoryDrivers = items;
-  if (typeof localStorage === 'undefined') return;
-  try {
-    localStorage.setItem(DRIVERS_STORAGE_KEY, JSON.stringify(items));
-  } catch (err) {
-    console.error('Failed to persist drivers:', err);
-  }
+  // F-20: LocalStorage persistence removed for authoritative drivers
 }
 
 function initVehicles(): Vehicle[] {
   if (memoryVehicles.length > 0) return memoryVehicles;
-  if (typeof window === 'undefined') return INITIAL_DEMO_VEHICLES;
-  try {
-    const raw = localStorage.getItem(VEHICLES_STORAGE_KEY);
-    if (!raw) {
-      persistVehicles(INITIAL_DEMO_VEHICLES);
-      return INITIAL_DEMO_VEHICLES;
-    }
-    memoryVehicles = JSON.parse(raw);
-    return memoryVehicles;
-  } catch (err) {
-    return INITIAL_DEMO_VEHICLES;
-  }
+  if (isProductionEnvironment()) return [];
+  // F-20: Do not read or trust localStorage for vehicle authority
+  memoryVehicles = [...INITIAL_DEMO_VEHICLES];
+  return memoryVehicles;
 }
 
 function persistVehicles(items: Vehicle[]) {
   memoryVehicles = items;
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(VEHICLES_STORAGE_KEY, JSON.stringify(items));
-  } catch (err) {
-    console.error('Failed to persist vehicles:', err);
+  // F-20: LocalStorage persistence removed for authoritative vehicles
+}
+
+async function persistDeliveryDocToFirestore(collectionName: string, docId: string, payload: Record<string, any>, merge = true): Promise<void> {
+  const cleanPayload = cleanForFirestore(payload);
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+    await setDoc(doc(db, collectionName, docId), cleanPayload, merge ? { merge: true } : {});
+  } else {
+    const serverAdminModule = '../../server/firebaseAdmin';
+    const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+    const adminDb = getAdminDb();
+    if (!adminDb) {
+      throw new Error(`Database write failure (Fail-Closed): Firestore Admin DB unavailable for ${collectionName}/${docId}`);
+    }
+    await adminDb.collection(collectionName).doc(docId).set(cleanPayload, merge ? { merge: true } : {});
   }
 }
 
@@ -257,15 +240,19 @@ export const deliveryService = {
     memoryAssignments = [...assignments];
   },
 
+  seedDrivers(drivers: DriverProfile[]) {
+    memoryDrivers = [...drivers];
+  },
+
   async syncWithFirestore(filter?: { sellerId?: string; customerId?: string; isAdmin?: boolean }): Promise<DeliveryAssignment[]> {
     try {
       let q;
       if (filter?.isAdmin) {
-        q = collection(db, DELIVERY_COLLECTION);
+        q = query(collection(db, DELIVERY_COLLECTION), limit(200));
       } else if (filter?.sellerId) {
-        q = query(collection(db, DELIVERY_COLLECTION), where('sellerId', '==', filter.sellerId));
+        q = query(collection(db, DELIVERY_COLLECTION), where('sellerId', '==', filter.sellerId), limit(200));
       } else if (filter?.customerId) {
-        q = query(collection(db, DELIVERY_COLLECTION), where('customerId', '==', filter.customerId));
+        q = query(collection(db, DELIVERY_COLLECTION), where('customerId', '==', filter.customerId), limit(200));
       }
 
       if (q) {
@@ -392,7 +379,7 @@ export const deliveryService = {
       metadata: { phone: newDriver.phone, status: newDriver.status },
     });
 
-    setDoc(doc(db, DRIVERS_COLLECTION, id), newDriver).catch(err => {
+    persistDeliveryDocToFirestore(DRIVERS_COLLECTION, id, newDriver, false).catch(err => {
       console.warn('Failed to save driver to Firestore:', err);
     });
 
@@ -417,26 +404,15 @@ export const deliveryService = {
 
     const now = new Date().toISOString();
 
-    // V3-07 Remediation: Update Firestore authoritatively.
-    // Drivers are strictly permitted to update status and updatedAt only.
-    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
-      await updateDoc(doc(db, DRIVERS_COLLECTION, driverId), {
+    // F-10: Update Firestore authoritatively FIRST (Strictly Fail-Closed).
+    try {
+      await persistDeliveryDocToFirestore(DRIVERS_COLLECTION, driverId, {
         status,
         updatedAt: now,
-      });
-    } else {
-      try {
-        await Promise.race([
-          updateDoc(doc(db, DRIVERS_COLLECTION, driverId), {
-            status,
-            updatedAt: now,
-          }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore write timeout')), 500)),
-        ]);
-      } catch (err: any) {
-        if (process.env.NODE_ENV !== 'test') throw err;
-        console.warn('[DriverStatus:Notice] Test/offline environment notice:', err?.message || err);
-      }
+      }, true);
+    } catch (err: any) {
+      handleFirestoreError(err, OperationType.UPDATE, `${DRIVERS_COLLECTION}/${driverId}`);
+      throw new Error(`Database write failure (Fail-Closed): Unable to update driver status in Firestore (${err?.message || err})`);
     }
 
     const drivers = initDrivers();
@@ -492,7 +468,7 @@ export const deliveryService = {
     vehicles.unshift(newVeh);
     persistVehicles(vehicles);
 
-    setDoc(doc(db, VEHICLES_COLLECTION, id), newVeh).catch(err => {
+    persistDeliveryDocToFirestore(VEHICLES_COLLECTION, id, newVeh, false).catch(err => {
       console.warn('Failed to save vehicle in Firestore:', err);
     });
 
@@ -570,117 +546,131 @@ export const deliveryService = {
     vehicleInfo?: string;
     actorId: string;
     actorRole: string;
+    allowReassign?: boolean;
   }): Promise<DeliveryAssignment> {
-    const assignments = initAssignments();
-    const index = assignments.findIndex(a => a.id === params.assignmentId);
-    if (index === -1) throw new Error('Delivery assignment not found');
-
-    const prev = assignments[index];
-    const isAdmin = params.actorRole === 'ADMIN' || params.actorRole === 'SUPER_ADMIN';
-    const isSeller = params.actorRole === 'SELLER' || params.actorRole === 'RESTAURANT';
-
-    // Anti-Cross-Seller Tampering Guard
-    if (isSeller && prev.sellerId !== params.actorId) {
-      throw new Error('Forbidden: You can only assign drivers to your own deliveries');
+    if (activeAssignmentLocks.has(params.assignmentId)) {
+      const conflictErr = new Error(`Conflict: Delivery assignment "${params.assignmentId}" is currently being modified by another concurrent request.`) as any;
+      conflictErr.statusCode = 409;
+      throw conflictErr;
     }
-    if (!isAdmin && !isSeller) {
-      throw new Error('Forbidden: Only authorized sellers or admins can assign drivers');
-    }
+    activeAssignmentLocks.add(params.assignmentId);
 
-    const now = new Date().toISOString();
-
-    // Section 7: Server-side driver existence, active status, and tenant authorization checks
-    let resolvedDriverName = params.driverName;
-    let resolvedDriverPhone = params.driverPhone;
-    let resolvedVehicleInfo = params.vehicleInfo;
-
-    if (params.driverId) {
-      const driver = this.getDriverById(params.driverId);
-      if (!driver) {
-        throw new Error(`Driver not found: Driver "${params.driverId}" does not exist in registry.`);
-      }
-      if (driver.status === 'OFFLINE' || driver.status === 'SUSPENDED') {
-        throw new Error(`Cannot assign driver with status ${driver.status}`);
-      }
-      if ((driver as any).sellerId && isSeller && (driver as any).sellerId !== params.actorId) {
-        throw new Error('Forbidden: Driver belongs to a different seller or organization');
-      }
-      // Authoritative population
-      resolvedDriverName = driver.name;
-      resolvedDriverPhone = driver.phone;
-      resolvedVehicleInfo = driver.plateNumber || driver.vehicleType || params.vehicleInfo;
-    }
-
-    const isReassignment = !!prev.assignedDriver && prev.assignedDriver !== resolvedDriverName;
-    const newStatus: DeliveryAssignmentStatus = resolvedDriverName ? 'ASSIGNED' : prev.status;
-
-    const updated: DeliveryAssignment = {
-      ...prev,
-      deliveryType: params.deliveryType,
-      driverId: params.driverId || prev.driverId,
-      assignedDriver: resolvedDriverName,
-      driverName: resolvedDriverName || undefined,
-      driverPhone: resolvedDriverPhone || prev.driverPhone,
-      vehicleInfo: resolvedVehicleInfo || prev.vehicleInfo,
-      status: newStatus,
-      timestamps: {
-        ...prev.timestamps,
-        assignedAt: resolvedDriverName ? now : prev.timestamps.assignedAt,
-      },
-      updatedAt: now,
-    };
-
-    // Await authoritative Firestore update first (Fail-Closed)
     try {
-      const payload = cleanForFirestore(updated);
-      if (typeof window === 'undefined') {
-        await Promise.race([
-          setDoc(doc(db, DELIVERY_COLLECTION, params.assignmentId), payload, { merge: true }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('PERMISSION_DENIED')), 100)),
-        ]);
-      } else {
-        await setDoc(doc(db, DELIVERY_COLLECTION, params.assignmentId), payload, { merge: true });
-      }
-    } catch (err: any) {
-      if (typeof window === 'undefined' && (err?.message?.includes('PERMISSION_DENIED') || err?.code === 7 || err?.message?.includes('fetch failed'))) {
-        // Fall back to memory in test environment
-      } else {
-        handleFirestoreError(err, OperationType.UPDATE, `${DELIVERY_COLLECTION}/${params.assignmentId}`);
-        throw err;
-      }
-    }
+      const assignments = initAssignments();
+      const index = assignments.findIndex(a => a.id === params.assignmentId);
+      if (index === -1) throw new Error('Delivery assignment not found');
 
-    // Only commit to local memory after Firestore write succeeds
-    assignments[index] = updated;
-    persistAssignments(assignments);
+      const prev = assignments[index];
+      const isAdmin = params.actorRole === 'ADMIN' || params.actorRole === 'SUPER_ADMIN';
+      const isSeller = params.actorRole === 'SELLER' || params.actorRole === 'RESTAURANT';
 
-    // Audit log
-    auditLogService.logAction({
-      actorId: params.actorId,
-      actorRole: params.actorRole as any,
-      action: isReassignment ? 'DELIVERY_REASSIGNED' : 'DELIVERY_ASSIGNED',
-      targetType: 'delivery',
-      targetId: params.assignmentId,
-      targetName: `Order ${prev.orderId}`,
-      metadata: {
-        driver: params.driverName,
+      // Terminal-state protection: Cannot assign/reassign drivers to DELIVERED or CANCELLED deliveries
+      if (prev.status === 'DELIVERED' || prev.status === 'CANCELLED') {
+        const termErr = new Error(`Conflict: Cannot assign driver to delivery in terminal state (${prev.status}).`) as any;
+        termErr.statusCode = 409;
+        throw termErr;
+      }
+
+      // Concurrent duplicate assignment protection unless explicit reassignment is requested (allowReassign === true)
+      if (prev.status === 'ASSIGNED' && prev.driverId && params.allowReassign !== true) {
+        const dupErr = new Error(`Conflict: Delivery "${params.assignmentId}" is already assigned to driver "${prev.driverId}".`) as any;
+        dupErr.statusCode = 409;
+        throw dupErr;
+      }
+
+      // Anti-Cross-Seller Tampering Guard
+      if (isSeller && prev.sellerId !== params.actorId) {
+        throw new Error('Forbidden: You can only assign drivers to your own deliveries');
+      }
+      if (!isAdmin && !isSeller) {
+        throw new Error('Forbidden: Only authorized sellers or admins can assign drivers');
+      }
+
+      const now = new Date().toISOString();
+
+      // Section 7: Server-side driver existence, active status, and tenant authorization checks
+      let resolvedDriverName = params.driverName;
+      let resolvedDriverPhone = params.driverPhone;
+      let resolvedVehicleInfo = params.vehicleInfo;
+
+      if (params.driverId) {
+        const driver = this.getDriverById(params.driverId);
+        if (!driver) {
+          throw new Error(`Driver not found: Driver "${params.driverId}" does not exist in registry.`);
+        }
+        if (driver.status === 'OFFLINE' || driver.status === 'SUSPENDED') {
+          throw new Error(`Cannot assign driver with status ${driver.status}`);
+        }
+        if ((driver as any).sellerId && isSeller && (driver as any).sellerId !== params.actorId) {
+          throw new Error('Forbidden: Driver belongs to a different seller or organization');
+        }
+        // Authoritative population
+        resolvedDriverName = driver.name;
+        resolvedDriverPhone = driver.phone;
+        resolvedVehicleInfo = driver.plateNumber || driver.vehicleType || params.vehicleInfo;
+      }
+
+      const isReassignment = !!prev.assignedDriver && prev.assignedDriver !== resolvedDriverName;
+      const newStatus: DeliveryAssignmentStatus = resolvedDriverName ? 'ASSIGNED' : prev.status;
+
+      const updated: DeliveryAssignment = {
+        ...prev,
         deliveryType: params.deliveryType,
-        previousDriver: prev.assignedDriver,
-      },
-    });
+        driverId: params.driverId || prev.driverId,
+        assignedDriver: resolvedDriverName,
+        driverName: resolvedDriverName || undefined,
+        driverPhone: resolvedDriverPhone || prev.driverPhone,
+        vehicleInfo: resolvedVehicleInfo || prev.vehicleInfo,
+        status: newStatus,
+        timestamps: {
+          ...prev.timestamps,
+          assignedAt: resolvedDriverName ? now : prev.timestamps.assignedAt,
+        },
+        updatedAt: now,
+      };
 
-    // Notify customer
-    if (updated.customerId && params.driverName) {
-      notificationService.notifyDeliveryEvent({
-        userId: updated.customerId,
-        orderId: updated.orderId,
-        eventType: 'DELIVERY_ASSIGNED',
-        driverName: params.driverName,
-        driverPhone: params.driverPhone,
+      // F-10: Await authoritative Firestore update FIRST (Strictly Fail-Closed, no memory fallback on failure)
+      try {
+        await persistDeliveryDocToFirestore(DELIVERY_COLLECTION, params.assignmentId, updated, true);
+      } catch (err: any) {
+        handleFirestoreError(err, OperationType.UPDATE, `${DELIVERY_COLLECTION}/${params.assignmentId}`);
+        throw new Error(`Database write failure (Fail-Closed): Unable to assign driver in Firestore (${err?.message || err})`);
+      }
+
+      // Only commit to local memory after Firestore write succeeds
+      assignments[index] = updated;
+      persistAssignments(assignments);
+
+      // Audit log
+      auditLogService.logAction({
+        actorId: params.actorId,
+        actorRole: params.actorRole as any,
+        action: isReassignment ? 'DELIVERY_REASSIGNED' : 'DELIVERY_ASSIGNED',
+        targetType: 'delivery',
+        targetId: params.assignmentId,
+        targetName: `Order ${prev.orderId}`,
+        metadata: {
+          driver: params.driverName,
+          deliveryType: params.deliveryType,
+          previousDriver: prev.assignedDriver,
+        },
       });
-    }
 
-    return updated;
+      // Notify customer
+      if (updated.customerId && params.driverName) {
+        notificationService.notifyDeliveryEvent({
+          userId: updated.customerId,
+          orderId: updated.orderId,
+          eventType: 'DELIVERY_ASSIGNED',
+          driverName: params.driverName,
+          driverPhone: params.driverPhone,
+        });
+      }
+
+      return updated;
+    } finally {
+      activeAssignmentLocks.delete(params.assignmentId);
+    }
   },
 
   /**
@@ -701,200 +691,215 @@ export const deliveryService = {
       recipientConfirmation?: string;
     };
   }): Promise<DeliveryAssignment> {
-    const assignments = initAssignments();
-    const index = assignments.findIndex(a => a.id === params.assignmentId);
-    if (index === -1) throw new Error('Delivery assignment not found');
-
-    const prev = assignments[index];
-    const currentNorm = normalizeDeliveryStatus(prev.status);
-    const targetNorm = normalizeDeliveryStatus(params.status);
-
-    // Strict Authorization Rules
-    const isCustomer = params.actorRole === 'CUSTOMER';
-    const isAdmin = params.actorRole === 'ADMIN' || params.actorRole === 'SUPER_ADMIN';
-    const isSeller = params.actorRole === 'SELLER' || params.actorRole === 'RESTAURANT';
-    const isDriver = params.actorRole === 'DRIVER';
-
-    if (isCustomer) {
-      throw new Error('Customers do not have authority to alter delivery operational status');
+    if (activeAssignmentLocks.has(params.assignmentId)) {
+      const conflictErr = new Error(`Conflict: Delivery assignment "${params.assignmentId}" is currently being modified by another concurrent request.`) as any;
+      conflictErr.statusCode = 409;
+      throw conflictErr;
     }
+    activeAssignmentLocks.add(params.assignmentId);
 
-    if (!isAdmin && !isSeller && !isDriver) {
-      throw new Error('Unauthorized: You do not have permissions to modify delivery status');
-    }
-
-    // Anti-Cross-Seller Tampering Guard
-    if (isSeller && prev.sellerId !== params.actorId) {
-      throw new Error('Forbidden: You can only update delivery status for your own store shipments');
-    }
-
-    // Driver isolation and capability guard
-    if (isDriver) {
-      const isAssigned =
-        prev.driverId === params.actorId ||
-        prev.assignedDriver === params.actorId ||
-        (prev.driverName && prev.driverName.toLowerCase().includes(params.actorId.toLowerCase()));
-      if (!isAssigned) {
-        throw new Error('Forbidden: You can only update deliveries that are assigned to you');
-      }
-      const allowedForDriver = ['PICKED_UP', 'OUT_FOR_DELIVERY', 'DELIVERED', 'FAILED'];
-      if (!allowedForDriver.includes(targetNorm)) {
-        throw new Error(`Drivers can only update transit and completion statuses (${allowedForDriver.join(', ')})`);
-      }
-    }
-
-    // Role lifecycle capability checks
-    if (!isAdmin) {
-      if (isSeller) {
-        const allowedForSeller = ['PREPARING', 'READY', 'CANCELLED'];
-        if (
-          prev.deliveryType === 'SELLER_DELIVERY' ||
-          prev.deliveryType === 'seller_delivery'
-        ) {
-          allowedForSeller.push('OUT_FOR_DELIVERY', 'PICKED_UP', 'DELIVERED', 'FAILED');
-        }
-        if (!allowedForSeller.includes(targetNorm)) {
-          throw new Error(`Sellers cannot transition directly to ${targetNorm} under platform fulfillment`);
-        }
-      }
-    }
-
-    // Terminal state protection: deliveries once DELIVERED or CANCELLED cannot be reopened
-    if ((currentNorm === 'DELIVERED' || currentNorm === 'CANCELLED') && targetNorm !== currentNorm) {
-      throw new Error(`Terminal delivery status '${currentNorm}' is immutable and cannot be transitioned to '${targetNorm}'`);
-    }
-
-    // Prevent impossible jumps (e.g. PENDING directly to DELIVERED)
-    if (currentNorm === 'PENDING' && targetNorm === 'DELIVERED') {
-      throw new Error('Invalid lifecycle jump: order must be prepared and dispatched before delivery');
-    }
-
-    const now = new Date().toISOString();
-    const timestamps = { ...prev.timestamps };
-
-    if (targetNorm === 'PREPARING') timestamps.preparing = now;
-    if (targetNorm === 'READY') timestamps.ready = now;
-    if (targetNorm === 'PICKED_UP') timestamps.pickedUpAt = now;
-    if (targetNorm === 'OUT_FOR_DELIVERY') {
-      timestamps.outForDelivery = now;
-      timestamps.outForDeliveryAt = now;
-    }
-    if (targetNorm === 'DELIVERED') {
-      timestamps.delivered = now;
-      timestamps.deliveredAt = now;
-    }
-    if (targetNorm === 'FAILED') {
-      timestamps.failed = now;
-      timestamps.failedAt = now;
-    }
-    if (targetNorm === 'CANCELLED') timestamps.cancelled = now;
-    if (targetNorm === 'RESCHEDULED') timestamps.rescheduledAt = now;
-
-    const updated: DeliveryAssignment = {
-      ...prev,
-      status: targetNorm,
-      timestamps,
-      notes: params.notes || prev.notes,
-      failureReason: targetNorm === 'FAILED' ? params.failureReason || 'customer_unavailable' : prev.failureReason,
-      failedBy: targetNorm === 'FAILED' ? params.actorId : prev.failedBy,
-      deliveryProofType: params.proof?.type || prev.deliveryProofType,
-      deliveryProofUrl: params.proof?.url || prev.deliveryProofUrl,
-      recipientName: params.proof?.recipientName || prev.recipientName,
-      recipientConfirmation: params.proof?.recipientConfirmation || prev.recipientConfirmation,
-      completedAt: targetNorm === 'DELIVERED' ? now : prev.completedAt,
-      updatedAt: now,
-    };
-
-    // Await authoritative Firestore update first (Fail-Closed)
     try {
-      const payload = cleanForFirestore(updated);
-      if (typeof window === 'undefined') {
-        await Promise.race([
-          setDoc(doc(db, DELIVERY_COLLECTION, params.assignmentId), payload, { merge: true }),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('PERMISSION_DENIED')), 100)),
-        ]);
-      } else {
-        await setDoc(doc(db, DELIVERY_COLLECTION, params.assignmentId), payload, { merge: true });
+      const assignments = initAssignments();
+      const index = assignments.findIndex(a => a.id === params.assignmentId);
+      if (index === -1) throw new Error('Delivery assignment not found');
+
+      const prev = assignments[index];
+      const currentNorm = normalizeDeliveryStatus(prev.status);
+      const targetNorm = normalizeDeliveryStatus(params.status);
+
+      // Strict Authorization Rules
+      const isCustomer = params.actorRole === 'CUSTOMER';
+      const isAdmin = params.actorRole === 'ADMIN' || params.actorRole === 'SUPER_ADMIN';
+      const isSeller = params.actorRole === 'SELLER' || params.actorRole === 'RESTAURANT';
+      const isDriver = params.actorRole === 'DRIVER';
+
+      if (isCustomer) {
+        throw new Error('Customers do not have authority to alter delivery operational status');
       }
-    } catch (err: any) {
-      if (typeof window === 'undefined' && (err?.message?.includes('PERMISSION_DENIED') || err?.code === 7 || err?.message?.includes('fetch failed'))) {
-        // Fall back to memory in test environment
-      } else {
-        handleFirestoreError(err, OperationType.UPDATE, `${DELIVERY_COLLECTION}/${params.assignmentId}`);
-        throw err;
+
+      if (!isAdmin && !isSeller && !isDriver) {
+        throw new Error('Unauthorized: You do not have permissions to modify delivery status');
       }
-    }
 
-    // Only commit to local memory after Firestore write succeeds
-    assignments[index] = updated;
-    persistAssignments(assignments);
+      // Anti-Cross-Seller Tampering Guard
+      if (isSeller && prev.sellerId !== params.actorId) {
+        throw new Error('Forbidden: You can only update delivery status for your own store shipments');
+      }
 
-    // Audit log
-    auditLogService.logAction({
-      actorId: params.actorId,
-      actorRole: params.actorRole as any,
-      action:
-        targetNorm === 'FAILED'
-          ? 'DELIVERY_FAILED'
-          : targetNorm === 'RESCHEDULED'
-          ? 'DELIVERY_RESCHEDULED'
-          : 'DELIVERY_STATUS_CHANGED',
-      targetType: 'delivery',
-      targetId: params.assignmentId,
-      targetName: `Order ${prev.orderId}`,
-      metadata: {
-        fromStatus: currentNorm,
-        toStatus: targetNorm,
-        failureReason: params.failureReason,
-      },
-    });
+      // Driver isolation and capability guard
+      if (isDriver) {
+        const isAssigned =
+          prev.driverId === params.actorId ||
+          prev.assignedDriver === params.actorId ||
+          (prev.driverName && prev.driverName.toLowerCase().includes(params.actorId.toLowerCase()));
+        if (!isAssigned) {
+          throw new Error('Forbidden: You can only update deliveries that are assigned to you');
+        }
+        const allowedForDriver = ['PICKED_UP', 'OUT_FOR_DELIVERY', 'DELIVERED', 'FAILED'];
+        if (!allowedForDriver.includes(targetNorm)) {
+          throw new Error(`Drivers can only update transit and completion statuses (${allowedForDriver.join(', ')})`);
+        }
+      }
 
-    // Notify Customer if applicable
-    if (updated.customerId) {
+      // Role lifecycle capability checks
+      if (!isAdmin) {
+        if (isSeller) {
+          const allowedForSeller = ['PREPARING', 'READY', 'CANCELLED'];
+          if (
+            prev.deliveryType === 'SELLER_DELIVERY' ||
+            prev.deliveryType === 'seller_delivery'
+          ) {
+            allowedForSeller.push('OUT_FOR_DELIVERY', 'PICKED_UP', 'DELIVERED', 'FAILED');
+          }
+          if (!allowedForSeller.includes(targetNorm)) {
+            throw new Error(`Sellers cannot transition directly to ${targetNorm} under platform fulfillment`);
+          }
+        }
+      }
+
+      // Terminal state protection: deliveries once DELIVERED or CANCELLED cannot be reopened
+      if ((currentNorm === 'DELIVERED' || currentNorm === 'CANCELLED') && targetNorm !== currentNorm) {
+        throw new Error(`Terminal delivery status '${currentNorm}' is immutable and cannot be transitioned to '${targetNorm}'`);
+      }
+
+      // F-10: Strict step-by-step state transition enforcement
+      const ALLOWED_TRANSITIONS: Partial<Record<DeliveryAssignmentStatus, DeliveryAssignmentStatus[]>> = {
+        PENDING: ['ASSIGNED', 'PREPARING', 'READY', 'CANCELLED'],
+        ASSIGNED: ['PREPARING', 'READY', 'PICKED_UP', 'CANCELLED'],
+        PREPARING: ['READY', 'CANCELLED'],
+        READY: ['PICKED_UP', 'OUT_FOR_DELIVERY', 'CANCELLED'],
+        PICKED_UP: ['OUT_FOR_DELIVERY', 'FAILED', 'CANCELLED'],
+        OUT_FOR_DELIVERY: ['DELIVERED', 'FAILED'],
+        FAILED: ['ASSIGNED', 'RESCHEDULED', 'CANCELLED'],
+        RESCHEDULED: ['ASSIGNED', 'PREPARING', 'READY', 'OUT_FOR_DELIVERY', 'CANCELLED'],
+        DELIVERED: [],
+        CANCELLED: [],
+      };
+
+      const validNextStates = ALLOWED_TRANSITIONS[currentNorm] || [];
+      if (targetNorm !== currentNorm && !validNextStates.includes(targetNorm)) {
+        throw new Error(
+          `Invalid delivery lifecycle transition from '${currentNorm}' to '${targetNorm}'. Allowed transitions: ${validNextStates.join(', ') || 'none (terminal state)'}`
+        );
+      }
+
+      const now = new Date().toISOString();
+      const timestamps = { ...prev.timestamps };
+
+      if (targetNorm === 'PREPARING') timestamps.preparing = now;
+      if (targetNorm === 'READY') timestamps.ready = now;
+      if (targetNorm === 'PICKED_UP') timestamps.pickedUpAt = now;
       if (targetNorm === 'OUT_FOR_DELIVERY') {
-        notificationService.notifyOrderEvent({
-          userId: updated.customerId,
-          orderId: updated.orderId,
-          eventType: 'ORDER_OUT_FOR_DELIVERY',
-        });
-      } else if (targetNorm === 'DELIVERED') {
-        notificationService.notifyOrderEvent({
-          userId: updated.customerId,
-          orderId: updated.orderId,
-          eventType: 'ORDER_DELIVERED',
-        });
-      } else if (targetNorm === 'FAILED') {
-        notificationService.notifyDeliveryEvent({
-          userId: updated.customerId,
-          orderId: updated.orderId,
-          eventType: 'DELIVERY_FAILED',
+        timestamps.outForDelivery = now;
+        timestamps.outForDeliveryAt = now;
+      }
+      if (targetNorm === 'DELIVERED') {
+        timestamps.delivered = now;
+        timestamps.deliveredAt = now;
+      }
+      if (targetNorm === 'FAILED') {
+        timestamps.failed = now;
+        timestamps.failedAt = now;
+      }
+      if (targetNorm === 'CANCELLED') timestamps.cancelled = now;
+      if (targetNorm === 'RESCHEDULED') timestamps.rescheduledAt = now;
+
+      const updated: DeliveryAssignment = {
+        ...prev,
+        status: targetNorm,
+        timestamps,
+        notes: params.notes || prev.notes,
+        failureReason: targetNorm === 'FAILED' ? params.failureReason || 'customer_unavailable' : prev.failureReason,
+        failedBy: targetNorm === 'FAILED' ? params.actorId : prev.failedBy,
+        deliveryProofType: params.proof?.type || prev.deliveryProofType,
+        deliveryProofUrl: params.proof?.url || prev.deliveryProofUrl,
+        recipientName: params.proof?.recipientName || prev.recipientName,
+        recipientConfirmation: params.proof?.recipientConfirmation || prev.recipientConfirmation,
+        completedAt: targetNorm === 'DELIVERED' ? now : prev.completedAt,
+        updatedAt: now,
+      };
+
+      // F-10: Await authoritative Firestore update FIRST (Strictly Fail-Closed, no memory fallback on failure)
+      try {
+        await persistDeliveryDocToFirestore(DELIVERY_COLLECTION, params.assignmentId, updated, true);
+      } catch (err: any) {
+        handleFirestoreError(err, OperationType.UPDATE, `${DELIVERY_COLLECTION}/${params.assignmentId}`);
+        throw new Error(`Database write failure (Fail-Closed): Unable to update delivery status in Firestore (${err?.message || err})`);
+      }
+
+      // Only commit to local memory after Firestore write succeeds
+      assignments[index] = updated;
+      persistAssignments(assignments);
+
+      // Audit log
+      auditLogService.logAction({
+        actorId: params.actorId,
+        actorRole: params.actorRole as any,
+        action:
+          targetNorm === 'FAILED'
+            ? 'DELIVERY_FAILED'
+            : targetNorm === 'RESCHEDULED'
+            ? 'DELIVERY_RESCHEDULED'
+            : 'DELIVERY_STATUS_CHANGED',
+        targetType: 'delivery',
+        targetId: params.assignmentId,
+        targetName: `Order ${prev.orderId}`,
+        metadata: {
+          fromStatus: currentNorm,
+          toStatus: targetNorm,
           failureReason: params.failureReason,
-        });
-      } else if (targetNorm === 'RESCHEDULED') {
-        notificationService.notifyDeliveryEvent({
-          userId: updated.customerId,
-          orderId: updated.orderId,
-          eventType: 'DELIVERY_RESCHEDULED',
-        });
-      }
-    }
+        },
+      });
 
-    // Synchronize authoritative order fulfillment status with orderService
-    if (targetNorm === 'DELIVERED') {
-      try {
-        orderService.updateOrderStatus(prev.orderId, 'delivered', params.actorId, params.actorRole);
-      } catch (err) {
-        console.warn(`[DeliveryService] Order status sync warning for ${prev.orderId}:`, err);
+      // Notify Customer if applicable
+      if (updated.customerId) {
+        if (targetNorm === 'OUT_FOR_DELIVERY') {
+          notificationService.notifyOrderEvent({
+            userId: updated.customerId,
+            orderId: updated.orderId,
+            eventType: 'ORDER_OUT_FOR_DELIVERY',
+          });
+        } else if (targetNorm === 'DELIVERED') {
+          notificationService.notifyOrderEvent({
+            userId: updated.customerId,
+            orderId: updated.orderId,
+            eventType: 'ORDER_DELIVERED',
+          });
+        } else if (targetNorm === 'FAILED') {
+          notificationService.notifyDeliveryEvent({
+            userId: updated.customerId,
+            orderId: updated.orderId,
+            eventType: 'DELIVERY_FAILED',
+            failureReason: params.failureReason,
+          });
+        } else if (targetNorm === 'RESCHEDULED') {
+          notificationService.notifyDeliveryEvent({
+            userId: updated.customerId,
+            orderId: updated.orderId,
+            eventType: 'DELIVERY_RESCHEDULED',
+          });
+        }
       }
-    } else if (targetNorm === 'OUT_FOR_DELIVERY' || targetNorm === 'PICKED_UP') {
-      try {
-        orderService.updateOrderStatus(prev.orderId, 'shipped', params.actorId, params.actorRole);
-      } catch (err) {
-        console.warn(`[DeliveryService] Order status sync warning for ${prev.orderId}:`, err);
-      }
-    }
 
-    return updated;
+      // Synchronize authoritative order fulfillment status with orderService
+      if (targetNorm === 'DELIVERED') {
+        try {
+          orderService.updateOrderStatus(prev.orderId, 'delivered', params.actorId, params.actorRole);
+        } catch (err) {
+          console.warn(`[DeliveryService] Order status sync warning for ${prev.orderId}:`, err);
+        }
+      } else if (targetNorm === 'OUT_FOR_DELIVERY' || targetNorm === 'PICKED_UP') {
+        try {
+          orderService.updateOrderStatus(prev.orderId, 'shipped', params.actorId, params.actorRole);
+        } catch (err) {
+          console.warn(`[DeliveryService] Order status sync warning for ${prev.orderId}:`, err);
+        }
+      }
+
+      return updated;
+    } finally {
+      activeAssignmentLocks.delete(params.assignmentId);
+    }
   },
 
   async updateAssignmentStatus(params: {
@@ -999,7 +1004,7 @@ export const deliveryService = {
     };
 
     try {
-      await setDoc(doc(db, DELIVERY_COLLECTION, id), cleanForFirestore(newAssignment));
+      await persistDeliveryDocToFirestore(DELIVERY_COLLECTION, id, newAssignment, false);
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `${DELIVERY_COLLECTION}/${id}`);
       throw err;

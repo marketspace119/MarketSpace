@@ -1,3 +1,4 @@
+process.env.NODE_ENV = 'test';
 import assert from 'assert';
 import { commissionService } from '../src/services/commissionService';
 import { deliveryService } from '../src/services/deliveryService';
@@ -8,7 +9,49 @@ import { refundService } from '../src/services/refundService';
 import { userService } from '../src/services/userService';
 import { imageUploadService } from '../src/services/imageUploadService';
 import { MemoryRateLimitStore, DistributedFirestoreRateLimitStore } from '../server/rateLimiter';
+import { setAdminDbForTesting } from '../server/firebaseAdmin';
 import { OrderDetails, DeliveryAssignment, PayoutRequest, RefundRequest } from '../src/types';
+
+if (!process.env.FIRESTORE_EMULATOR_HOST) {
+  const memCols = new Map<string, Map<string, any>>();
+  const getCol = (name: string) => {
+    if (!memCols.has(name)) memCols.set(name, new Map());
+    return memCols.get(name)!;
+  };
+  setAdminDbForTesting({
+    collection: (name: string) => ({
+      doc: (id: string) => {
+        const docRef = {
+          id,
+          get: async () => {
+            const d = getCol(name).get(id);
+            return { exists: d !== undefined, id, data: () => d };
+          },
+          set: async (data: any, opts?: any) => {
+            const prev = getCol(name).get(id) || {};
+            getCol(name).set(id, opts?.merge ? { ...prev, ...data } : data);
+          },
+          update: async (data: any) => {
+            const prev = getCol(name).get(id) || {};
+            getCol(name).set(id, { ...prev, ...data });
+          },
+          delete: async () => {
+            getCol(name).delete(id);
+          },
+        };
+        return docRef;
+      },
+    }),
+    runTransaction: async (fn: any) => {
+      return await fn({
+        get: async (ref: any) => await ref.get(),
+        set: (ref: any, data: any, opts?: any) => ref.set(data, opts),
+        update: (ref: any, data: any) => ref.update(data),
+        delete: (ref: any) => ref.delete(),
+      });
+    },
+  });
+}
 
 interface StructuredTestResult {
   id: string;
@@ -2172,29 +2215,41 @@ async function runDeterministicAuditSuite() {
     assert.strictEqual(earned1, 100, 'Single order with total=100 must evaluate to 100');
     assert.strictEqual(Number.isFinite(earned1), true, 'earned1 must be finite');
 
-    // 2. Order with completely undefined monetary values
-    const earned2 = calculateEarnedFromOrder(
-      { status: 'delivered', paymentStatus: 'paid', sellerId: FIXTURE_USERS.sellerA.id },
-      FIXTURE_USERS.sellerA.id
-    );
-    assert.strictEqual(earned2, 0, 'Order with undefined values must safely evaluate to 0');
-    assert.strictEqual(Number.isFinite(earned2), true, 'earned2 must be finite');
+    // 2. Order with completely undefined monetary values -> MUST FAIL-CLOSED (NEW-07)
+    let undefinedThrew = false;
+    try {
+      calculateEarnedFromOrder(
+        { status: 'delivered', paymentStatus: 'paid', sellerId: FIXTURE_USERS.sellerA.id },
+        FIXTURE_USERS.sellerA.id
+      );
+    } catch (e: any) {
+      undefinedThrew = e.message.includes('Fail-Closed');
+    }
+    assert.strictEqual(undefinedThrew, true, 'Order with undefined monetary values must fail-closed (throw)');
 
-    // 3. Malicious NaN inputs
-    const earned3 = calculateEarnedFromOrder(
-      { status: 'delivered', paymentStatus: 'paid', total: NaN, sellerRevenue: NaN, sellerId: FIXTURE_USERS.sellerA.id },
-      FIXTURE_USERS.sellerA.id
-    );
-    assert.strictEqual(earned3, 0, 'NaN input must evaluate to 0');
-    assert.strictEqual(Number.isFinite(earned3), true, 'earned3 must be finite');
+    // 3. Malicious NaN inputs -> MUST FAIL-CLOSED (NEW-07)
+    let nanThrew = false;
+    try {
+      calculateEarnedFromOrder(
+        { status: 'delivered', paymentStatus: 'paid', total: NaN, sellerRevenue: NaN, sellerId: FIXTURE_USERS.sellerA.id },
+        FIXTURE_USERS.sellerA.id
+      );
+    } catch (e: any) {
+      nanThrew = e.message.includes('Fail-Closed');
+    }
+    assert.strictEqual(nanThrew, true, 'NaN input must fail-closed (throw)');
 
-    // 4. Malicious Infinity inputs
-    const earned4 = calculateEarnedFromOrder(
-      { status: 'delivered', paymentStatus: 'paid', total: Infinity, sellerRevenue: Infinity, sellerId: FIXTURE_USERS.sellerA.id },
-      FIXTURE_USERS.sellerA.id
-    );
-    assert.strictEqual(earned4, 0, 'Infinity input must evaluate to 0');
-    assert.strictEqual(Number.isFinite(earned4), true, 'earned4 must be finite');
+    // 4. Malicious Infinity inputs -> MUST FAIL-CLOSED (NEW-07)
+    let infThrew = false;
+    try {
+      calculateEarnedFromOrder(
+        { status: 'delivered', paymentStatus: 'paid', total: Infinity, sellerRevenue: Infinity, sellerId: FIXTURE_USERS.sellerA.id },
+        FIXTURE_USERS.sellerA.id
+      );
+    } catch (e: any) {
+      infThrew = e.message.includes('Fail-Closed');
+    }
+    assert.strictEqual(infThrew, true, 'Infinity input must fail-closed (throw)');
 
     // 5. Multi-vendor order with missing subtotal
     const earned5 = calculateEarnedFromOrder(
@@ -2214,29 +2269,26 @@ async function runDeterministicAuditSuite() {
 
     const assertionExecuted =
       earned1 === 100 &&
-      earned2 === 0 &&
-      earned3 === 0 &&
-      earned4 === 0 &&
+      undefinedThrew &&
+      nanThrew &&
+      infThrew &&
       earned5 === 80 &&
       Number.isFinite(earned1) &&
-      Number.isFinite(earned2) &&
-      Number.isFinite(earned3) &&
-      Number.isFinite(earned4) &&
       Number.isFinite(earned5);
 
-    assert(assertionExecuted, 'All 5 NaN and Infinity arithmetic invariants must hold');
+    assert(assertionExecuted, 'All 5 NaN, Infinity, undefined fail-closed and fallback invariants must hold');
 
     recordTest({
       id: 'TEST-28',
-      name: 'Authoritative NaN, Infinity, and Undefined-Derived Arithmetic Invariant (FIN-01)',
+      name: 'Authoritative NaN, Infinity, and Undefined-Derived Arithmetic Invariant (FIN-01 & NEW-07)',
       fixtureCreated: 'Orders with total-only, undefined, NaN, Infinity, and sub-order fallback payloads',
       preconditionsVerified: true,
       actionExecuted: 'Evaluated calculateEarnedFromOrder against NaN, Infinity, undefined, and fallback vectors',
-      expectedResult: 'All earnings strictly finite, NaN/Infinity neutralized to 0, total-only evaluated accurately',
-      actualResult: `earned1=${earned1}, earned2=${earned2}, earned3=${earned3}, earned4=${earned4}, earned5=${earned5}`,
+      expectedResult: 'Valid earnings strictly finite, corrupt undefined/NaN/Infinity fail-closed (throw)',
+      actualResult: `earned1=${earned1}, undefinedThrew=${undefinedThrew}, nanThrew=${nanThrew}, infThrew=${infThrew}, earned5=${earned5}`,
       assertionExecuted,
       pass: true,
-      details: 'Strictly neutralizes NaN, Infinity, and undefined-derived arithmetic, guaranteeing finite positive seller earnings.',
+      details: 'Strictly fails closed on NaN, Infinity, and undefined monetary fields (NEW-07) while evaluating valid total/sub-order fallbacks accurately.',
     });
   } catch (err: any) {
     recordTest({

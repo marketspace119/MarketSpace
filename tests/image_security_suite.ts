@@ -5,7 +5,7 @@ process.env.FIRESTORE_EMULATOR_HOST = '127.0.0.1:8085';
 import assert from 'assert';
 import { sniffImageMagicBytes } from '../src/lib/imageSecurity';
 import { processImageVerificationGateway } from '../server/imageGateway';
-import { getAdminDb } from '../server/firebaseAdmin';
+import { getAdminDb, setAdminDbForTesting } from '../server/firebaseAdmin';
 
 interface TestResult {
   id: string;
@@ -43,16 +43,25 @@ export async function runImageSecuritySuite() {
 
   const authHeader = createMockAuthHeader('test_seller_user');
 
-  try {
-    const adminDb = getAdminDb();
-    await adminDb.collection('users').doc('test_seller_user').set({
-      id: 'test_seller_user',
-      email: 'test_seller_user@marketspace.test',
-      role: 'SELLER',
-      status: 'active',
-      isVerified: true,
-    });
-  } catch {}
+  const docs = new Map<string, any>();
+  docs.set('test_seller_user', {
+    id: 'test_seller_user',
+    email: 'test_seller_user@marketspace.test',
+    role: 'SELLER',
+    status: 'active',
+    isVerified: true,
+  });
+  setAdminDbForTesting({
+    collection: () => ({
+      doc: (id: string) => ({
+        get: async () => ({
+          exists: docs.has(id),
+          data: () => docs.get(id),
+        }),
+        set: async (data: any) => { docs.set(id, data); },
+      }),
+    }),
+  });
 
   // Vector 1: Valid PNG (PNG 8-byte magic: 89 50 4E 47 0D 0A 1A 0A + dummy chunk)
   {
@@ -270,6 +279,86 @@ export async function runImageSecuritySuite() {
       actualResult: blocked ? 'REJECTED' : 'VALID',
       pass: blocked,
       reason: details,
+    });
+  }
+
+  // Vector 11: Valid GIF89a Magic Bytes Detection
+  {
+    const validGifBytes = Buffer.from([
+      0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00,
+      0x01, 0x00, 0x80, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+    ]);
+    const res = sniffImageMagicBytes(validGifBytes);
+    const pass = res.isValid === true && res.detectedFormat === 'gif';
+    record({
+      id: 'IMG-11',
+      name: 'Valid GIF89a Magic Bytes Detection',
+      expectedResult: 'VALID',
+      actualResult: res.isValid ? 'VALID' : 'REJECTED',
+      pass,
+      reason: res.byteSignature,
+    });
+  }
+
+  // Vector 12: Deep-Offset Polyglot JPEG Payloads at >256B, 1KB, 4KB, 16KB, 32KB, and 60KB
+  {
+    const offsets = [300, 1024, 4096, 16384, 32768, 61440];
+    let allRejected = true;
+    let failureReason = 'All deep-offset polyglots (300B to 60KB) rejected';
+    for (const offset of offsets) {
+      const buf = Buffer.alloc(64 * 1024, 0x00);
+      // Valid JPEG header
+      buf[0] = 0xFF; buf[1] = 0xD8; buf[2] = 0xFF; buf[3] = 0xE0;
+      const payload = Buffer.from('<?php system($_GET["cmd"]); ?>');
+      payload.copy(buf, offset);
+      const res = sniffImageMagicBytes(buf);
+      if (res.isValid) {
+        allRejected = false;
+        failureReason = `Failed to reject PHP polyglot at offset ${offset}`;
+        break;
+      }
+    }
+    record({
+      id: 'IMG-12',
+      name: 'Deep-Offset Polyglot JPEG + PHP Rejection (300B, 1KB, 4KB, 16KB, 32KB, 60KB)',
+      expectedResult: 'REJECTED',
+      actualResult: allRejected ? 'REJECTED' : 'VALID',
+      pass: allRejected,
+      reason: failureReason,
+    });
+  }
+
+  // Vector 13: Embedded iframe, object, embed, onerror, onload, and javascript: Polyglot Rejection
+  {
+    const vectors = [
+      '<iframe src="https://evil.test"></iframe>',
+      '<object data="evil.swf"></object>',
+      '<embed src="evil.swf">',
+      'onerror=alert(1)',
+      'onload=alert(1)',
+      'javascript:alert(1)',
+    ];
+    let allBlocked = true;
+    let reason = 'All 6 HTML/JS polyglot vectors (<iframe, <object, <embed, onerror=, onload=, javascript:) rejected';
+    for (const v of vectors) {
+      const buf = Buffer.alloc(2048, 0x20);
+      buf[0] = 0x89; buf[1] = 0x50; buf[2] = 0x4E; buf[3] = 0x47;
+      buf[4] = 0x0D; buf[5] = 0x0A; buf[6] = 0x1A; buf[7] = 0x0A;
+      Buffer.from(v).copy(buf, 512);
+      const res = sniffImageMagicBytes(buf);
+      if (res.isValid) {
+        allBlocked = false;
+        reason = `Vector was not blocked: ${v}`;
+        break;
+      }
+    }
+    record({
+      id: 'IMG-13',
+      name: 'Polyglot PNG + iframe/object/embed/onerror/onload/javascript Rejection',
+      expectedResult: 'REJECTED',
+      actualResult: allBlocked ? 'REJECTED' : 'VALID',
+      pass: allBlocked,
+      reason,
     });
   }
 

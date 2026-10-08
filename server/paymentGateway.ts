@@ -133,10 +133,21 @@ export async function processPaymentReferenceSubmissionGateway(
         throw err;
       }
 
+      // Enforce authoritative order total integrity (NEW-07 Fail-Closed: NaN > 0.01 is false in JS, so validate orderTotal first!)
+      const rawOrderTotal = orderData.total;
+      const orderTotal = (rawOrderTotal === null || rawOrderTotal === undefined || rawOrderTotal === '' || typeof rawOrderTotal === 'boolean')
+        ? NaN
+        : Number(rawOrderTotal);
+      if (!Number.isFinite(orderTotal) || isNaN(orderTotal) || orderTotal <= 0) {
+        const err = new Error(`Corrupted or unreadable authoritative order total for #${orderId}. Payment submission aborted (Fail-Closed).`);
+        (err as any).statusCode = 503;
+        throw err;
+      }
+
       // Enforce authoritative order amount if client supplied an altered amount
       if (payload.amount !== undefined && Number(payload.amount) > 0) {
-        if (Math.abs(orderData.total - Number(payload.amount)) > 0.01) {
-          const err = new Error(`المبلغ المدخل ($${payload.amount}) غير متطابق مع إجمالي الطلب المعتمد ($${orderData.total}).`);
+        if (Math.abs(orderTotal - Number(payload.amount)) > 0.01) {
+          const err = new Error(`المبلغ المدخل ($${payload.amount}) غير متطابق مع إجمالي الطلب المعتمد ($${orderTotal}).`);
           (err as any).statusCode = 400;
           throw err;
         }
@@ -328,6 +339,16 @@ export async function processPaymentReviewGateway(
       throw err;
     }
 
+    const rawReviewOrderTotal = orderData.total;
+    const orderTotal = (rawReviewOrderTotal === null || rawReviewOrderTotal === undefined || rawReviewOrderTotal === '' || typeof rawReviewOrderTotal === 'boolean')
+      ? NaN
+      : Number(rawReviewOrderTotal);
+    if (!Number.isFinite(orderTotal) || isNaN(orderTotal) || orderTotal <= 0) {
+      const err = new Error(`Corrupted or unreadable authoritative order total for #${targetOrderId}. Payment review aborted (Fail-Closed).`);
+      (err as any).statusCode = 503;
+      throw err;
+    }
+
     // Invariant: If submissionId was supplied, verify customer, amount, currency, and reference
     if (subData) {
       if (subData.customerId && orderData.customerId && subData.customerId !== orderData.customerId) {
@@ -336,9 +357,11 @@ export async function processPaymentReviewGateway(
         throw err;
       }
 
-      const subAmount = Number(subData.amount);
-      const orderTotal = Number(orderData.total);
-      if (isNaN(subAmount) || Math.abs(subAmount - orderTotal) > 0.01) {
+      const rawSubAmount = subData.amount;
+      const subAmount = (rawSubAmount === null || rawSubAmount === undefined || rawSubAmount === '' || typeof rawSubAmount === 'boolean')
+        ? NaN
+        : Number(rawSubAmount);
+      if (!Number.isFinite(subAmount) || isNaN(subAmount) || subAmount <= 0 || Math.abs(subAmount - orderTotal) > 0.01) {
         const err = new Error(`مبلغ إشعار الدفع ($${subAmount}) غير مطابق لإجمالي الطلب المعتمد ($${orderTotal}).`);
         (err as any).statusCode = 400;
         throw err;

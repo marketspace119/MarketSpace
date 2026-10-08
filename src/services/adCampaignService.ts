@@ -1,4 +1,4 @@
-import { doc, getDocs, collection, setDoc, updateDoc } from 'firebase/firestore';
+import { doc, getDocs, collection, setDoc, updateDoc, query, limit } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { AdCampaign, AdCampaignStatus, AdPlacement, UserRole } from '../types';
 import { auditLogService } from './auditLogService';
@@ -71,38 +71,57 @@ export const INITIAL_AD_CAMPAIGNS: AdCampaign[] = [
 
 let memoryCampaigns: AdCampaign[] = [];
 
+function isProductionEnvironment(): boolean {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'production') return true;
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.PROD) return true;
+  return false;
+}
+
 function loadCampaigns(): AdCampaign[] {
   if (memoryCampaigns.length > 0) return memoryCampaigns;
-  if (typeof window === 'undefined') return INITIAL_AD_CAMPAIGNS;
-  try {
-    const raw = localStorage.getItem(CAMPAIGNS_STORAGE_KEY);
-    memoryCampaigns = raw ? JSON.parse(raw) : INITIAL_AD_CAMPAIGNS;
+  if (isProductionEnvironment()) {
+    memoryCampaigns = [];
     return memoryCampaigns;
-  } catch {
-    return INITIAL_AD_CAMPAIGNS;
   }
+  // F-20: Do not read or trust localStorage for campaign authority
+  memoryCampaigns = [...INITIAL_AD_CAMPAIGNS];
+  return memoryCampaigns;
 }
 
 function persistCampaigns(campaigns: AdCampaign[]) {
   memoryCampaigns = campaigns;
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(CAMPAIGNS_STORAGE_KEY, JSON.stringify(campaigns));
-  } catch (err) {
-    console.error('Failed to save campaigns to localStorage', err);
+  // F-20: LocalStorage persistence removed for authoritative campaign state
+}
+
+async function persistCampaignToFirestore(id: string, payload: Record<string, any>, merge = true): Promise<void> {
+  const cleanPayload = JSON.parse(JSON.stringify(payload));
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+    await setDoc(doc(db, CAMPAIGNS_COLLECTION, id), cleanPayload, merge ? { merge: true } : {});
+  } else {
+    const serverAdminModule = '../../server/firebaseAdmin';
+    const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+    const adminDb = getAdminDb();
+    if (!adminDb) {
+      throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable for campaign persistence');
+    }
+    await adminDb.collection(CAMPAIGNS_COLLECTION).doc(id).set(cleanPayload, merge ? { merge: true } : {});
   }
 }
 
 export const adCampaignService = {
+  resetMemoryState(): void {
+    memoryCampaigns = [];
+  },
+
   async syncWithFirestore(): Promise<AdCampaign[]> {
     try {
-      const snap = await getDocs(collection(db, CAMPAIGNS_COLLECTION));
+      const snap = await getDocs(query(collection(db, CAMPAIGNS_COLLECTION), limit(200)));
       if (!snap.empty) {
         const cloudCampaigns: AdCampaign[] = [];
         snap.forEach(d => cloudCampaigns.push(d.data() as AdCampaign));
         persistCampaigns(cloudCampaigns);
         return cloudCampaigns;
-      } else {
+      } else if (!isProductionEnvironment()) {
         persistCampaigns(INITIAL_AD_CAMPAIGNS);
       }
     } catch (err) {
@@ -173,21 +192,23 @@ export const adCampaignService = {
       updatedAt: startAt,
     };
 
+    // F-13: Authoritative Firestore write MUST succeed BEFORE updating local state
     try {
-      await setDoc(doc(db, CAMPAIGNS_COLLECTION, newCampaign.id), newCampaign);
-      const campaigns = loadCampaigns();
-      campaigns.unshift(newCampaign);
-      persistCampaigns(campaigns);
-    } catch (err) {
+      await persistCampaignToFirestore(newCampaign.id, newCampaign, false);
+    } catch (err: any) {
       handleFirestoreError(err, OperationType.CREATE, `${CAMPAIGNS_COLLECTION}/${newCampaign.id}`);
-      throw err;
+      throw new Error(`Database write failure (Fail-Closed): Unable to submit campaign to Firestore (${err?.message || err})`);
     }
+
+    const campaigns = loadCampaigns();
+    campaigns.unshift(newCampaign);
+    persistCampaigns(campaigns);
 
     return newCampaign;
   },
 
   /**
-   * Admin approves, pauses, or rejects a campaign
+   * Admin approves, pauses, or rejects a campaign (F-13: Firestore-first)
    */
   async updateCampaignStatus(
     campaignId: string,
@@ -201,31 +222,42 @@ export const adCampaignService = {
     }
 
     const campaigns = loadCampaigns();
-    const target = campaigns.find(c => c.id === campaignId);
-    if (!target) throw new Error('Campaign not found');
+    const index = campaigns.findIndex(c => c.id === campaignId);
+    if (index === -1) throw new Error('Campaign not found');
 
+    const prev = campaigns[index];
     const now = new Date().toISOString();
-    target.status = newStatus;
-    target.updatedAt = now;
-    target.reviewedBy = adminId;
-    target.reviewedAt = now;
-    if (paymentVerified !== undefined) {
-      target.paymentVerified = paymentVerified;
-    }
+    const nextPaymentVerified = paymentVerified !== undefined ? paymentVerified : prev.paymentVerified;
 
-    persistCampaigns(campaigns);
+    const updated: AdCampaign = {
+      ...prev,
+      status: newStatus,
+      updatedAt: now,
+      reviewedBy: adminId,
+      reviewedAt: now,
+      paymentVerified: nextPaymentVerified,
+    };
 
+    // F-13: Authoritative Firestore write MUST succeed BEFORE mutating local state (Fail-Closed)
     try {
-      await updateDoc(doc(db, CAMPAIGNS_COLLECTION, campaignId), {
-        status: target.status,
-        updatedAt: now,
-        reviewedBy: adminId,
-        reviewedAt: now,
-        paymentVerified: target.paymentVerified,
-      });
-    } catch (err) {
+      await persistCampaignToFirestore(
+        campaignId,
+        {
+          status: updated.status,
+          updatedAt: now,
+          reviewedBy: adminId,
+          reviewedAt: now,
+          paymentVerified: updated.paymentVerified,
+        },
+        true
+      );
+    } catch (err: any) {
       handleFirestoreError(err, OperationType.UPDATE, `${CAMPAIGNS_COLLECTION}/${campaignId}`);
+      throw new Error(`Database write failure (Fail-Closed): Unable to update campaign status in Firestore (${err?.message || err})`);
     }
+
+    campaigns[index] = updated;
+    persistCampaigns(campaigns);
 
     await auditLogService.logAction({
       actorId: adminId,
@@ -233,11 +265,11 @@ export const adCampaignService = {
       action: newStatus === 'APPROVED' ? 'CAMPAIGN_APPROVED' : newStatus === 'REJECTED' ? 'CAMPAIGN_REJECTED' : 'CAMPAIGN_PAUSED',
       targetType: 'campaign',
       targetId: campaignId,
-      targetName: `Campaign ${target.id}`,
-      metadata: { newStatus, budget: target.budget },
+      targetName: `Campaign ${updated.id}`,
+      metadata: { newStatus, budget: updated.budget },
     });
 
-    return target;
+    return updated;
   },
 
   /**
@@ -251,9 +283,9 @@ export const adCampaignService = {
     target.impressions = (target.impressions || 0) + 1;
     persistCampaigns(campaigns);
 
-    updateDoc(doc(db, CAMPAIGNS_COLLECTION, campaignId), {
+    persistCampaignToFirestore(campaignId, {
       impressions: target.impressions,
-    }).catch(err => {
+    }, true).catch(err => {
       console.warn('Impression metric update offline:', err);
     });
   },
@@ -269,9 +301,9 @@ export const adCampaignService = {
     target.clicks = (target.clicks || 0) + 1;
     persistCampaigns(campaigns);
 
-    updateDoc(doc(db, CAMPAIGNS_COLLECTION, campaignId), {
+    persistCampaignToFirestore(campaignId, {
       clicks: target.clicks,
-    }).catch(err => {
+    }, true).catch(err => {
       console.warn('Click metric update offline:', err);
     });
   },

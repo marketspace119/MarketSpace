@@ -1,4 +1,4 @@
-import { collection, getDocs, query, where } from 'firebase/firestore';
+import { collection, getDocs, query, where, limit } from 'firebase/firestore';
 import { db, auth } from '../lib/firebase';
 import { orderService } from './orderService';
 
@@ -281,9 +281,9 @@ export const paymentService = {
     try {
       let q;
       if (isAdmin) {
-        q = collection(db, SUBMISSIONS_COLLECTION);
+        q = query(collection(db, SUBMISSIONS_COLLECTION), limit(200));
       } else if (currentUserId) {
-        q = query(collection(db, SUBMISSIONS_COLLECTION), where('customerId', '==', currentUserId));
+        q = query(collection(db, SUBMISSIONS_COLLECTION), where('customerId', '==', currentUserId), limit(200));
       }
 
       if (q) {

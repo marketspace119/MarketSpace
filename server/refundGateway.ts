@@ -1,6 +1,6 @@
 import crypto from 'crypto';
-import { getAdminDb, requireAuthenticatedCaller, isCallerPlatformAdmin } from './firebaseAdmin';
-import { RefundRequest } from '../src/types';
+import { getAdminDb, requireAuthenticatedCaller, requireVerifiedPlatformAdmin, isCallerPlatformAdmin } from './firebaseAdmin';
+import { RefundRequest, RefundStatus } from '../src/types';
 
 export interface CreateRefundGatewayRequest {
   orderId: string;
@@ -90,8 +90,17 @@ export async function processRefundGateway(
       throw new Error('Cannot request a refund for an unpaid order. Payment must be confirmed as paid first.');
     }
 
-    // Resolve Authoritative Entity Context & Max Allowed Ceiling
-    let maxAllowedCeiling = Number(orderData.total) || 0;
+    // Resolve Authoritative Entity Context & Max Allowed Ceiling (Strict Fail-Closed on corrupted total)
+    const rawOrderTotalVal = orderData.total;
+    const rawOrderTotal = (rawOrderTotalVal === null || rawOrderTotalVal === undefined || rawOrderTotalVal === '' || typeof rawOrderTotalVal === 'boolean')
+      ? NaN
+      : Number(rawOrderTotalVal);
+    if (!Number.isFinite(rawOrderTotal) || isNaN(rawOrderTotal) || rawOrderTotal <= 0) {
+      const err = new Error(`Corrupted or unreadable authoritative order total for #${orderId}. Refund aborted (Fail-Closed).`) as any;
+      err.statusCode = 503;
+      throw err;
+    }
+    let maxAllowedCeiling = rawOrderTotal;
 
     // Strict multi-vendor subOrderId allocation check (F-08)
     if (Array.isArray(orderData.vendorOrders) && orderData.vendorOrders.length > 1 && !subOrderId) {
@@ -105,7 +114,16 @@ export async function processRefundGateway(
       }
       authoritativeSellerId = vo.sellerId;
       authoritativeStoreId = vo.storeId;
-      maxAllowedCeiling = Number(vo.subtotal || vo.total) || maxAllowedCeiling;
+      const rawSubVal = vo.subtotal ?? vo.total;
+      const subCeiling = (rawSubVal === null || rawSubVal === undefined || rawSubVal === '' || typeof rawSubVal === 'boolean')
+        ? NaN
+        : Number(rawSubVal);
+      if (!Number.isFinite(subCeiling) || isNaN(subCeiling) || subCeiling <= 0) {
+        const err = new Error(`Corrupted sub-order total for #${subOrderId}. Refund aborted (Fail-Closed).`) as any;
+        err.statusCode = 503;
+        throw err;
+      }
+      maxAllowedCeiling = subCeiling;
     } else if (Array.isArray(orderData.vendorOrders) && orderData.vendorOrders.length > 0) {
       authoritativeSellerId = orderData.vendorOrders[0].sellerId || '';
       authoritativeStoreId = orderData.vendorOrders[0].storeId || '';
@@ -143,8 +161,9 @@ export async function processRefundGateway(
       idempotencyDocRef = adminDb.collection('refund_idempotency').doc(idemHash);
     }
 
-    // Pre-transaction read: Gather historical settled refunds baseline prior to transaction (Strict Fail-Closed)
-    let baselineHistoricalRefunded = 0;
+    // Pre-transaction read: Gather historical settled refunds baseline prior to transaction (Strict Fail-Closed, zero fallback)
+    let baselineHistoricalOrderRefunded = 0;
+    let baselineHistoricalSubOrderRefunded = 0;
     try {
       const histSnap = await adminDb
         .collection('refundRequests')
@@ -153,14 +172,29 @@ export async function processRefundGateway(
       if (!histSnap.empty) {
         histSnap.forEach((d) => {
           const r = d.data();
-          if (r.status !== 'REFUND_REJECTED') {
-            baselineHistoricalRefunded += (Number(r.amount) || 0);
+          if (!r || typeof r !== 'object') {
+            throw new Error(`Corrupted historical refund document (#${d.id}) for order #${orderId}. Fail-Closed.`);
+          }
+          if (r.status !== 'REFUND_REJECTED' && r.status !== 'REJECTED') {
+            const rawHistAmt = r.amount;
+            const histAmt = (rawHistAmt === null || rawHistAmt === undefined || rawHistAmt === '' || typeof rawHistAmt === 'boolean')
+              ? NaN
+              : Number(rawHistAmt);
+            if (!Number.isFinite(histAmt) || isNaN(histAmt) || histAmt <= 0) {
+              throw new Error(`Corrupted historical refund amount in record #${d.id} for order #${orderId}. Fail-Closed.`);
+            }
+            baselineHistoricalOrderRefunded += histAmt;
+            if (subOrderId && r.subOrderId === subOrderId) {
+              baselineHistoricalSubOrderRefunded += histAmt;
+            }
           }
         });
       }
     } catch (e: any) {
       console.error('[RefundGateway:FailClosed] Historical refunds baseline query failed:', e?.message || e);
-      throw new Error(`Database query failure: Unable to verify historical refunds for order #${orderId}. Operation aborted (Fail-Closed).`);
+      const failErr = new Error(`Database query failure: Unable to verify historical refunds for order #${orderId}. Operation aborted (Fail-Closed).`) as any;
+      failErr.statusCode = 503;
+      throw failErr;
     }
 
     const result = await adminDb.runTransaction(async (transaction) => {
@@ -186,20 +220,62 @@ export async function processRefundGateway(
       if (sellerLockRef) {
         const sellerLockDoc = await transaction.get(sellerLockRef);
         if (sellerLockDoc.exists) {
-          sellerCurrentRefundReserved = Number(sellerLockDoc.data()?.totalRefundReserved) || 0;
+          const sLockData = sellerLockDoc.data() || {};
+          if (sLockData.totalRefundReserved !== undefined) {
+            const parsedRes = (sLockData.totalRefundReserved === null || sLockData.totalRefundReserved === '' || typeof sLockData.totalRefundReserved === 'boolean')
+              ? NaN
+              : Number(sLockData.totalRefundReserved);
+            if (!Number.isFinite(parsedRes) || isNaN(parsedRes) || parsedRes < 0) {
+              const err = new Error(`Corrupted totalRefundReserved in seller_payout_locks for seller #${authoritativeSellerId}. Fail-Closed.`) as any;
+              err.statusCode = 503;
+              throw err;
+            }
+            sellerCurrentRefundReserved = parsedRes;
+          }
         }
       }
 
-      let cumulativeRefunded = baselineHistoricalRefunded;
+      let orderCumulativeRefunded = baselineHistoricalOrderRefunded;
+      let subOrderCumulativeRefunded = baselineHistoricalSubOrderRefunded;
+      const existingSubOrderRefundsMap: Record<string, number> = {};
+
       // Add any locked active amount from lockDoc if more recent
       if (lockDoc.exists) {
-        const lockData = lockDoc.data();
-        if (typeof lockData?.cumulativeRefunded === 'number' && lockData.cumulativeRefunded > cumulativeRefunded) {
-          cumulativeRefunded = lockData.cumulativeRefunded;
+        const lockData = lockDoc.data() || {};
+        if (lockData.cumulativeRefunded !== undefined) {
+          const parsedCum = (lockData.cumulativeRefunded === null || lockData.cumulativeRefunded === '' || typeof lockData.cumulativeRefunded === 'boolean')
+            ? NaN
+            : Number(lockData.cumulativeRefunded);
+          if (!Number.isFinite(parsedCum) || isNaN(parsedCum) || parsedCum < 0) {
+            const err = new Error(`Corrupted cumulativeRefunded in order_refund_locks for order #${orderId}. Fail-Closed.`) as any;
+            err.statusCode = 503;
+            throw err;
+          }
+          if (parsedCum > orderCumulativeRefunded) {
+            orderCumulativeRefunded = parsedCum;
+          }
+        }
+        if (lockData.subOrderRefunds && typeof lockData.subOrderRefunds === 'object') {
+          Object.assign(existingSubOrderRefundsMap, lockData.subOrderRefunds);
+          if (subOrderId && existingSubOrderRefundsMap[subOrderId] !== undefined) {
+            const lockedSubAmt = Number(existingSubOrderRefundsMap[subOrderId]);
+            if (!Number.isFinite(lockedSubAmt) || isNaN(lockedSubAmt) || lockedSubAmt < 0) {
+              const err = new Error(`Corrupted subOrderRefunds for subOrder #${subOrderId}. Fail-Closed.`) as any;
+              err.statusCode = 503;
+              throw err;
+            }
+            if (lockedSubAmt > subOrderCumulativeRefunded) {
+              subOrderCumulativeRefunded = lockedSubAmt;
+            }
+          }
         }
       }
 
-      const remainingRefundable = Math.max(0, maxAllowedCeiling - cumulativeRefunded);
+      const remainingOrderRefundable = Math.max(0, Number((rawOrderTotal - orderCumulativeRefunded).toFixed(2)));
+      const remainingSubOrderRefundable = subOrderId
+        ? Math.max(0, Number((maxAllowedCeiling - subOrderCumulativeRefunded).toFixed(2)))
+        : remainingOrderRefundable;
+      const remainingRefundable = Math.min(remainingOrderRefundable, remainingSubOrderRefundable);
 
       if (requestedAmount > remainingRefundable + 0.001) {
         throw new Error(
@@ -207,7 +283,10 @@ export async function processRefundGateway(
         );
       }
 
-      const newCumulative = Number((cumulativeRefunded + requestedAmount).toFixed(2));
+      const newCumulative = Number((orderCumulativeRefunded + requestedAmount).toFixed(2));
+      if (subOrderId) {
+        existingSubOrderRefundsMap[subOrderId] = Number((subOrderCumulativeRefunded + requestedAmount).toFixed(2));
+      }
 
       // Build authoritative refund object
       const customerName = orderData.customerName || caller.token?.name || 'Customer';
@@ -236,12 +315,13 @@ export async function processRefundGateway(
       // Write lock update
       transaction.set(refundLockRef, {
         orderId,
-        maxAllowedCeiling,
+        maxAllowedCeiling: rawOrderTotal,
         cumulativeRefunded: newCumulative,
+        subOrderRefunds: existingSubOrderRefundsMap,
         lastRefundId: refundId,
         lastAmount: requestedAmount,
         updatedAt: now,
-      });
+      }, { merge: true });
 
       if (sellerLockRef) {
         transaction.set(sellerLockRef, {
@@ -283,4 +363,256 @@ export async function processRefundGateway(
   } finally {
     inFlightRefundOrders.delete(orderId);
   }
+}
+
+export interface ReviewRefundGatewayRequest {
+  refundId: string;
+  action: 'APPROVE' | 'REJECT';
+  adminNotes?: string;
+}
+
+/**
+ * Authoritative Refund Review Gateway (Finding 4 & Finding 18)
+ * Atomically approves or rejects a refund request, updates order refundStatus,
+ * and adjusts seller_payout_locks.totalRefundReserved when rejected.
+ */
+export async function processRefundReviewGateway(
+  payload: ReviewRefundGatewayRequest,
+  authHeader?: string
+): Promise<{ success: boolean; refund: RefundRequest }> {
+  const caller = await requireVerifiedPlatformAdmin(authHeader);
+  const refundId = (payload.refundId || '').trim();
+  const action = payload.action;
+  const adminNotes = payload.adminNotes?.trim();
+
+  if (!refundId) {
+    const err = new Error('Refund ID is required');
+    (err as any).statusCode = 400;
+    throw err;
+  }
+  if (action !== 'APPROVE' && action !== 'REJECT') {
+    const err = new Error('Invalid action: must be APPROVE or REJECT');
+    (err as any).statusCode = 400;
+    throw err;
+  }
+
+  const adminDb = getAdminDb();
+  const now = new Date().toISOString();
+
+  const updatedRefund = await adminDb.runTransaction(async (transaction) => {
+    const refundRef = adminDb.collection('refundRequests').doc(refundId);
+    const refundDoc = await transaction.get(refundRef);
+    if (!refundDoc.exists) {
+      const err = new Error('Refund request not found');
+      (err as any).statusCode = 404;
+      throw err;
+    }
+
+    const prev = refundDoc.data() as RefundRequest;
+    if (
+      prev.status === 'REFUNDED' ||
+      prev.status === 'REFUND_REJECTED' ||
+      prev.status === 'REJECTED' ||
+      (prev.status as any) === 'completed'
+    ) {
+      const err = new Error('Terminal state: Settled refunds cannot be modified');
+      (err as any).statusCode = 409;
+      throw err;
+    }
+
+    const orderRef = adminDb.collection('orders').doc(prev.orderId);
+    const orderDoc = await transaction.get(orderRef);
+
+    const refundLockRef = adminDb.collection('order_refund_locks').doc(prev.orderId);
+    const refundLockDoc = await transaction.get(refundLockRef);
+
+    const sellerLockRef = prev.sellerId ? adminDb.collection('seller_payout_locks').doc(prev.sellerId) : null;
+    const sellerLockDoc = sellerLockRef ? await transaction.get(sellerLockRef) : null;
+
+    const nextStatus: RefundStatus = action === 'APPROVE' ? 'REFUND_APPROVED' : 'REFUND_REJECTED';
+
+    const updated: RefundRequest = {
+      ...prev,
+      status: nextStatus,
+      processedBy: caller.uid,
+      processedAt: now,
+      updatedAt: now,
+      adminNotes: adminNotes || prev.adminNotes || '',
+    };
+
+    transaction.set(refundRef, updated, { merge: true });
+
+    if (orderDoc.exists) {
+      transaction.update(orderRef, {
+        refundStatus: action === 'APPROVE' ? 'approved' : 'rejected',
+        updatedAt: now,
+      });
+    }
+
+    // If rejected, release the refund reservation on order_refund_locks and seller_payout_locks
+    if (action === 'REJECT') {
+      if (refundLockDoc.exists) {
+        const rLockData = refundLockDoc.data() || {};
+        const currentCumulative = Number(rLockData.cumulativeRefunded) || 0;
+        const releasedCumulative = Math.max(0, Number((currentCumulative - prev.amount).toFixed(2)));
+        const nextSubOrderRefunds = { ...(rLockData.subOrderRefunds || {}) };
+        if (prev.subOrderId && nextSubOrderRefunds[prev.subOrderId] !== undefined) {
+          nextSubOrderRefunds[prev.subOrderId] = Math.max(
+            0,
+            Number(((Number(nextSubOrderRefunds[prev.subOrderId]) || 0) - prev.amount).toFixed(2))
+          );
+        }
+        transaction.set(refundLockRef, {
+          cumulativeRefunded: releasedCumulative,
+          subOrderRefunds: nextSubOrderRefunds,
+          updatedAt: now,
+        }, { merge: true });
+      }
+      if (sellerLockRef && sellerLockDoc && sellerLockDoc.exists) {
+        const sLockData = sellerLockDoc.data() || {};
+        const currentRefundReserved = Number(sLockData.totalRefundReserved) || 0;
+        const releasedRefundReserved = Math.max(0, Number((currentRefundReserved - prev.amount).toFixed(2)));
+        transaction.set(sellerLockRef, {
+          totalRefundReserved: releasedRefundReserved,
+          updatedAt: now,
+        }, { merge: true });
+      }
+    }
+
+    const auditRef = adminDb.collection('audit_logs').doc(`audit_ref_rev_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
+    transaction.set(auditRef, {
+      id: auditRef.id,
+      actorId: caller.uid,
+      actorRole: caller.isSuperAdmin ? 'SUPER_ADMIN' : 'ADMIN',
+      actorEmail: caller.email || '',
+      action: action === 'APPROVE' ? 'REFUND_APPROVED' : 'REFUND_REJECTED',
+      targetType: 'refund',
+      targetId: refundId,
+      targetName: `Refund for Order ${prev.orderId}`,
+      timestamp: now,
+      metadata: { status: nextStatus, amount: prev.amount, orderId: prev.orderId },
+    });
+
+    return updated;
+  });
+
+  return { success: true, refund: updatedRefund };
+}
+
+export interface SettleRefundGatewayRequest {
+  refundId: string;
+  settlementType: 'MANUAL_MOBILE_TRANSFER' | 'CASH' | 'STORE_CREDIT';
+  settlementReference: string;
+  adminNotes?: string;
+}
+
+/**
+ * Authoritative Refund Settlement Gateway (Finding 4 & Finding 18)
+ * Atomically settles an approved refund request, updates order refundStatus to 'refunded',
+ * and updates seller_financial_ledgers.lifetimeSettledRefunds.
+ */
+export async function processRefundSettlementGateway(
+  payload: SettleRefundGatewayRequest,
+  authHeader?: string
+): Promise<{ success: boolean; refund: RefundRequest }> {
+  const caller = await requireVerifiedPlatformAdmin(authHeader);
+  const refundId = (payload.refundId || '').trim();
+  const trimmedRef = (payload.settlementReference || '').trim();
+  const settlementType = payload.settlementType || 'MANUAL_MOBILE_TRANSFER';
+  const adminNotes = payload.adminNotes?.trim();
+
+  if (!refundId) {
+    const err = new Error('Refund ID is required');
+    (err as any).statusCode = 400;
+    throw err;
+  }
+  if (!trimmedRef || trimmedRef.length < 4) {
+    const err = new Error('رقم إشعار / مرجع التحويل المالي مطلوب ويجب أن يحتوي على 4 خانات على الأقل');
+    (err as any).statusCode = 400;
+    throw err;
+  }
+
+  const adminDb = getAdminDb();
+  const now = new Date().toISOString();
+
+  const settledRefund = await adminDb.runTransaction(async (transaction) => {
+    const refundRef = adminDb.collection('refundRequests').doc(refundId);
+    const refundDoc = await transaction.get(refundRef);
+    if (!refundDoc.exists) {
+      const err = new Error('Refund request not found');
+      (err as any).statusCode = 404;
+      throw err;
+    }
+
+    const prev = refundDoc.data() as RefundRequest;
+    if (prev.status === 'REFUNDED') {
+      const err = new Error('Terminal state: Refund has already been settled and completed');
+      (err as any).statusCode = 409;
+      throw err;
+    }
+    if (prev.status !== 'REFUND_APPROVED' && prev.status !== 'APPROVED') {
+      const err = new Error('يجب اعتماد طلب الاسترداد أولاً قبل تسجيل التسوية المالية');
+      (err as any).statusCode = 400;
+      throw err;
+    }
+
+    const orderRef = adminDb.collection('orders').doc(prev.orderId);
+    const orderDoc = await transaction.get(orderRef);
+
+    const ledgerRef = prev.sellerId ? adminDb.collection('seller_financial_ledgers').doc(prev.sellerId) : null;
+    const ledgerDoc = ledgerRef ? await transaction.get(ledgerRef) : null;
+
+    const updated: RefundRequest = {
+      ...prev,
+      status: 'REFUNDED',
+      settlementType,
+      settlementReference: trimmedRef,
+      processedBy: caller.uid,
+      processedAt: now,
+      updatedAt: now,
+      adminNotes: adminNotes || prev.adminNotes || '',
+    };
+
+    transaction.set(refundRef, updated, { merge: true });
+
+    if (orderDoc.exists) {
+      transaction.update(orderRef, {
+        refundStatus: 'refunded',
+        updatedAt: now,
+      });
+    }
+
+    // Increment lifetimeSettledRefunds on seller_financial_ledgers atomically
+    if (ledgerRef && ledgerDoc && ledgerDoc.exists) {
+      const lData = ledgerDoc.data() || {};
+      const nextSettledRefunds = Number(((Number(lData.lifetimeSettledRefunds) || 0) + prev.amount).toFixed(2));
+      transaction.set(ledgerRef, {
+        lifetimeSettledRefunds: nextSettledRefunds,
+        version: (Number(lData.version) || 1) + 1,
+      }, { merge: true });
+    }
+
+    const auditRef = adminDb.collection('audit_logs').doc(`audit_ref_settle_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
+    transaction.set(auditRef, {
+      id: auditRef.id,
+      actorId: caller.uid,
+      actorRole: caller.isSuperAdmin ? 'SUPER_ADMIN' : 'ADMIN',
+      actorEmail: caller.email || '',
+      action: 'REFUND_SETTLED',
+      targetType: 'refund',
+      targetId: refundId,
+      targetName: `Refund ${refundId}`,
+      timestamp: now,
+      metadata: {
+        settlementType,
+        settlementReference: trimmedRef,
+        amount: prev.amount,
+        orderId: prev.orderId,
+      },
+    });
+
+    return updated;
+  });
+
+  return { success: true, refund: settledRefund };
 }

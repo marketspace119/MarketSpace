@@ -1,4 +1,4 @@
-import { doc, getDocs, collection, setDoc, updateDoc, query, where } from 'firebase/firestore';
+import { doc, getDocs, collection, setDoc, updateDoc, query, where, limit } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import {
   FeaturedListing,
@@ -63,67 +63,76 @@ export const INITIAL_PROMOTION_REQUESTS: PromotionRequest[] = [
 let memoryFeatured: FeaturedListing[] = [];
 let memoryPromotions: PromotionRequest[] = [];
 
+function isProductionEnvironment(): boolean {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'production') return true;
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.PROD) return true;
+  return false;
+}
+
 function loadFeatured(): FeaturedListing[] {
   if (memoryFeatured.length > 0) return memoryFeatured;
-  if (typeof window === 'undefined') return INITIAL_FEATURED_LISTINGS;
-  try {
-    const raw = localStorage.getItem(FEATURED_STORAGE_KEY);
-    memoryFeatured = raw ? JSON.parse(raw) : INITIAL_FEATURED_LISTINGS;
+  if (isProductionEnvironment()) {
+    memoryFeatured = [];
     return memoryFeatured;
-  } catch {
-    return INITIAL_FEATURED_LISTINGS;
   }
+  // F-20: Do not read or trust localStorage for featured listings authority
+  memoryFeatured = [...INITIAL_FEATURED_LISTINGS];
+  return memoryFeatured;
 }
 
 function persistFeatured(items: FeaturedListing[]) {
   memoryFeatured = items;
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(FEATURED_STORAGE_KEY, JSON.stringify(items));
-  } catch (err) {
-    console.error('Failed to save featured listings to localStorage', err);
-  }
+  // F-20: LocalStorage persistence removed for authoritative featured listings
 }
 
 function loadPromotions(): PromotionRequest[] {
   if (memoryPromotions.length > 0) return memoryPromotions;
-  if (typeof window === 'undefined') return INITIAL_PROMOTION_REQUESTS;
-  try {
-    const raw = localStorage.getItem(PROMOTIONS_STORAGE_KEY);
-    memoryPromotions = raw ? JSON.parse(raw) : INITIAL_PROMOTION_REQUESTS;
+  if (isProductionEnvironment()) {
+    memoryPromotions = [];
     return memoryPromotions;
-  } catch {
-    return INITIAL_PROMOTION_REQUESTS;
   }
+  // F-20: Do not read or trust localStorage for promotion requests authority
+  memoryPromotions = [...INITIAL_PROMOTION_REQUESTS];
+  return memoryPromotions;
 }
 
 function persistPromotions(items: PromotionRequest[]) {
   memoryPromotions = items;
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(PROMOTIONS_STORAGE_KEY, JSON.stringify(items));
-  } catch (err) {
-    console.error('Failed to save promotion requests to localStorage', err);
+  // F-20: LocalStorage persistence removed for authoritative promotion requests
+}
+
+async function persistPromoDocToFirestore(colName: string, id: string, payload: Record<string, any>, merge = true): Promise<void> {
+  const cleanPayload = JSON.parse(JSON.stringify(payload));
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+    await setDoc(doc(db, colName, id), cleanPayload, merge ? { merge: true } : {});
+  } else {
+    const serverAdminModule = '../../server/firebaseAdmin';
+    const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+    const adminDb = getAdminDb();
+    if (!adminDb) {
+      throw new Error(`Database write failure (Fail-Closed): Firestore Admin DB unavailable for ${colName} persistence`);
+    }
+    await adminDb.collection(colName).doc(id).set(cleanPayload, merge ? { merge: true } : {});
   }
 }
 
 export const promotionService = {
   async syncWithFirestore(sellerId?: string, isAdmin?: boolean): Promise<void> {
     try {
-      const featSnap = await getDocs(collection(db, FEATURED_COLLECTION));
+      const featSnap = await getDocs(query(collection(db, FEATURED_COLLECTION), limit(200)));
       if (!featSnap.empty) {
         const cloudFeat: FeaturedListing[] = [];
         featSnap.forEach(d => cloudFeat.push(d.data() as FeaturedListing));
         persistFeatured(cloudFeat);
-      } else {
+      } else if (!isProductionEnvironment()) {
         persistFeatured(INITIAL_FEATURED_LISTINGS);
       }
 
       let promoQ;
       if (isAdmin) {
-        promoQ = collection(db, PROMOTIONS_COLLECTION);
+        promoQ = query(collection(db, PROMOTIONS_COLLECTION), limit(200));
       } else if (sellerId) {
-        promoQ = query(collection(db, PROMOTIONS_COLLECTION), where('sellerId', '==', sellerId));
+        promoQ = query(collection(db, PROMOTIONS_COLLECTION), where('sellerId', '==', sellerId), limit(200));
       }
 
       if (promoQ) {
@@ -132,7 +141,7 @@ export const promotionService = {
           const cloudPromo: PromotionRequest[] = [];
           promoSnap.forEach(d => cloudPromo.push(d.data() as PromotionRequest));
           persistPromotions(cloudPromo);
-        } else if (!sellerId) {
+        } else if (!sellerId && !isProductionEnvironment()) {
           persistPromotions(INITIAL_PROMOTION_REQUESTS);
         }
       }
@@ -190,9 +199,10 @@ export const promotionService = {
     };
 
     try {
-      await setDoc(doc(db, FEATURED_COLLECTION, newListing.id), newListing);
+      await persistPromoDocToFirestore(FEATURED_COLLECTION, newListing.id, newListing, false);
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `${FEATURED_COLLECTION}/${newListing.id}`);
+      throw err;
     }
 
     items.unshift(newListing);
@@ -258,7 +268,7 @@ export const promotionService = {
     };
 
     try {
-      await setDoc(doc(db, PROMOTIONS_COLLECTION, newReq.id), newReq);
+      await persistPromoDocToFirestore(PROMOTIONS_COLLECTION, newReq.id, newReq, false);
       const requests = loadPromotions();
       requests.unshift(newReq);
       persistPromotions(requests);
@@ -291,32 +301,37 @@ export const promotionService = {
 
     const now = new Date();
     const nowIso = now.toISOString();
+    const nextStatus = params.status === 'APPROVED' ? 'ACTIVE' : 'REJECTED';
+    const nextStartAt = params.status === 'APPROVED' ? nowIso : target.startAt;
+    const nextEndAt = params.status === 'APPROVED'
+      ? new Date(now.getTime() + target.durationDays * 24 * 60 * 60 * 1000).toISOString()
+      : target.endAt;
 
-    target.status = params.status === 'APPROVED' ? 'ACTIVE' : 'REJECTED';
+    try {
+      await persistPromoDocToFirestore(PROMOTIONS_COLLECTION, target.id, {
+        status: nextStatus,
+        reviewedBy: params.adminId,
+        reviewedAt: nowIso,
+        updatedAt: nowIso,
+        adminNotes: params.adminNotes || target.adminNotes || '',
+        rejectionReason: params.rejectionReason || target.rejectionReason || '',
+        startAt: nextStartAt || '',
+        endAt: nextEndAt || '',
+      }, true);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `${PROMOTIONS_COLLECTION}/${target.id}`);
+      throw err;
+    }
+
+    target.status = nextStatus;
     target.reviewedBy = params.adminId;
     target.reviewedAt = nowIso;
     target.updatedAt = nowIso;
     if (params.adminNotes) target.adminNotes = params.adminNotes;
     if (params.rejectionReason) target.rejectionReason = params.rejectionReason;
-
     if (params.status === 'APPROVED') {
-      target.startAt = nowIso;
-      target.endAt = new Date(now.getTime() + target.durationDays * 24 * 60 * 60 * 1000).toISOString();
-    }
-
-    try {
-      await updateDoc(doc(db, PROMOTIONS_COLLECTION, target.id), {
-        status: target.status,
-        reviewedBy: target.reviewedBy,
-        reviewedAt: target.reviewedAt,
-        updatedAt: target.updatedAt,
-        adminNotes: target.adminNotes || '',
-        rejectionReason: target.rejectionReason || '',
-        startAt: target.startAt || '',
-        endAt: target.endAt || '',
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `${PROMOTIONS_COLLECTION}/${target.id}`);
+      target.startAt = nextStartAt;
+      target.endAt = nextEndAt;
     }
 
     persistPromotions(requests);

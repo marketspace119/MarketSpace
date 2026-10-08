@@ -100,7 +100,10 @@ export class DistributedFirestoreRateLimitStore implements RateLimitStore {
   async consume(key: string, limit: number, windowMs: number): Promise<RateLimitResult> {
     const adminDb = getAdminDb();
     if (!adminDb) {
-      throw new Error('Distributed rate limiter unavailable: Firestore Admin DB not initialized (Fail-Closed)');
+      const err = new Error('Distributed rate limiter unavailable: Firestore Admin DB not initialized (Fail-Closed)') as any;
+      err.statusCode = 503;
+      err.code = 'RATE_LIMITER_UNAVAILABLE';
+      throw err;
     }
 
     const now = Date.now();
@@ -158,13 +161,75 @@ export class DistributedFirestoreRateLimitStore implements RateLimitStore {
           resetTime,
           retryAfter: 0,
         };
-      }, { maxAttempts: 1 });
+      }, { maxAttempts: 5 });
     } catch (err: any) {
       console.error('[RateLimiter:Distributed] Firestore transaction failed (Fail-Closed):', err?.message || err);
-      throw new Error(`Distributed rate limiter unavailable: ${err?.message || 'Transaction error'} (Fail-Closed)`);
+      const unavailableErr = new Error(`Distributed rate limiter unavailable: ${err?.message || 'Transaction error'} (Fail-Closed)`) as any;
+      unavailableErr.statusCode = 503;
+      unavailableErr.code = 'RATE_LIMITER_UNAVAILABLE';
+      throw unavailableErr;
     }
   }
 }
+
+/**
+ * Distributed Failed Authentication Tracker (Brute-Force & Credential Stuffing Protection)
+ * Tracks repeated failed authentication attempts strictly by sanitized client IP across all server instances.
+ * SECURITY INVARIANT (PCR-09): Unverified UIDs extracted from failed/forged JWT payloads MUST NEVER be used
+ * for security lockout decisions, as that would allow attackers to forge tokens with a victim's UID and cause
+ * a global account lockout DoS against the victim. Claimed UIDs are recorded for diagnostic telemetry only.
+ * Strictly Fail-Closed: If the underlying distributed store is unavailable, throws HTTP 503 (RATE_LIMITER_UNAVAILABLE).
+ */
+export class DistributedFailedAuthTracker {
+  private readonly maxFailedAttempts: number;
+  private readonly windowMs: number;
+  private readonly customStore?: RateLimitStore;
+
+  constructor(options?: { maxFailedAttempts?: number; windowMs?: number; store?: RateLimitStore }) {
+    this.maxFailedAttempts = options?.maxFailedAttempts ?? 10;
+    this.windowMs = options?.windowMs ?? 15 * 60 * 1000; // 15 minutes default window
+    this.customStore = options?.store;
+  }
+
+  private getStore(): RateLimitStore {
+    return this.customStore || activeStore;
+  }
+
+  /**
+   * Records a failed authentication attempt for a client IP.
+   * Any unverified claimedUid is logged solely for telemetry and NEVER used for lockout enforcement.
+   */
+  async recordFailedAttempt(params: {
+    ip?: string;
+    telemetryClaimedUid?: string;
+  }): Promise<{
+    lockedOut: boolean;
+    ipAttempts: number;
+    telemetryClaimedUid?: string;
+    retryAfter: number;
+  }> {
+    const store = this.getStore();
+    const cleanIp = normalizeClientIp(params.ip);
+    const ipKey = `failed_auth_ip_${cleanIp}`;
+
+    const ipRes = await store.consume(ipKey, this.maxFailedAttempts, this.windowMs);
+
+    if (params.telemetryClaimedUid) {
+      console.warn(
+        `[SecurityTelemetry:FailedAuth] Failed authentication from IP=${cleanIp} (attempt=${ipRes.count}/${this.maxFailedAttempts}, telemetryClaimedUid=${params.telemetryClaimedUid})`
+      );
+    }
+
+    return {
+      lockedOut: !ipRes.allowed,
+      ipAttempts: ipRes.count,
+      telemetryClaimedUid: params.telemetryClaimedUid,
+      retryAfter: ipRes.retryAfter,
+    };
+  }
+}
+
+export const failedAuthTracker = new DistributedFailedAuthTracker();
 
 // Global store selection
 let activeStore: RateLimitStore = new DistributedFirestoreRateLimitStore();
@@ -193,6 +258,8 @@ export function createRateLimiter(options: {
   message?: string;
   store?: RateLimitStore;
   allowGuest?: boolean;
+  maxFailedAuthAttempts?: number;
+  failedAuthWindowMs?: number;
 }) {
   return async (req: Request, res: Response, next: NextFunction) => {
     const store = options.store || activeStore;
@@ -201,42 +268,66 @@ export function createRateLimiter(options: {
     const clientIp = normalizeClientIp(typeof rawIp === 'string' ? rawIp : undefined);
     const authHeader = req.headers.authorization;
 
-    // F-36: Hardened Rate Limit Identity Architecture
+    // F-36 & PCR-09: Hardened Rate Limit Identity Architecture
     // 1. Never trust client-supplied identity headers (X-User-ID, X-Forwarded-User, etc.)
     // 2. If Bearer token is provided: MUST cryptographically verify it via Firebase Admin.
     //    - If valid: bind rate limit identity strictly to verified UID (`user_${uid}`)
-    //    - If invalid/malformed: REJECT IMMEDIATELY with 401 Unauthorized before consuming quota.
-    //      This prevents malicious random tokens from burning legitimate user or guest IP quotas.
+    //    - If invalid/malformed: record distributed failed auth attempt strictly by client IP (`failed_auth_ip_${clientIp}`).
+    //      Unverified UID claims in failed tokens are NEVER used for lockout enforcement (prevents victim UID lockout DoS).
     // 3. If NO Authorization header is provided:
     //    - If guests are allowed: bind rate limit identity strictly to sanitized client IP (`guest_ip_${clientIp}`)
     //    - If guests are not allowed and endpoint requires auth: reject with 401
     let identityKey: string;
 
+    const recordAuthFailureOrThrow503 = async (authErrorMsg?: string) => {
+      try {
+        const tracker = new DistributedFailedAuthTracker({
+          maxFailedAttempts: options.maxFailedAuthAttempts ?? 10,
+          windowMs: options.failedAuthWindowMs ?? 15 * 60 * 1000,
+          store,
+        });
+        const trackRes = await tracker.recordFailedAttempt({ ip: clientIp });
+        if (trackRes.lockedOut) {
+          res.setHeader('Retry-After', trackRes.retryAfter);
+          return res.status(429).json({
+            success: false,
+            error: 'Too many failed authentication attempts from this IP address. Please wait and try again later.',
+            code: 'AUTH_RATE_LIMIT_EXCEEDED',
+            retryAfter: trackRes.retryAfter,
+          });
+        }
+      } catch (err: any) {
+        console.error('[RateLimiter:FailedAuth] Distributed failed-auth tracking unavailable (Fail-Closed):', err?.message || err);
+        res.setHeader('Retry-After', 60);
+        return res.status(503).json({
+          success: false,
+          error: 'Security control failure: Rate limiter service temporarily unavailable.',
+          code: 'RATE_LIMITER_UNAVAILABLE',
+          retryAfter: 60,
+        });
+      }
+      return res.status(401).json({
+        success: false,
+        error: authErrorMsg || 'Authentication failed: Invalid or expired Bearer token',
+      });
+    };
+
     if (authHeader) {
       if (!authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({
-          success: false,
-          error: 'Authentication failed: Authorization header must use Bearer schema',
-        });
+        return await recordAuthFailureOrThrow503('Authentication failed: Authorization header must use Bearer schema');
       }
 
       try {
         const decoded = await verifyFirebaseBearerToken(authHeader);
         if (!decoded || !decoded.uid) {
-          return res.status(401).json({
-            success: false,
-            error: 'Authentication failed: Invalid token claims or missing UID',
-          });
+          return await recordAuthFailureOrThrow503('Authentication failed: Invalid token claims or missing UID');
         }
         identityKey = `user_${decoded.uid}`;
         (req as any).authenticatedUser = decoded;
       } catch (err: any) {
-        // Invalid or expired token: Reject fail-closed.
-        // Do NOT fall back to IP; doing so would allow attackers with fake tokens to exhaust shared IP quotas.
-        return res.status(401).json({
-          success: false,
-          error: err?.message || 'Authentication failed: Invalid or expired Bearer token',
-        });
+        // PCR-09: Reject invalid token and track failed auth strictly by IP.
+        // Never extract or enforce lockout on unverified UID claims from failed tokens.
+        return await recordAuthFailureOrThrow503(err?.message || 'Authentication failed: Invalid or expired Bearer token');
       }
     } else {
       // Unauthenticated request: isolate to guest IP bucket

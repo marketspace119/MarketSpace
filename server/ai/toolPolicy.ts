@@ -1,4 +1,5 @@
 import { VerifiedCaller } from '../firebaseAdmin';
+import { getRateLimitStore } from '../rateLimiter';
 import { logAIAction } from './aiAudit';
 
 export type AllowedAITool =
@@ -12,24 +13,21 @@ export interface ToolExecutionResult {
   toolName: string;
   data?: any;
   error?: string;
+  code?: string;
+  statusCode?: number;
   requiresUserConfirmation?: boolean;
 }
 
-// In-memory per-user rate limit for AI tool calls (max 30 tool calls per minute)
-const toolCallRateLimitMap = new Map<string, { count: number; resetAt: number }>();
-
-function checkToolRateLimit(userId: string): boolean {
-  const now = Date.now();
-  const entry = toolCallRateLimitMap.get(userId);
-  if (!entry || now > entry.resetAt) {
-    toolCallRateLimitMap.set(userId, { count: 1, resetAt: now + 60 * 1000 });
-    return true;
-  }
-  if (entry.count >= 30) {
-    return false;
-  }
-  entry.count++;
-  return true;
+/**
+ * Distributed per-user rate limit for AI tool calls (max 30 tool calls per minute).
+ * Uses the authoritative distributed RateLimitStore (Firestore transaction-backed in production).
+ * Strictly Fail-Closed: Throws RATE_LIMITER_UNAVAILABLE (503) if the distributed backend fails.
+ */
+async function checkDistributedToolRateLimit(userId: string): Promise<boolean> {
+  const store = getRateLimitStore();
+  const key = `ai_tool_call_user_${userId}`;
+  const res = await store.consume(key, 30, 60 * 1000);
+  return res.allowed;
 }
 
 // Denied mutating operations that must NEVER be executed directly by AI
@@ -80,14 +78,23 @@ export async function validateAndExecuteToolPolicy(
     };
   }
 
-  // 2. Rate limit tool execution
+  // 2. Distributed rate limit tool execution (Fail-Closed on backend unavailability)
   const rateLimitIdentity = caller?.uid || 'guest';
-  if (!checkToolRateLimit(rateLimitIdentity)) {
-    return {
-      allowed: false,
-      toolName,
-      error: 'AI tool execution rate limit exceeded. Please wait a minute before requesting more actions.',
-    };
+  try {
+    const allowed = await checkDistributedToolRateLimit(rateLimitIdentity);
+    if (!allowed) {
+      return {
+        allowed: false,
+        toolName,
+        statusCode: 429,
+        error: 'AI tool execution rate limit exceeded. Please wait a minute before requesting more actions.',
+      };
+    }
+  } catch (err: any) {
+    const failClosedErr = new Error(err?.message || 'Security control failure: Rate limiter service temporarily unavailable.') as any;
+    failClosedErr.statusCode = 503;
+    failClosedErr.code = 'RATE_LIMITER_UNAVAILABLE';
+    throw failClosedErr;
   }
 
   // 3. Whitelist validation

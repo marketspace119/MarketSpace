@@ -1,4 +1,4 @@
-import { doc, getDocs, collection, setDoc, updateDoc, query, where } from 'firebase/firestore';
+import { doc, getDocs, collection, setDoc, updateDoc, query, where, limit } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
 import { SellerPlan, SellerSubscription, SubscriptionStatus, UserRole } from '../types';
 import { auditLogService } from './auditLogService';
@@ -125,55 +125,58 @@ let memorySubscriptions: SellerSubscription[] = [];
 
 function loadPlans(): SellerPlan[] {
   if (memoryPlans.length > 0) return memoryPlans;
-  if (typeof window === 'undefined') return STANDARD_SELLER_PLANS;
-  try {
-    const raw = localStorage.getItem(PLANS_STORAGE_KEY);
-    memoryPlans = raw ? JSON.parse(raw) : STANDARD_SELLER_PLANS;
-    return memoryPlans;
-  } catch {
-    return STANDARD_SELLER_PLANS;
-  }
+  // F-20: Do not read or trust localStorage for plan authority
+  memoryPlans = [...STANDARD_SELLER_PLANS];
+  return memoryPlans;
 }
 
 function persistPlans(plans: SellerPlan[]) {
   memoryPlans = plans;
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(PLANS_STORAGE_KEY, JSON.stringify(plans));
-  } catch (err) {
-    console.error('Failed to save plans to localStorage', err);
-  }
+  // F-20: LocalStorage persistence removed for authoritative plan state
 }
 
 function loadSubscriptions(): SellerSubscription[] {
   if (memorySubscriptions.length > 0) return memorySubscriptions;
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(SUBSCRIPTIONS_STORAGE_KEY);
-    memorySubscriptions = raw ? JSON.parse(raw) : [];
-    return memorySubscriptions;
-  } catch {
-    return [];
-  }
+  // F-20: Do not read or trust localStorage for subscription authority
+  return memorySubscriptions;
 }
 
 function persistSubscriptions(subs: SellerSubscription[]) {
   memorySubscriptions = subs;
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(SUBSCRIPTIONS_STORAGE_KEY, JSON.stringify(subs));
-  } catch (err) {
-    console.error('Failed to save subscriptions to localStorage', err);
+  // F-20: LocalStorage persistence removed for authoritative subscription state
+}
+
+async function persistSubscriptionToFirestore(id: string, payload: Record<string, any>, merge = true): Promise<void> {
+  const cleanPayload = JSON.parse(JSON.stringify(payload));
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+    await setDoc(doc(db, SUBSCRIPTIONS_COLLECTION, id), cleanPayload, merge ? { merge: true } : {});
+  } else {
+    const serverAdminModule = '../../server/firebaseAdmin';
+    const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+    const adminDb = getAdminDb();
+    if (!adminDb) {
+      throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable for subscription persistence');
+    }
+    await adminDb.collection(SUBSCRIPTIONS_COLLECTION).doc(id).set(cleanPayload, merge ? { merge: true } : {});
   }
 }
 
 export const subscriptionService = {
+  resetMemoryState(): void {
+    memoryPlans = [];
+    memorySubscriptions = [];
+  },
+
+  seedSubscriptions(subs: SellerSubscription[]): void {
+    memorySubscriptions = [...subs];
+  },
+
   /**
    * Sync plans and subscriptions from Firestore
    */
   async syncWithFirestore(sellerId?: string, isAdmin?: boolean): Promise<void> {
     try {
-      const plansSnap = await getDocs(collection(db, PLANS_COLLECTION));
+      const plansSnap = await getDocs(query(collection(db, PLANS_COLLECTION), limit(50)));
       if (!plansSnap.empty) {
         const cloudPlans: SellerPlan[] = [];
         plansSnap.forEach(d => cloudPlans.push(d.data() as SellerPlan));
@@ -184,9 +187,9 @@ export const subscriptionService = {
 
       let subsQuery;
       if (isAdmin) {
-        subsQuery = collection(db, SUBSCRIPTIONS_COLLECTION);
+        subsQuery = query(collection(db, SUBSCRIPTIONS_COLLECTION), limit(200));
       } else if (sellerId) {
-        subsQuery = query(collection(db, SUBSCRIPTIONS_COLLECTION), where('sellerId', '==', sellerId));
+        subsQuery = query(collection(db, SUBSCRIPTIONS_COLLECTION), where('sellerId', '==', sellerId), limit(100));
       }
 
       if (subsQuery) {
@@ -231,6 +234,10 @@ export const subscriptionService = {
     return sub;
   },
 
+  getActiveSubscriptionForSeller(sellerId: string): SellerSubscription | undefined {
+    return this.getSellerSubscription(sellerId);
+  },
+
   /**
    * Deterministically returns the active plan for a seller.
    * Defaults safely to the FREE plan if no active subscription exists.
@@ -259,6 +266,16 @@ export const subscriptionService = {
     paymentReference?: string;
     notes?: string;
   }): Promise<SellerSubscription> {
+    if (!params.sellerId || !params.storeId || !params.planId) {
+      throw new Error('sellerId, storeId, and planId are required');
+    }
+    if (typeof window !== 'undefined' && !auth?.currentUser) {
+      throw new Error('Authentication required: Please log in to request a subscription');
+    }
+    if (auth?.currentUser && auth.currentUser.uid !== params.sellerId) {
+      throw new Error('Forbidden: Cannot request subscription on behalf of another seller');
+    }
+
     const plan = this.getPlanById(params.planId);
     if (!plan) throw new Error('Selected plan does not exist');
 
@@ -269,6 +286,7 @@ export const subscriptionService = {
     const isFree = plan.tier === 'FREE' || plan.price === 0;
     const initialStatus: SubscriptionStatus = params.paymentReference ? 'PENDING_REVIEW' : 'PENDING_PAYMENT';
 
+    const cleanRef = params.paymentReference?.trim();
     const newSub: SellerSubscription = {
       id: `SUB-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
       sellerId: params.sellerId,
@@ -279,7 +297,8 @@ export const subscriptionService = {
       billingClassification: isFree ? 'FREE' : 'MANUAL',
       price: plan.price,
       paymentMethod: params.paymentMethod,
-      paymentReference: params.paymentReference?.trim(),
+      paymentReference: cleanRef,
+      paymentReferenceNumber: cleanRef,
       submittedAt: startDate,
       startDate,
       endDate,
@@ -289,15 +308,8 @@ export const subscriptionService = {
     };
 
     try {
-      await setDoc(doc(db, SUBSCRIPTIONS_COLLECTION, newSub.id), newSub);
+      await persistSubscriptionToFirestore(newSub.id, newSub, false);
       const currentSubs = loadSubscriptions();
-      // Invalidate existing active subscriptions for this seller
-      currentSubs.forEach(s => {
-        if (s.sellerId === params.sellerId && s.status === 'ACTIVE') {
-          s.status = 'CANCELLED';
-          s.updatedAt = startDate;
-        }
-      });
       currentSubs.unshift(newSub);
       persistSubscriptions(currentSubs);
     } catch (err) {
@@ -425,19 +437,20 @@ export const subscriptionService = {
     }
 
     const now = new Date().toISOString();
-    target.status = 'CANCELLED';
-    target.updatedAt = now;
 
+    // F-13: Authoritative Firestore write MUST succeed BEFORE mutating local state (Fail-Closed)
     try {
-      await updateDoc(doc(db, SUBSCRIPTIONS_COLLECTION, subscriptionId), {
+      await persistSubscriptionToFirestore(subscriptionId, {
         status: 'CANCELLED',
         updatedAt: now,
-      });
-    } catch (err) {
+      }, true);
+    } catch (err: any) {
       handleFirestoreError(err, OperationType.UPDATE, `${SUBSCRIPTIONS_COLLECTION}/${subscriptionId}`);
-      throw err;
+      throw new Error(`Database write failure (Fail-Closed): Unable to cancel subscription in Firestore (${err?.message || err})`);
     }
 
+    target.status = 'CANCELLED';
+    target.updatedAt = now;
     persistSubscriptions(currentSubs);
     return target;
   },
@@ -486,21 +499,24 @@ export const subscriptionService = {
     if (!target) throw new Error('Subscription not found');
 
     const now = new Date().toISOString();
-    target.status = 'CANCELLED';
-    target.notes = reason ? `${target.notes || ''} [Rejected: ${reason}]`.trim() : target.notes;
-    target.updatedAt = now;
+    const nextNotes = reason ? `${target.notes || ''} [Rejected: ${reason}]`.trim() : target.notes;
 
-    persistSubscriptions(currentSubs);
-
+    // F-13: Authoritative Firestore write MUST succeed BEFORE mutating local state (Fail-Closed)
     try {
-      await updateDoc(doc(db, SUBSCRIPTIONS_COLLECTION, subscriptionId), {
+      await persistSubscriptionToFirestore(subscriptionId, {
         status: 'CANCELLED',
-        notes: target.notes || '',
+        notes: nextNotes || '',
         updatedAt: now,
-      });
-    } catch (err) {
+      }, true);
+    } catch (err: any) {
       handleFirestoreError(err, OperationType.UPDATE, `${SUBSCRIPTIONS_COLLECTION}/${subscriptionId}`);
+      throw new Error(`Database write failure (Fail-Closed): Unable to reject subscription in Firestore (${err?.message || err})`);
     }
+
+    target.status = 'CANCELLED';
+    target.notes = nextNotes;
+    target.updatedAt = now;
+    persistSubscriptions(currentSubs);
 
     await auditLogService.logAction({
       actorId: adminId,

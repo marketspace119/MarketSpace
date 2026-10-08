@@ -4,7 +4,8 @@ import { SellerSubscription, SubscriptionStatus } from '../src/types';
 
 export interface ReviewSubscriptionPayload {
   subscriptionId: string;
-  action: 'APPROVE' | 'REJECT' | 'CANCEL';
+  action?: 'APPROVE' | 'REJECT' | 'CANCEL';
+  decision?: 'APPROVE' | 'APPROVED' | 'REJECT' | 'REJECTED' | 'CANCEL' | 'CANCELLED';
   notes?: string;
 }
 
@@ -14,7 +15,15 @@ export async function processSubscriptionReviewGateway(
 ) {
   const caller = await requireVerifiedPlatformAdmin(authHeader);
   const subscriptionId = (payload.subscriptionId || '').trim();
-  const action = payload.action;
+  const rawAction = String(payload.action || payload.decision || '').toUpperCase();
+  const action =
+    rawAction === 'APPROVED'
+      ? 'APPROVE'
+      : rawAction === 'REJECTED'
+      ? 'REJECT'
+      : rawAction === 'CANCELLED'
+      ? 'CANCEL'
+      : (rawAction as 'APPROVE' | 'REJECT' | 'CANCEL');
   const notes = payload.notes?.trim();
 
   if (!subscriptionId) {
@@ -34,8 +43,16 @@ export async function processSubscriptionReviewGateway(
   const now = new Date().toISOString();
 
   const result = await adminDb.runTransaction(async (transaction) => {
-    const subRef = adminDb.collection('subscriptions').doc(subscriptionId);
-    const subDoc = await transaction.get(subRef);
+    let subRef = adminDb.collection('subscriptions').doc(subscriptionId);
+    let subDoc = await transaction.get(subRef);
+    if (!subDoc.exists) {
+      const aliasRef = adminDb.collection('sellerSubscriptions').doc(subscriptionId);
+      const aliasDoc = await transaction.get(aliasRef);
+      if (aliasDoc.exists) {
+        subRef = aliasRef;
+        subDoc = aliasDoc;
+      }
+    }
     if (!subDoc.exists) {
       const err = new Error(`الاشتراك ${subscriptionId} غير موجود.`);
       (err as any).statusCode = 404;
@@ -44,11 +61,23 @@ export async function processSubscriptionReviewGateway(
 
     const prev = subDoc.data() as SellerSubscription;
 
+    // Acquire per-seller subscription lock inside transaction to serialize concurrent approvals
+    const subLockRef = adminDb.collection('seller_subscription_locks').doc(prev.sellerId || 'unknown_seller');
+    await transaction.get(subLockRef);
+
+    // F-07 & F-28: Terminal state protection — EXPIRED, CANCELLED, or REJECTED subscriptions cannot be reopened
+    if (['EXPIRED', 'CANCELLED', 'REJECTED'].includes(prev.status)) {
+      const err = new Error(`Terminal subscription state violation: Cannot modify subscription in terminal state ${prev.status}`);
+      (err as any).statusCode = 409;
+      throw err;
+    }
+
     let newStatus: SubscriptionStatus;
+    const docsToSupersede: FirebaseFirestore.DocumentReference[] = [];
     if (action === 'APPROVE') {
       if (prev.status === 'ACTIVE') {
         const err = new Error('الاشتراك نشط بالفعل.');
-        (err as any).statusCode = 400;
+        (err as any).statusCode = 409;
         throw err;
       }
 
@@ -67,7 +96,8 @@ export async function processSubscriptionReviewGateway(
       }
 
       // Require verified payment proof if subscription has a non-zero price
-      if (prev.price && prev.price > 0 && !prev.paymentReferenceNumber) {
+      const refNum = prev.paymentReferenceNumber || prev.paymentReference;
+      if (prev.price && prev.price > 0 && !refNum) {
         const err = new Error('لا يمكن تفعيل اشتراك مدفوع دون إرفاق وتأكيد الرقم المرجعي للتحويل المالي.');
         (err as any).statusCode = 400;
         throw err;
@@ -75,28 +105,40 @@ export async function processSubscriptionReviewGateway(
 
       newStatus = 'ACTIVE';
 
-      // Supersede any existing ACTIVE subscriptions for this seller to prevent overlapping entitlements
-      const activeSubsSnap = await adminDb
-        .collection('subscriptions')
-        .where('sellerId', '==', prev.sellerId)
-        .where('status', '==', 'ACTIVE')
-        .get();
-
-      if (!activeSubsSnap.empty) {
-        for (const docSnap of activeSubsSnap.docs) {
-          if (docSnap.id !== subscriptionId) {
-            const oldSubRef = docSnap.ref || adminDb.collection('subscriptions').doc(docSnap.id);
-            transaction.set(oldSubRef, {
-              status: 'EXPIRED',
-              supersededBy: subscriptionId,
-              updatedAt: now,
-            }, { merge: true });
+      // Supersede any existing ACTIVE/active subscriptions for this seller in both collections (all reads before writes)
+      for (const colName of ['subscriptions', 'sellerSubscriptions']) {
+        const colObj = adminDb.collection(colName) as any;
+        if (colObj && typeof colObj.where === 'function') {
+          const sellerSubsSnap = await colObj.where('sellerId', '==', prev.sellerId).get();
+          if (sellerSubsSnap && !sellerSubsSnap.empty && Array.isArray(sellerSubsSnap.docs)) {
+            for (const docSnap of sellerSubsSnap.docs) {
+              const sData = typeof docSnap.data === 'function' ? docSnap.data() : docSnap;
+              const st = String(sData?.status || '').toUpperCase();
+              if (docSnap.id !== subscriptionId && st === 'ACTIVE') {
+                docsToSupersede.push(docSnap.ref || adminDb.collection(colName).doc(docSnap.id));
+              }
+            }
           }
         }
       }
     } else {
       newStatus = 'CANCELLED';
     }
+
+    for (const oldSubRef of docsToSupersede) {
+      transaction.set(oldSubRef, {
+        status: 'EXPIRED',
+        supersededBy: subscriptionId,
+        updatedAt: now,
+      }, { merge: true });
+    }
+
+    transaction.set(subLockRef, {
+      sellerId: prev.sellerId,
+      activeSubscriptionId: action === 'APPROVE' ? subscriptionId : null,
+      lastAction: action,
+      updatedAt: now,
+    }, { merge: true });
 
     const updated: Partial<SellerSubscription> = {
       ...prev,

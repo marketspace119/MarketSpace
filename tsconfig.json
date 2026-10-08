@@ -25,7 +25,8 @@
   },
   "include": [
     "src",
-    "server"
+    "server",
+    "server.ts"
   ],
   "exclude": [
     "node_modules",

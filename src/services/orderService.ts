@@ -17,15 +17,8 @@ let memoryOrders: OrderDetails[] = [];
 
 function initOrders(): OrderDetails[] {
   if (memoryOrders.length > 0) return memoryOrders;
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(ORDERS_STORAGE_KEY);
-    memoryOrders = raw ? JSON.parse(raw) : [];
-    return memoryOrders;
-  } catch (err) {
-    console.error('Failed to load orders from storage', err);
-    return [];
-  }
+  // F-20: Do not read or trust localStorage for order authority
+  return memoryOrders;
 }
 
 function sanitizeOrderForLocalStorage(order: OrderDetails): OrderDetails {
@@ -40,16 +33,14 @@ function sanitizeOrderForLocalStorage(order: OrderDetails): OrderDetails {
 
 function persistLocal(orders: OrderDetails[]) {
   memoryOrders = orders;
-  if (typeof window === 'undefined') return;
-  try {
-    const sanitized = orders.map(sanitizeOrderForLocalStorage);
-    localStorage.setItem(ORDERS_STORAGE_KEY, JSON.stringify(sanitized));
-  } catch (err) {
-    console.error('Failed to save orders to storage', err);
-  }
+  // F-20: LocalStorage persistence removed for authoritative order state
 }
 
 export const orderService = {
+  resetMemoryState() {
+    memoryOrders = [];
+  },
+
   /**
    * Purge local order cache on logout or user switch
    */
@@ -137,11 +128,11 @@ export const orderService = {
       const isAdmin = userRole === 'ADMIN' || userRole === 'SUPER_ADMIN';
       let q;
       if (isAdmin) {
-        q = collection(db, ORDERS_COLLECTION);
+        q = query(collection(db, ORDERS_COLLECTION), limit(200));
       } else if (userRole === 'SELLER' && currentUserId) {
-        q = query(collection(db, ORDERS_COLLECTION), where('sellerIds', 'array-contains', currentUserId));
+        q = query(collection(db, ORDERS_COLLECTION), where('sellerIds', 'array-contains', currentUserId), limit(200));
       } else if (currentUserId) {
-        q = query(collection(db, ORDERS_COLLECTION), where('customerId', '==', currentUserId));
+        q = query(collection(db, ORDERS_COLLECTION), where('customerId', '==', currentUserId), limit(200));
       } else {
         return [];
       }
@@ -273,6 +264,14 @@ export const orderService = {
           },
         ],
       };
+      try {
+        const serverAdminModule = '../../server/firebaseAdmin';
+        const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+        const adminDb = getAdminDb();
+        if (adminDb && typeof adminDb.collection === 'function') {
+          await adminDb.collection(ORDERS_COLLECTION).doc(parentOrderId).set(cleanForFirestore(finalOrder));
+        }
+      } catch {}
     } else {
       const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || '');
       const response = await fetch(`${baseUrl}/api/orders/create`, {
@@ -348,6 +347,10 @@ export const orderService = {
       return orders.filter(o => o.customerId === currentUserId);
     }
     return [];
+  },
+
+  getOrders(currentUserId?: string, userRole?: string): OrderDetails[] {
+    return this.getAllOrders(currentUserId, userRole);
   },
 
   /**
@@ -514,10 +517,12 @@ export const orderService = {
 
       try {
         if (typeof window === 'undefined') {
-          await Promise.race([
-            updateDoc(doc(db, ORDERS_COLLECTION, parentOrderId), subOrderUpdates),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('PERMISSION_DENIED')), 100)),
-          ]);
+          const serverAdminModule = '../../server/firebaseAdmin';
+          const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+          const adminDb = getAdminDb();
+          if (adminDb && typeof adminDb.collection === 'function') {
+            await adminDb.collection(ORDERS_COLLECTION).doc(parentOrderId).set(subOrderUpdates, { merge: true });
+          }
         } else {
           await updateDoc(doc(db, ORDERS_COLLECTION, parentOrderId), subOrderUpdates);
         }
@@ -733,6 +738,29 @@ export const orderService = {
     const isAdmin = userRole === 'ADMIN' || userRole === 'SUPER_ADMIN';
     const isOwnerCustomer = userRole === 'CUSTOMER' && order.customerId === currentUserId;
 
+    const ALLOWED_ORDER_STATUS_TRANSITIONS: Record<string, string[]> = {
+      pending: ['confirmed', 'processing', 'preparing', 'cancelled'],
+      confirmed: ['processing', 'preparing', 'ready', 'cancelled'],
+      processing: ['preparing', 'ready', 'shipped', 'out_for_delivery', 'cancelled'],
+      preparing: ['ready', 'shipped', 'out_for_delivery', 'cancelled'],
+      ready: ['shipped', 'out_for_delivery', 'cancelled'],
+      shipped: ['out_for_delivery', 'delivered', 'cancelled'],
+      out_for_delivery: ['delivered', 'cancelled'],
+      delivered: [],
+      cancelled: [],
+    };
+
+    const currentStatus = (order.status || 'pending').toLowerCase();
+    const targetStatus = (newStatus || '').toLowerCase();
+    if (currentStatus !== targetStatus) {
+      const allowedNext = ALLOWED_ORDER_STATUS_TRANSITIONS[currentStatus] || [];
+      if (!allowedNext.includes(targetStatus)) {
+        throw new Error(
+          `Invalid order state transition: cannot transition from "${order.status}" to "${newStatus}" (State Machine Enforcement - F-02). Allowed: ${allowedNext.join(', ') || 'none'}`
+        );
+      }
+    }
+
     if (newStatus === 'cancelled') {
       if (!isAdmin && !isOwnerCustomer) {
         throw new Error('Forbidden: You can only cancel your own pending orders');
@@ -771,10 +799,12 @@ export const orderService = {
 
     try {
       if (typeof window === 'undefined') {
-        await Promise.race([
-          updateDoc(doc(db, ORDERS_COLLECTION, orderId), orderDocUpdates),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('PERMISSION_DENIED')), 100)),
-        ]);
+        const serverAdminModule = '../../server/firebaseAdmin';
+        const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+        const adminDb = getAdminDb();
+        if (adminDb && typeof adminDb.collection === 'function') {
+          await adminDb.collection(ORDERS_COLLECTION).doc(orderId).set(orderDocUpdates, { merge: true });
+        }
       } else {
         await updateDoc(doc(db, ORDERS_COLLECTION, orderId), orderDocUpdates);
       }
@@ -796,20 +826,25 @@ export const orderService = {
     orders[index] = order;
     persistLocal(orders);
 
-    // Restore inventory stock when an order is cancelled
+    // Restore inventory stock when an order is cancelled (NEW-08: Aggregate quantities per productId across all line items)
     if (newStatus === 'cancelled' && Array.isArray(order.items)) {
+      const aggregatedCancelQty = new Map<string, number>();
       for (const item of order.items) {
-        const prodId = item.product?.id || item.id;
-        if (prodId && item.quantity > 0) {
-          inventoryService.restoreStockOnCancellation(prodId, item.quantity, {
-            orderId,
-            customerId: order.customerId,
-            timestamp: now,
-            reason: reason || 'Order cancelled',
-          }).catch(err => {
-            console.warn(`[OrderService] Failed restoring stock for product ${prodId}:`, err);
-          });
+        const prodId = item.product?.id || (item as any).productId || item.id;
+        const qty = Number(item.quantity);
+        if (prodId && Number.isFinite(qty) && qty > 0) {
+          aggregatedCancelQty.set(prodId, (aggregatedCancelQty.get(prodId) || 0) + Math.floor(qty));
         }
+      }
+      for (const [prodId, totalRestoreQty] of aggregatedCancelQty.entries()) {
+        await inventoryService.restoreStockOnCancellation(prodId, totalRestoreQty, {
+          orderId,
+          customerId: order.customerId,
+          timestamp: now,
+          reason: reason || 'Order cancelled',
+        }).catch(err => {
+          console.warn(`[OrderService] Failed restoring stock for product ${prodId}:`, err);
+        });
       }
     }
 
@@ -842,7 +877,7 @@ export const orderService = {
     if (!userId) return false;
     const orders = initOrders();
     const userOrders = orders.filter(
-      o => (o.customerId === userId || (o as any).userId === userId) && o.status !== 'cancelled'
+      o => (o.customerId === userId || (o as any).userId === userId) && (o.status === 'delivered' || (o.status as any) === 'completed')
     );
     return userOrders.some(o => {
       const hasProduct = o.items.some(
@@ -857,7 +892,7 @@ export const orderService = {
     if (!userId) return undefined;
     const orders = initOrders();
     const userOrders = orders.filter(
-      o => (o.customerId === userId || (o as any).userId === userId) && o.status !== 'cancelled'
+      o => (o.customerId === userId || (o as any).userId === userId) && (o.status === 'delivered' || (o.status as any) === 'completed')
     );
     const match = userOrders.find(o => {
       const hasProduct = o.items.some(

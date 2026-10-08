@@ -119,83 +119,252 @@ async function getAuthoritativeCoupon(code: string) {
   return null;
 }
 
+export interface AuthoritativeSellerPlan {
+  id: string;
+  tier: 'FREE' | 'BASIC' | 'BUSINESS' | 'PREMIUM';
+  maxProducts: number;
+  commissionAdjustment: number;
+  active: boolean;
+}
+
+export const AUTHORITATIVE_SELLER_PLANS: Record<string, AuthoritativeSellerPlan> = {
+  plan_free: { id: 'plan_free', tier: 'FREE', maxProducts: 10, commissionAdjustment: 0, active: true },
+  FREE: { id: 'plan_free', tier: 'FREE', maxProducts: 10, commissionAdjustment: 0, active: true },
+  plan_basic: { id: 'plan_basic', tier: 'BASIC', maxProducts: 50, commissionAdjustment: 1, active: true },
+  BASIC: { id: 'plan_basic', tier: 'BASIC', maxProducts: 50, commissionAdjustment: 1, active: true },
+  plan_business: { id: 'plan_business', tier: 'BUSINESS', maxProducts: 250, commissionAdjustment: 2, active: true },
+  BUSINESS: { id: 'plan_business', tier: 'BUSINESS', maxProducts: 250, commissionAdjustment: 2, active: true },
+  plan_premium: { id: 'plan_premium', tier: 'PREMIUM', maxProducts: 1000, commissionAdjustment: 3, active: true },
+  PREMIUM: { id: 'plan_premium', tier: 'PREMIUM', maxProducts: 1000, commissionAdjustment: 3, active: true },
+};
+
 /**
- * PART 14: Single Source of Truth Commission Resolution
+ * Authoritative Server-Side Subscription & Plan Resolver (Single Source of Truth: SERVER)
+ * Validates active status, plan ID, plan status, expiry, commissionAdjustment, store ownership, and seller ownership.
+ * Never trusts client-side localStorage or memory caches.
+ */
+export async function resolveAuthoritativeSellerSubscription(
+  sellerId: string,
+  storeId?: string
+): Promise<AuthoritativeSellerPlan> {
+  if (!sellerId) {
+    return AUTHORITATIVE_SELLER_PLANS.plan_free;
+  }
+
+  try {
+    const adminDb = getAdminDb();
+    const subsCol = adminDb.collection('subscriptions') as any;
+    if (!subsCol || typeof subsCol.where !== 'function') {
+      return AUTHORITATIVE_SELLER_PLANS.plan_free;
+    }
+
+    const snap = await subsCol.where('sellerId', '==', sellerId).get();
+    if (!snap || snap.empty || !Array.isArray(snap.docs)) {
+      return AUTHORITATIVE_SELLER_PLANS.plan_free;
+    }
+
+    const nowMs = Date.now();
+    let bestPlan: AuthoritativeSellerPlan | null = null;
+    let bestTimestamp = -1;
+
+    for (const docSnap of snap.docs) {
+      const sub = typeof docSnap.data === 'function' ? docSnap.data() : docSnap;
+      if (!sub || typeof sub !== 'object') continue;
+
+      // 1. Seller ownership check
+      if (sub.sellerId !== sellerId) continue;
+
+      // 2. Store ownership check (if subscription is scoped to a storeId)
+      if (sub.storeId && storeId && sub.storeId !== storeId) continue;
+
+      // 3. Active subscription status check
+      const statusStr = String(sub.status || '').toLowerCase();
+      if (statusStr !== 'active') continue;
+
+      // 4. Expiry check (reject expired or malformed end dates)
+      const rawExpiry = sub.endDate || sub.expiresAt;
+      if (rawExpiry !== undefined && rawExpiry !== null && rawExpiry !== '') {
+        const expiryMs = new Date(rawExpiry).getTime();
+        if (!Number.isFinite(expiryMs) || isNaN(expiryMs) || expiryMs <= nowMs) {
+          continue;
+        }
+      }
+
+      // 5. Plan ID & Plan Status check
+      const rawPlanKey = String(sub.planId || sub.planTier || '');
+      const canonicalPlan = AUTHORITATIVE_SELLER_PLANS[rawPlanKey];
+      if (!canonicalPlan || !canonicalPlan.active) {
+        // Check if custom plan document exists in Firestore sellerPlans collection
+        let resolvedCustom: AuthoritativeSellerPlan | null = null;
+        if (rawPlanKey && typeof adminDb.collection === 'function') {
+          try {
+            const planDoc = await adminDb.collection('sellerPlans').doc(rawPlanKey).get();
+            if (planDoc && planDoc.exists) {
+              const pData = planDoc.data() || {};
+              const adj = Number(pData.commissionAdjustment);
+              const maxP = Number(pData.maxProducts);
+              if (
+                pData.active !== false &&
+                Number.isFinite(adj) &&
+                adj >= 0 &&
+                adj <= 50 &&
+                Number.isFinite(maxP) &&
+                maxP > 0
+              ) {
+                resolvedCustom = {
+                  id: rawPlanKey,
+                  tier: (pData.tier || 'BASIC') as any,
+                  maxProducts: Math.floor(maxP),
+                  commissionAdjustment: adj,
+                  active: true,
+                };
+              }
+            }
+          } catch {
+            // Malformed or unreadable custom plan fails closed to free plan
+          }
+        }
+        if (!resolvedCustom) continue;
+
+        const createdMs = new Date(sub.updatedAt || sub.startDate || sub.createdAt || 0).getTime() || 0;
+        if (createdMs >= bestTimestamp) {
+          bestTimestamp = createdMs;
+          bestPlan = resolvedCustom;
+        }
+        continue;
+      }
+
+      // Validate if subscription overrides commissionAdjustment with malformed value
+      if (sub.commissionAdjustment !== undefined) {
+        const subAdj = Number(sub.commissionAdjustment);
+        if (!Number.isFinite(subAdj) || isNaN(subAdj) || subAdj < 0 || subAdj > 50) {
+          continue; // Malformed plan payload rejected
+        }
+      }
+
+      const createdMs = new Date(sub.updatedAt || sub.startDate || sub.createdAt || 0).getTime() || 0;
+      if (createdMs >= bestTimestamp) {
+        bestTimestamp = createdMs;
+        bestPlan = canonicalPlan;
+      }
+    }
+
+    return bestPlan || AUTHORITATIVE_SELLER_PLANS.plan_free;
+  } catch (err) {
+    console.warn('[OrderGateway:Subscription] Falling back to FREE plan due to lookup error:', err);
+    return AUTHORITATIVE_SELLER_PLANS.plan_free;
+  }
+}
+
+/**
+ * PART 14: Single Source of Truth Commission Resolution (Server-Authoritative)
  * Priority:
  *  1. Store Custom Override (store.commissionRate)
  *  2. Category Specific Rate (categoryRates[category])
  *  3. Seller Type Rate (sellerTypeRates[sellerType])
  *  4. Global Platform Rate (platformSettings.defaultCommissionRate)
+ * Then subtracts verified active subscription commissionAdjustment:
+ *  effectiveRate = clamp(baseRate - planDiscount, 0, 50)
  */
-async function resolveAuthoritativeCommissionRate(
+export async function resolveAuthoritativeCommissionRate(
   store: any,
   sellerType: string,
-  category?: string
-): Promise<{ rate: number; policySource: string }> {
-  // 1. Store Custom Override (Bounded strictly between 0% and 50% - F-03)
-  if (store && typeof store.commissionRate === 'number' && Number.isFinite(store.commissionRate) && store.commissionRate >= 0) {
-    const boundedRate = Math.min(50, Math.max(0, store.commissionRate));
-    return { rate: boundedRate, policySource: 'seller_specific' };
-  }
-
-  let globalRate = DEFAULT_COMMISSION_RATE;
-  let sellerTypeRates: Record<string, number> = {
-    restaurant: 6,
-    service: 8,
-    store: 10,
-    classified: 5,
-  };
-  let categoryRates: Record<string, number> = {
-    electronics: 7,
-    digital: 5,
-    cosmetics: 9,
-    fashion: 10,
-    groceries: 6,
-    automotive: 8,
-  };
-
-  try {
-    const adminDb = getAdminDb();
-    const settingsSnap = await adminDb.collection('platformSettings').doc('default').get();
-    if (settingsSnap.exists) {
-      const data = settingsSnap.data();
-      if (typeof data?.defaultCommissionRate === 'number') {
-        globalRate = data.defaultCommissionRate;
-      }
-      if (data?.sellerTypeCommissionRates) {
-        sellerTypeRates = { ...sellerTypeRates, ...data.sellerTypeCommissionRates };
-      }
-      if (data?.categoryCommissionRates) {
-        categoryRates = { ...categoryRates, ...data.categoryCommissionRates };
-      }
-    } else {
-      // In production, missing authoritative settings MUST fail closed (OPEN-09)
-      if (process.env.NODE_ENV === 'production') {
-        throw new Error('Authoritative platform settings document (platformSettings/default) is missing. Cannot resolve commission rate (Fail-Closed).');
-      }
-    }
-  } catch (err: any) {
-    console.error('[OrderGateway:Error] Failed to read platformSettings for commission resolution:', err);
-    throw new Error('Database error while querying authoritative commission policy. Transaction aborted (Fail-Closed).');
-  }
+  category?: string,
+  sellerId?: string
+): Promise<{
+  rate: number;
+  baseRate: number;
+  appliedDiscount: number;
+  appliedPlanId: string;
+  policySource: string;
+}> {
+  let baseRate = DEFAULT_COMMISSION_RATE;
+  let policySource = 'global';
 
   const clampCommission = (r: number): number => {
     if (typeof r !== 'number' || !Number.isFinite(r) || isNaN(r)) return DEFAULT_COMMISSION_RATE;
     return Math.min(50, Math.max(0, r));
   };
 
-  // 2. Category Rate
-  if (category && categoryRates[category] !== undefined) {
-    return { rate: clampCommission(categoryRates[category]), policySource: 'category' };
+  // 1. Store Custom Override (Bounded strictly between 0% and 50% - F-03)
+  if (store && typeof store.commissionRate === 'number' && Number.isFinite(store.commissionRate) && store.commissionRate >= 0) {
+    baseRate = Math.min(50, Math.max(0, store.commissionRate));
+    policySource = 'seller_specific';
+  } else {
+    let globalRate = DEFAULT_COMMISSION_RATE;
+    let sellerTypeRates: Record<string, number> = {
+      restaurant: 6,
+      service: 8,
+      store: 10,
+      classified: 5,
+    };
+    let categoryRates: Record<string, number> = {
+      electronics: 7,
+      digital: 5,
+      cosmetics: 9,
+      fashion: 10,
+      groceries: 6,
+      automotive: 8,
+    };
+
+    try {
+      const adminDb = getAdminDb();
+      const settingsSnap = await adminDb.collection('platformSettings').doc('default').get();
+      if (settingsSnap.exists) {
+        const data = settingsSnap.data();
+        if (typeof data?.defaultCommissionRate === 'number') {
+          globalRate = data.defaultCommissionRate;
+        }
+        if (data?.sellerTypeCommissionRates) {
+          sellerTypeRates = { ...sellerTypeRates, ...data.sellerTypeCommissionRates };
+        }
+        if (data?.categoryCommissionRates) {
+          categoryRates = { ...categoryRates, ...data.categoryCommissionRates };
+        }
+      } else {
+        // In production, missing authoritative settings MUST fail closed (OPEN-09)
+        if (process.env.NODE_ENV === 'production') {
+          throw new Error('Authoritative platform settings document (platformSettings/default) is missing. Cannot resolve commission rate (Fail-Closed).');
+        }
+      }
+    } catch (err: any) {
+      console.error('[OrderGateway:Error] Failed to read platformSettings for commission resolution:', err);
+      throw new Error('Database error while querying authoritative commission policy. Transaction aborted (Fail-Closed).');
+    }
+
+    // 2. Category Rate
+    if (category && categoryRates[category] !== undefined) {
+      baseRate = clampCommission(categoryRates[category]);
+      policySource = 'category';
+    }
+    // 3. Seller Type Rate
+    else if (sellerType && sellerTypeRates[sellerType] !== undefined) {
+      baseRate = clampCommission(sellerTypeRates[sellerType]);
+      policySource = 'seller_type';
+    }
+    // 4. Global Platform Rate
+    else {
+      baseRate = clampCommission(globalRate);
+      policySource = 'global';
+    }
   }
 
-  // 3. Seller Type Rate
-  if (sellerType && sellerTypeRates[sellerType] !== undefined) {
-    return { rate: clampCommission(sellerTypeRates[sellerType]), policySource: 'seller_type' };
-  }
+  // 5. Apply Authoritative Subscription Plan Commission Discount
+  const effectiveSellerId = sellerId || store?.sellerId || '';
+  const effectiveStoreId = store?.id || store?.storeId;
+  const activePlan = await resolveAuthoritativeSellerSubscription(effectiveSellerId, effectiveStoreId);
+  const planDiscount = Math.max(0, Math.min(50, Number(activePlan.commissionAdjustment) || 0));
 
-  // 4. Global Platform Rate
-  return { rate: clampCommission(globalRate), policySource: 'global' };
+  const rawEffective = baseRate - planDiscount;
+  const effectiveRate = Math.min(50, Math.max(0, Number(rawEffective.toFixed(2))));
+
+  return {
+    rate: effectiveRate,
+    baseRate,
+    appliedDiscount: planDiscount,
+    appliedPlanId: activePlan.id,
+    policySource,
+  };
 }
 
 /**
@@ -438,19 +607,20 @@ export async function processOrderGateway(
     const storeDeliveryFee = isFreeShipping ? 0 : Math.max(0, Math.min(500, rawDeliveryFee));
     serverCalculatedShipping += storeDeliveryFee;
 
-    // Authoritative 4-Tier Commission calculation (PART 14)
-    const storeSellerType = (store?.sellerType as any) || 'store';
-    const storeCategory = storeItems[0]?.product?.category;
-    const { rate: commissionRate, policySource } = await resolveAuthoritativeCommissionRate(
-      store,
-      storeSellerType,
-      storeCategory
-    );
-    const platformCommission = Number(((storeSubtotal * commissionRate) / 100).toFixed(2));
-    const sellerRevenue = Number((storeSubtotal - platformCommission).toFixed(2));
-
+    // Authoritative 4-Tier Commission + Subscription Plan Discount calculation (PART 14)
     const subOrderId = `${parentOrderId}-S${storeIndex++}`;
     const sellerId = store?.sellerId || (storeItems[0].product.sellerId || 'seller_system');
+    const storeSellerType = (store?.sellerType as any) || 'store';
+    const storeCategory = storeItems[0]?.product?.category;
+    const { rate: effectiveCommissionRate, baseRate, policySource } = await resolveAuthoritativeCommissionRate(
+      { ...store, id: storeId },
+      storeSellerType,
+      storeCategory,
+      sellerId
+    );
+    const roundedStoreSubtotal = Number(storeSubtotal.toFixed(2));
+    const platformCommission = Number(((roundedStoreSubtotal * effectiveCommissionRate) / 100).toFixed(2));
+    const sellerRevenue = Number((roundedStoreSubtotal - platformCommission).toFixed(2));
     const sellerType = storeSellerType;
 
     vendorOrders.push({
@@ -461,11 +631,11 @@ export async function processOrderGateway(
       sellerId,
       sellerType,
       items: storeItems,
-      subtotal: Number(storeSubtotal.toFixed(2)),
+      subtotal: roundedStoreSubtotal,
       deliveryFee: Number(storeDeliveryFee.toFixed(2)),
-      total: Number((storeSubtotal + storeDeliveryFee).toFixed(2)),
-      commissionRate,
-      effectiveCommissionRate: commissionRate,
+      total: Number((roundedStoreSubtotal + storeDeliveryFee).toFixed(2)),
+      commissionRate: baseRate,
+      effectiveCommissionRate,
       commissionPolicyUsed: policySource as any,
       platformCommission,
       sellerRevenue,
@@ -544,8 +714,9 @@ export async function processOrderGateway(
     let discount = 0;
     if (coupon.discountType === 'percentage') {
       discount = (eligibleSubtotal * (Number(coupon.discountValue) || 0)) / 100;
-      if (coupon.maxDiscountAmount && discount > coupon.maxDiscountAmount) {
-        discount = coupon.maxDiscountAmount;
+      const maxCap = Number((coupon as any).maxDiscountAmount ?? (coupon as any).maxDiscount) || 0;
+      if (maxCap > 0 && discount > maxCap) {
+        discount = maxCap;
       }
     } else {
       discount = Number(coupon.discountValue) || 0;
@@ -577,11 +748,13 @@ export async function processOrderGateway(
 
   const sellerIds = Array.from(new Set(vendorOrders.map(v => v.sellerId)));
   const vendorStoreIds = Array.from(new Set(vendorOrders.map(v => v.storeId)));
-  const finalOrder: OrderDetails = {
+  const productIds = Array.from(new Set(verifiedOrderItems.map(it => it.product?.id || (it as any).productId).filter(Boolean)));
+  const finalOrder: OrderDetails & { productIds?: string[] } = {
     orderId: parentOrderId,
     customerId: verifiedCustomerId,
     sellerIds,
     vendorStoreIds,
+    productIds,
     customerName: payload.customerName.trim(),
     phone: payload.phone.trim(),
     ...(payload.email?.trim() ? { email: payload.email.trim() } : {}),
@@ -690,8 +863,9 @@ export async function processOrderGateway(
         let recomputedDiscount = 0;
         if (authoritativeDiscountType === 'percentage') {
           recomputedDiscount = (serverCalculatedSubtotal * authoritativeDiscountValue) / 100;
-          if (typeof cData.maxDiscount === 'number' && cData.maxDiscount > 0) {
-            recomputedDiscount = Math.min(recomputedDiscount, cData.maxDiscount);
+          const maxCap = Number(cData.maxDiscountAmount ?? cData.maxDiscount) || 0;
+          if (maxCap > 0) {
+            recomputedDiscount = Math.min(recomputedDiscount, maxCap);
           }
         } else {
           recomputedDiscount = Math.min(serverCalculatedSubtotal, authoritativeDiscountValue);
@@ -800,7 +974,8 @@ export async function processOrderGateway(
 }
 
 export interface SubOrderUpdateRequest {
-  parentOrderId: string;
+  parentOrderId?: string;
+  orderId?: string;
   subOrderId: string;
   newStatus: string;
   trackingNumber?: string;
@@ -821,7 +996,8 @@ export async function processSubOrderUpdateGateway(
   }
   const caller = await requireAuthenticatedCaller(authHeader);
 
-  const { parentOrderId, subOrderId, newStatus, trackingNumber, note } = payload;
+  const parentOrderId = payload.parentOrderId || payload.orderId;
+  const { subOrderId, newStatus, trackingNumber, note } = payload;
   if (!parentOrderId || !subOrderId || !newStatus) {
     throw new Error('Missing required fields: parentOrderId, subOrderId, newStatus');
   }
@@ -871,8 +1047,9 @@ export async function processSubOrderUpdateGateway(
       }
 
       const ALLOWED_SUBORDER_TRANSITIONS: Record<string, string[]> = {
-        pending: ['confirmed', 'preparing', 'cancelled'],
-        confirmed: ['preparing', 'ready', 'cancelled'],
+        pending: ['confirmed', 'preparing', 'processing', 'cancelled'],
+        confirmed: ['preparing', 'processing', 'ready', 'cancelled'],
+        processing: ['preparing', 'ready', 'shipped', 'out_for_delivery', 'cancelled'],
         preparing: ['ready', 'shipped', 'out_for_delivery', 'cancelled'],
         ready: ['shipped', 'out_for_delivery', 'cancelled'],
         shipped: ['out_for_delivery', 'delivered', 'cancelled'],
@@ -881,7 +1058,7 @@ export async function processSubOrderUpdateGateway(
         cancelled: [],
       };
 
-      if (currentStatus !== newStatus && !isAdminUser) {
+      if (currentStatus !== newStatus) {
         const allowed = ALLOWED_SUBORDER_TRANSITIONS[currentStatus] || [];
         if (!allowed.includes(newStatus)) {
           throw new Error(`Invalid forward transition from "${currentStatus}" to "${newStatus}". Allowed transitions: ${allowed.length ? allowed.join(', ') : 'none'}`);
@@ -889,19 +1066,24 @@ export async function processSubOrderUpdateGateway(
       }
 
       // Step 2: Pre-read products to restore stock if sub-order is being cancelled (All reads before writes)
+      // Aggregate quantities per productId first so multi-line items of the same product restore the full sum!
       const productsToRestore: Array<{ ref: FirebaseFirestore.DocumentReference; currentStock: number; restoreQty: number }> = [];
       if (newStatus === 'cancelled' && currentStatus !== 'cancelled' && Array.isArray(subOrder.items)) {
+        const restoreQtyByProduct = new Map<string, number>();
         for (const it of subOrder.items) {
           const pId = it.productId || (it as any).product?.id || (it as any).id;
           if (pId) {
-            const pRef = adminDb.collection('products').doc(pId);
-            const pSnap = await transaction.get(pRef);
-            if (pSnap.exists) {
-              const pData = pSnap.data();
-              const currentStock = typeof pData?.stock === 'number' ? pData.stock : 0;
-              const q = Math.max(1, Math.min(999, Math.floor(Number(it.quantity) || 1)));
-              productsToRestore.push({ ref: pRef, currentStock, restoreQty: q });
-            }
+            const q = Math.max(1, Math.min(999, Math.floor(Number(it.quantity) || 1)));
+            restoreQtyByProduct.set(String(pId), (restoreQtyByProduct.get(String(pId)) || 0) + q);
+          }
+        }
+        for (const [pId, totalRestoreQty] of restoreQtyByProduct.entries()) {
+          const pRef = adminDb.collection('products').doc(pId);
+          const pSnap = await transaction.get(pRef);
+          if (pSnap.exists) {
+            const pData = pSnap.data();
+            const currentStock = typeof pData?.stock === 'number' ? pData.stock : 0;
+            productsToRestore.push({ ref: pRef, currentStock, restoreQty: totalRestoreQty });
           }
         }
       }
@@ -986,3 +1168,491 @@ export async function processSubOrderUpdateGateway(
 }
 
 export const processOrderCreationGateway = processOrderGateway;
+
+export interface GatewayProductCreateRequest {
+  id?: string;
+  storeId: string;
+  sellerId?: string;
+  title: { ar?: string; en?: string; so?: string } | string;
+  description?: { ar?: string; en?: string; so?: string } | string;
+  slug?: string;
+  sku?: string;
+  price: number;
+  oldPrice?: number;
+  currency?: string;
+  stock: number;
+  lowStockThreshold?: number;
+  category?: string;
+  categories?: string[];
+  tags?: string[];
+  type?: string;
+  thumbnail?: string;
+  images?: string[];
+  isOffer?: boolean;
+  isPublished?: boolean;
+  status?: string;
+  prepTimeMinutes?: number;
+  dietaryTags?: string[];
+  sizes?: string[];
+  colors?: string[];
+  addons?: any[];
+}
+
+/**
+ * Authoritative Product Creation Gateway (PRODUCT-PERSIST & QUOTA Enforcement)
+ * Enforces:
+ *  - Authentication & active user verification
+ *  - Seller & store ownership verification
+ *  - Atomic subscription plan maxProducts quota check inside transaction
+ *  - Price & stock finite bounds validation
+ *  - Status lifecycle validation
+ *  - Fail-closed Firestore write (never returns fake success on DB failure)
+ */
+export async function processProductCreationGateway(
+  payload: GatewayProductCreateRequest & { idempotencyKey?: string },
+  authHeader?: string
+): Promise<{ success: boolean; product: any; reused?: boolean }> {
+  const caller = await requireAuthenticatedCaller(authHeader);
+
+  if (!payload || typeof payload !== 'object') {
+    const err = new Error('Invalid product creation payload') as any;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const storeId = String(payload.storeId || '').trim();
+  if (!storeId) {
+    const err = new Error('storeId is required to create a product') as any;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Price validation
+  const rawPrice = Number(payload.price);
+  if (payload.price === undefined || payload.price === null || payload.price === ('' as any) || !Number.isFinite(rawPrice) || isNaN(rawPrice) || rawPrice < 0 || rawPrice > 1000000) {
+    const err = new Error('Invalid product price: price must be a finite non-negative number (max $1,000,000)') as any;
+    err.statusCode = 400;
+    throw err;
+  }
+  const validatedPrice = Number(rawPrice.toFixed(2));
+
+  // Stock validation
+  const rawStock = Number(payload.stock ?? 0);
+  if (!Number.isFinite(rawStock) || isNaN(rawStock) || rawStock < 0 || rawStock > 1000000) {
+    const err = new Error('Invalid product stock: stock must be a finite non-negative number (max 1,000,000)') as any;
+    err.statusCode = 400;
+    throw err;
+  }
+  const validatedStock = Math.floor(rawStock);
+
+  const cleanIdempotencyKey = typeof payload.idempotencyKey === 'string' ? payload.idempotencyKey.trim() : '';
+  if (payload.idempotencyKey !== undefined && (!cleanIdempotencyKey || cleanIdempotencyKey.length < 4 || cleanIdempotencyKey.length > 128)) {
+    const err = new Error('Invalid idempotencyKey: must be between 4 and 128 characters') as any;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Title validation
+  const titleObj = typeof payload.title === 'string'
+    ? { ar: payload.title.trim(), en: payload.title.trim(), so: payload.title.trim() }
+    : {
+        ar: String(payload.title?.ar || payload.title?.en || '').trim(),
+        en: String(payload.title?.en || payload.title?.ar || '').trim(),
+        so: String(payload.title?.so || payload.title?.en || payload.title?.ar || '').trim(),
+      };
+  if (!titleObj.ar && !titleObj.en) {
+    const err = new Error('Product title is required') as any;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  // Status lifecycle validation
+  const allowedStatuses = ['draft', 'pending', 'pending_review', 'hidden', 'published', 'approved'];
+  const requestedStatus = String(payload.status || 'published').toLowerCase();
+  if (!allowedStatuses.includes(requestedStatus)) {
+    const err = new Error(`Invalid product status '${payload.status}'. Allowed statuses: ${allowedStatuses.join(', ')}`) as any;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const adminDb = getAdminDb();
+
+  // 1. Authoritative Store & Ownership Lookup
+  let storeData: any = null;
+  try {
+    const storeDoc = await adminDb.collection('stores').doc(storeId).get();
+    if (!storeDoc.exists) {
+      const err = new Error(`Store #${storeId} not found`) as any;
+      err.statusCode = 404;
+      throw err;
+    }
+    storeData = storeDoc.data() || {};
+  } catch (err: any) {
+    if (err.statusCode) throw err;
+    const dbErr = new Error(`Database read failure while verifying store #${storeId}: ${err?.message || err}`) as any;
+    dbErr.statusCode = 503;
+    throw dbErr;
+  }
+
+  if (storeData.status === 'suspended' || storeData.status === 'banned' || storeData.status === 'rejected') {
+    const err = new Error(`Cannot create product: Store #${storeId} is currently ${storeData.status}`) as any;
+    err.statusCode = 403;
+    throw err;
+  }
+
+  const authoritativeSellerId = storeData.sellerId;
+  if (!authoritativeSellerId) {
+    const err = new Error(`Store #${storeId} has no valid owner sellerId`) as any;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (!caller.isPlatformAdmin && caller.uid !== authoritativeSellerId) {
+    const err = new Error(`Forbidden: You can only create products for your own store (#${storeId})`) as any;
+    err.statusCode = 403;
+    throw err;
+  }
+
+  if (payload.sellerId && payload.sellerId !== authoritativeSellerId && !caller.isPlatformAdmin) {
+    const err = new Error('Forbidden: sellerId mismatch with authoritative store owner') as any;
+    err.statusCode = 403;
+    throw err;
+  }
+
+  // 2. Authoritative Subscription Plan Quota Resolution
+  const activePlan = await resolveAuthoritativeSellerSubscription(authoritativeSellerId, storeId);
+  const maxProducts = activePlan.maxProducts || 10;
+
+  const now = new Date().toISOString();
+  const productId = payload.id && String(payload.id).trim()
+    ? String(payload.id).trim()
+    : `prod_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+
+  const descObj = typeof payload.description === 'string'
+    ? { ar: payload.description, en: payload.description, so: payload.description }
+    : {
+        ar: String(payload.description?.ar || payload.description?.en || ''),
+        en: String(payload.description?.en || payload.description?.ar || ''),
+        so: String(payload.description?.so || payload.description?.en || payload.description?.ar || ''),
+      };
+
+  const newProduct: any = {
+    id: productId,
+    storeId,
+    sellerId: authoritativeSellerId,
+    title: titleObj,
+    description: descObj,
+    slug: payload.slug || titleObj.en.toLowerCase().replace(/[^a-z0-9]+/g, '-') || `prod-${Date.now()}`,
+    sku: payload.sku || `SKU-${Date.now()}`,
+    price: validatedPrice,
+    oldPrice: payload.oldPrice !== undefined ? Math.max(0, Number(payload.oldPrice) || 0) : 0,
+    currency: payload.currency || 'USD',
+    stock: validatedStock,
+    lowStockThreshold: Math.max(0, Math.floor(Number(payload.lowStockThreshold ?? 5) || 5)),
+    category: payload.category || 'general',
+    categories: Array.isArray(payload.categories) ? payload.categories : [payload.category || 'general'],
+    tags: Array.isArray(payload.tags) ? payload.tags : [payload.category || 'general'],
+    type: payload.type || 'marketplace',
+    thumbnail: payload.thumbnail || (Array.isArray(payload.images) && payload.images[0]) || '',
+    images: Array.isArray(payload.images) ? payload.images : (payload.thumbnail ? [payload.thumbnail] : []),
+    isOffer: Boolean(payload.isOffer),
+    status: requestedStatus,
+    isPublished: payload.isPublished !== undefined ? Boolean(payload.isPublished) : requestedStatus === 'published',
+    rating: 0,
+    reviewsCount: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const initialHistoryEntry = {
+    id: `inv_init_${Date.now()}`,
+    date: now,
+    previousStock: 0,
+    newStock: validatedStock,
+    change: validatedStock,
+    reason: 'restock',
+    actor: caller.uid,
+  };
+
+  // 3. Atomic Quota Enforcement & Product Persistence Transaction
+  const productRef = adminDb.collection('products').doc(productId);
+  const quotaLockRef = adminDb.collection('store_product_quotas').doc(storeId);
+  const idemLockRef = cleanIdempotencyKey
+    ? adminDb.collection('product_idempotency_locks').doc(`${caller.uid}_${cleanIdempotencyKey}`)
+    : null;
+  let reusedExistingProduct: any = null;
+
+  try {
+    await adminDb.runTransaction(async (transaction) => {
+      if (idemLockRef) {
+        const idemSnap = await transaction.get(idemLockRef);
+        if (idemSnap.exists) {
+          const idemData = idemSnap.data() || {};
+          if (idemData.product) {
+            reusedExistingProduct = idemData.product;
+            return;
+          }
+        }
+      }
+
+      // Read quota lock document to serialize concurrent product creations for the same store
+      await transaction.get(quotaLockRef);
+
+      // Query authoritative product count in Firestore
+      const productsCol = adminDb.collection('products') as any;
+      let currentCount = 0;
+      if (typeof productsCol.where === 'function') {
+        const q = productsCol.where('storeId', '==', storeId);
+        const snap = typeof (transaction as any).get === 'function'
+          ? await (transaction as any).get(q)
+          : await q.get();
+        if (snap) {
+          currentCount = typeof snap.size === 'number'
+            ? snap.size
+            : Array.isArray(snap.docs)
+              ? snap.docs.length
+              : 0;
+        }
+      }
+
+      if (currentCount >= maxProducts) {
+        const quotaErr = new Error(
+          `لقد بلغت الحد الأقصى للمنتجات المسموح بها (${maxProducts}) في باقتك الحالية (${activePlan.tier}). يرجى ترقية الباقة لتتمكن من إضافة المزيد من المنتجات. (Product quota exceeded: ${currentCount}/${maxProducts})`
+        ) as any;
+        quotaErr.statusCode = 403;
+        throw quotaErr;
+      }
+
+      transaction.set(quotaLockRef, {
+        storeId,
+        sellerId: authoritativeSellerId,
+        productCount: currentCount + 1,
+        maxProducts,
+        planId: activePlan.id,
+        updatedAt: now,
+      });
+
+      const cleanProduct = JSON.parse(JSON.stringify(newProduct));
+      transaction.set(productRef, cleanProduct);
+      if (idemLockRef) {
+        transaction.set(idemLockRef, {
+          idempotencyKey: cleanIdempotencyKey,
+          sellerId: caller.uid,
+          productId,
+          product: cleanProduct,
+          createdAt: now,
+        });
+      }
+    });
+  } catch (err: any) {
+    if (err.statusCode) {
+      throw err;
+    }
+    console.error('[ProductGateway:Error] Fatal Firestore transaction failure during product creation:', err?.message || err);
+    const dbErr = new Error(`Database write failure (Fail-Closed): Unable to persist product to Firestore. (${err?.message || 'Transaction failed'})`) as any;
+    dbErr.statusCode = 503;
+    throw dbErr;
+  }
+
+  if (reusedExistingProduct) {
+    return {
+      success: true,
+      product: reusedExistingProduct,
+      reused: true,
+    };
+  }
+
+  return {
+    success: true,
+    product: newProduct,
+  };
+}
+
+export interface ProductUpdateGatewayRequest {
+  productId: string;
+  updates: Partial<Product>;
+}
+
+/**
+ * Authoritative Product Update & Status Moderation Gateway (PCR-13 Remediation)
+ * Enforces ownership/admin privileges, field sanitization, price/stock bounds,
+ * and atomic Firestore persistence.
+ * Strictly Fail-Closed: Throws HTTP 503 if Firestore write fails; never returns false success.
+ */
+export async function processProductUpdateGateway(
+  payload: ProductUpdateGatewayRequest,
+  authHeader?: string
+): Promise<{ success: boolean; product: Product }> {
+  const caller = await requireAuthenticatedCaller(authHeader);
+  const productId = String(payload?.productId || '').trim();
+  if (!productId) {
+    const err = new Error('productId is required') as any;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const rawUpdates = payload?.updates || {};
+  const adminDb = getAdminDb();
+  const productRef = adminDb.collection('products').doc(productId);
+  const now = new Date().toISOString();
+
+  try {
+    const updatedProduct = await adminDb.runTransaction(async (transaction) => {
+      const snap = await transaction.get(productRef);
+      if (!snap.exists) {
+        const err = new Error(`Product #${productId} not found`) as any;
+        err.statusCode = 404;
+        throw err;
+      }
+
+      const existing = snap.data() as Product;
+      if (!caller.isPlatformAdmin && existing.sellerId !== caller.uid) {
+        const err = new Error('Forbidden: You can only edit your own products') as any;
+        err.statusCode = 403;
+        throw err;
+      }
+
+      const safeUpdates: Record<string, any> = { ...rawUpdates };
+      delete safeUpdates.id;
+      delete safeUpdates.createdAt;
+
+      if (!caller.isPlatformAdmin) {
+        delete safeUpdates.sellerId;
+        delete safeUpdates.storeId;
+        delete safeUpdates.rating;
+        delete safeUpdates.reviewsCount;
+        if (safeUpdates.status !== undefined) {
+          const allowedSellerStatuses = ['draft', 'pending', 'pending_review', 'published', 'hidden'];
+          const reqStatus = String(safeUpdates.status).toLowerCase();
+          if (!allowedSellerStatuses.includes(reqStatus)) {
+            const err = new Error(`Forbidden: Seller cannot set product status to '${safeUpdates.status}'`) as any;
+            err.statusCode = 403;
+            throw err;
+          }
+          safeUpdates.status = reqStatus;
+        }
+      }
+
+      if (safeUpdates.price !== undefined) {
+        const numPrice = Number(safeUpdates.price);
+        if (!Number.isFinite(numPrice) || isNaN(numPrice) || numPrice <= 0 || numPrice > 1000000) {
+          const err = new Error('Invalid product price: must be between $0.01 and $1,000,000') as any;
+          err.statusCode = 400;
+          throw err;
+        }
+        safeUpdates.price = Number(numPrice.toFixed(2));
+      }
+
+      let nextHistory = Array.isArray(existing.inventoryHistory) ? [...existing.inventoryHistory] : [];
+      let newInventoryLogEntry: any = null;
+      if (safeUpdates.stock !== undefined) {
+        const numStock = Number(safeUpdates.stock);
+        if (!Number.isFinite(numStock) || isNaN(numStock) || numStock < 0 || numStock > 1000000) {
+          const err = new Error('Invalid product stock: must be a non-negative integer') as any;
+          err.statusCode = 400;
+          throw err;
+        }
+        const safeStock = Math.floor(numStock);
+        const oldStock = Number(existing.stock) || 0;
+        if (safeStock !== oldStock) {
+          newInventoryLogEntry = {
+            id: `inv_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`,
+            productId,
+            sellerId: existing.sellerId,
+            date: now,
+            previousStock: oldStock,
+            newStock: safeStock,
+            change: safeStock - oldStock,
+            reason: 'manual_update',
+            actor: caller.uid,
+          };
+          nextHistory = [
+            newInventoryLogEntry,
+            ...nextHistory,
+          ];
+        }
+        safeUpdates.stock = safeStock;
+      }
+
+      const merged: Product = {
+        ...existing,
+        ...safeUpdates,
+        id: productId,
+        updatedAt: now,
+      };
+      delete (merged as any).inventoryHistory;
+      delete (merged as any).salesCount;
+
+      transaction.set(productRef, JSON.parse(JSON.stringify(merged)), { merge: true });
+      if (newInventoryLogEntry) {
+        const invLogRef = adminDb.collection('inventory_logs').doc(newInventoryLogEntry.id);
+        transaction.set(invLogRef, newInventoryLogEntry);
+      }
+      return {
+        ...merged,
+        inventoryHistory: nextHistory,
+      };
+    });
+
+    return {
+      success: true,
+      product: updatedProduct,
+    };
+  } catch (err: any) {
+    if (err.statusCode) throw err;
+    console.error('[ProductGateway:UpdateError] Fatal Firestore transaction failure during product update:', err?.message || err);
+    const dbErr = new Error(`Database write failure (Fail-Closed): Unable to update product in Firestore. (${err?.message || 'Transaction failed'})`) as any;
+    dbErr.statusCode = 503;
+    throw dbErr;
+  }
+}
+
+/**
+ * Authoritative Product Deletion Gateway (PCR-13 Remediation)
+ * Strictly Fail-Closed: Throws HTTP 503 if Firestore delete fails; never returns false success.
+ */
+export async function processProductDeleteGateway(
+  payload: { productId: string },
+  authHeader?: string
+): Promise<{ success: boolean; productId: string }> {
+  const caller = await requireAuthenticatedCaller(authHeader);
+  const productId = String(payload?.productId || '').trim();
+  if (!productId) {
+    const err = new Error('productId is required') as any;
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const adminDb = getAdminDb();
+  const productRef = adminDb.collection('products').doc(productId);
+
+  try {
+    await adminDb.runTransaction(async (transaction) => {
+      const snap = await transaction.get(productRef);
+      if (!snap.exists) {
+        const err = new Error(`Product #${productId} not found`) as any;
+        err.statusCode = 404;
+        throw err;
+      }
+      const existing = snap.data() as Product;
+      if (!caller.isPlatformAdmin && existing.sellerId !== caller.uid) {
+        const err = new Error('Forbidden: You can only delete your own products') as any;
+        err.statusCode = 403;
+        throw err;
+      }
+      transaction.delete(productRef);
+    });
+
+    return {
+      success: true,
+      productId,
+    };
+  } catch (err: any) {
+    if (err.statusCode) throw err;
+    console.error('[ProductGateway:DeleteError] Fatal Firestore transaction failure during product deletion:', err?.message || err);
+    const dbErr = new Error(`Database write failure (Fail-Closed): Unable to delete product in Firestore. (${err?.message || 'Transaction failed'})`) as any;
+    dbErr.statusCode = 503;
+    throw dbErr;
+  }
+}
+

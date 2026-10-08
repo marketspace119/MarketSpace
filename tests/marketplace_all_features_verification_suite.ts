@@ -33,9 +33,40 @@ import { messagingService } from '../src/services/messagingService';
 import { notificationService } from '../src/services/notificationService';
 import { auditLogService } from '../src/services/auditLogService';
 import { inventoryService } from '../src/services/inventoryService';
+import { setAdminDbForTesting } from '../server/firebaseAdmin';
 import { db } from '../src/lib/firebase';
 import { disableNetwork } from 'firebase/firestore';
 import { CartItem, Product, Store, UserRole } from '../src/types';
+
+if (!process.env.FIRESTORE_EMULATOR_HOST) {
+  const memCols = new Map<string, Map<string, any>>();
+  const getCol = (name: string) => {
+    if (!memCols.has(name)) memCols.set(name, new Map());
+    return memCols.get(name)!;
+  };
+  setAdminDbForTesting({
+    collection: (name: string) => ({
+      doc: (id: string) => ({
+        id,
+        get: async () => {
+          const d = getCol(name).get(id);
+          return { exists: d !== undefined, id, data: () => d };
+        },
+        set: async (data: any, opts?: any) => {
+          const prev = getCol(name).get(id) || {};
+          getCol(name).set(id, opts?.merge ? { ...prev, ...data } : data);
+        },
+        update: async (data: any) => {
+          const prev = getCol(name).get(id) || {};
+          getCol(name).set(id, { ...prev, ...data });
+        },
+        delete: async () => {
+          getCol(name).delete(id);
+        },
+      }),
+    }),
+  });
+}
 
 async function runComprehensiveVerification() {
   await disableNetwork(db).catch(() => {});
@@ -122,6 +153,9 @@ async function runComprehensiveVerification() {
       deliveryFee: 3.5,
       total: targetProduct.price + 3.5,
     });
+    await orderService.updateOrderStatus(deliveredOrder.orderId, 'confirmed', 'admin_sys', 'ADMIN', 'Order confirmed');
+    await orderService.updateOrderStatus(deliveredOrder.orderId, 'ready', 'admin_sys', 'ADMIN', 'Order ready');
+    await orderService.updateOrderStatus(deliveredOrder.orderId, 'out_for_delivery', 'admin_sys', 'ADMIN', 'Order dispatched');
     await orderService.updateOrderStatus(deliveredOrder.orderId, 'delivered', 'admin_sys', 'ADMIN', 'Order completed');
 
     const hasPurchased = orderService.hasUserPurchased('cust_e2e_beta', targetProduct.id);
@@ -147,7 +181,7 @@ async function runComprehensiveVerification() {
   try {
     // 2.1 Store Onboarding
     const sellerId = `seller_flow_${Date.now()}`;
-    const newStore = storeService.createStore({
+    const newStore = await storeService.createStore({
       slug: `store-${Date.now()}`,
       name: 'متجر التميز الصومالي',
       description: { ar: 'متجر تقني وتجزئة معتمد', en: 'Certified electronics store', so: 'Dukaan la aqoonsan yahay' },
@@ -172,11 +206,11 @@ async function runComprehensiveVerification() {
     assert(newStore.sellerId === sellerId && newStore.status === 'pending', 'SELL-01', 'Seller completes onboarding with store created in pending moderation');
 
     // 2.2 Store Approved by Admin
-    const approvedStore = storeService.updateStoreStatus(newStore.id, 'approved', 'admin_01', 'ADMIN');
+    const approvedStore = await storeService.updateStoreStatus(newStore.id, 'approved', 'admin_01', 'ADMIN');
     assert(approvedStore.status === 'approved', 'SELL-02', 'Admin approves seller store to active status');
 
     // 2.3 Product Creation under Subscription Plan Quota
-    const newProduct = productService.createProduct(
+    const newProduct = await productService.createProduct(
       {
         slug: `solar-panel-${Date.now()}`,
         title: { ar: 'لوح طاقة شمسية 300 واط', en: 'Solar Panel 300W', so: 'Cadceed 300W' },
@@ -383,7 +417,7 @@ async function runComprehensiveVerification() {
     assert(doubleBookingBlocked, 'SRV-03', 'Double-booking protection strictly prevents overlapping appointments');
 
     // 4.4 Provider Accepts & Reschedules Booking
-    const rescheduled = bookingService.rescheduleBooking({
+    const rescheduled = await bookingService.rescheduleBooking({
       bookingId: booking.id,
       newDate: '2026-10-16',
       newTime: '11:00',
@@ -394,8 +428,8 @@ async function runComprehensiveVerification() {
     assert(rescheduled.date === '2026-10-16' && rescheduled.time === '11:00', 'SRV-04', 'Service appointment rescheduled with collision avoidance');
 
     // 4.5 Completion by Provider
-    const inProgBooking = bookingService.updateBookingStatus(booking.id, 'in_progress', providerId, 'SELLER');
-    const completedBooking = bookingService.completeBooking(booking.id, providerId, 'SELLER');
+    const inProgBooking = await bookingService.updateBookingStatus(booking.id, 'in_progress', providerId, 'SELLER');
+    const completedBooking = await bookingService.completeBooking(booking.id, providerId, 'SELLER');
     assert(inProgBooking.status === 'in_progress' && completedBooking.status === 'completed', 'SRV-05', 'Provider transitions booking to in_progress and completed');
 
     // 4.6 Customer Reviews Service Provider
@@ -422,20 +456,40 @@ async function runComprehensiveVerification() {
     // 5.1 Product Moderation (Hide/Publish)
     const prods = productService.getAllProducts();
     const modProd = prods[0];
-    const hiddenProd = productService.toggleProductStatus(modProd.id, 'hidden', 'admin_01', 'ADMIN');
-    const restoredProd = productService.toggleProductStatus(modProd.id, 'published', 'admin_01', 'ADMIN');
+    const hiddenProd = await productService.toggleProductStatus(modProd.id, 'hidden', 'admin_01', 'ADMIN');
+    const restoredProd = await productService.toggleProductStatus(modProd.id, 'published', 'admin_01', 'ADMIN');
     assert(hiddenProd.status === 'hidden' && restoredProd.status === 'published', 'ADM-01', 'Admin moderates product catalog visibility (hidden / published)');
 
     // 5.2 Review Moderation
     const storeReviews = reviewService.getAllReviews();
     const targetRev = storeReviews[0];
     if (targetRev) {
-      const hiddenRev = reviewService.toggleHideReview(targetRev.id, true, 'admin_01', 'ADMIN');
-      const restoredRev = reviewService.toggleHideReview(targetRev.id, false, 'admin_01', 'ADMIN');
+      const hiddenRev = await reviewService.toggleHideReview(targetRev.id, true, 'admin_01', 'ADMIN');
+      const restoredRev = await reviewService.toggleHideReview(targetRev.id, false, 'admin_01', 'ADMIN');
       assert(hiddenRev.isHidden === true && restoredRev.isHidden === false, 'ADM-02', 'Admin moderates and toggles customer review visibility');
     }
 
     // 5.3 Dispute Resolution
+    orderService.seedOrders([
+      ...orderService.getAllOrders(undefined, 'ADMIN'),
+      {
+        orderId: 'ord_adm_test',
+        customerId: 'cust_disp_adm',
+        customerName: 'Dahir Shire',
+        phone: '+252 61 555 0000',
+        sellerId: 'seller_alpha',
+        sellerIds: ['seller_alpha'],
+        storeId: 'store_alpha',
+        status: 'delivered',
+        paymentStatus: 'paid',
+        paymentMethod: 'cash_on_delivery',
+        items: [],
+        subtotal: 50,
+        deliveryFee: 0,
+        total: 50,
+        createdAt: new Date().toISOString(),
+      } as any,
+    ]);
     const disp = await disputeService.createDispute({
       orderId: 'ord_adm_test',
       customerId: 'cust_disp_adm',
@@ -485,17 +539,33 @@ async function runComprehensiveVerification() {
     assert(activeSub === undefined, 'EXT-03', 'Subscription engine verifies validity dates and marks expired subscriptions as inactive');
 
     // 6.4 Messaging Conversation
+    const msgProduct = productService.getAllProducts()[0];
+    const msgSellerId = msgProduct.sellerId || 'seller_msg_01';
+    const msgOrder = await orderService.createOrder({
+      customerId: 'cust_msg_01',
+      customerName: 'Customer Msg',
+      email: 'cust_msg@example.so',
+      phone: '+252 61 555 0101',
+      city: 'Mogadishu',
+      address: 'KM4',
+      paymentMethod: 'cash_on_delivery',
+      items: [{ product: msgProduct, quantity: 1 }],
+      subtotal: msgProduct.price,
+      deliveryFee: 3.0,
+      total: msgProduct.price + 3.0,
+    });
     const conv = await messagingService.getOrCreateConversation({
-      participantIds: ['cust_msg_01', 'seller_msg_01'],
+      callerId: 'cust_msg_01',
+      participantIds: ['cust_msg_01', msgSellerId],
       participantDetails: [
         { id: 'cust_msg_01', name: 'Customer Msg', role: 'CUSTOMER' },
-        { id: 'seller_msg_01', name: 'Seller Msg', role: 'SELLER' },
+        { id: msgSellerId, name: 'Seller Msg', role: 'SELLER' },
       ],
       contextType: 'order',
-      contextId: 'ord_msg_01',
-      contextTitle: 'Order #ord_msg_01 Inquiry',
+      contextId: msgOrder.orderId,
+      contextTitle: `Order #${msgOrder.orderId} Inquiry`,
     });
-    assert(conv.participantIds.includes('cust_msg_01') && conv.participantIds.includes('seller_msg_01'), 'EXT-04', 'Peer-to-peer conversation initiated with order context and participants');
+    assert(conv.participantIds.includes('cust_msg_01') && conv.participantIds.includes(msgSellerId), 'EXT-04', 'Peer-to-peer conversation initiated with order context and participants');
 
     // 6.5 Internationalization Key Localization
     const sampleProduct = productService.getAllProducts()[0];

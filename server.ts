@@ -2,15 +2,33 @@ import express from 'express';
 import path from 'path';
 import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
-import { processOrderGateway, processSubOrderUpdateGateway } from './server/orderGateway';
+import {
+  processOrderGateway,
+  processSubOrderUpdateGateway,
+  processProductCreationGateway,
+  processProductUpdateGateway,
+  processProductDeleteGateway,
+} from './server/orderGateway';
 import { processPayoutGateway, processPayoutReviewGateway, getSellerFinancialSummaryGateway } from './server/payoutGateway';
 import { processSubscriptionReviewGateway } from './server/subscriptionGateway';
-import { processRefundGateway } from './server/refundGateway';
+import {
+  processRefundGateway,
+  processRefundReviewGateway,
+  processRefundSettlementGateway,
+} from './server/refundGateway';
 import { processPaymentReferenceSubmissionGateway, processPaymentReviewGateway } from './server/paymentGateway';
 import { processUserRoleUpdateGateway, processUserStatusUpdateGateway } from './server/userGateway';
 import { processImageVerificationGateway, processImageUploadGateway } from './server/imageGateway';
 import { createRateLimiter } from './server/rateLimiter';
-import { getAdminDb, requireAuthenticatedCaller, requireVerifiedPlatformAdmin, verifyFirebaseBearerToken } from './server/firebaseAdmin';
+import {
+  getAdminDb,
+  requireAuthenticatedCaller,
+  requireVerifiedPlatformAdmin,
+  verifyFirebaseBearerToken,
+  sanitizeGatewayError,
+  validateBackendFirebaseConfiguration,
+  assertUserAccountActive,
+} from './server/firebaseAdmin';
 import {
   handleBusinessAssistant,
   handleSellerAssistant,
@@ -20,9 +38,8 @@ import {
 } from './server/ai/aiService';
 import { validateAndExecuteToolPolicy } from './server/ai/toolPolicy';
 
-async function startServer() {
+export function createProductionApiApp(): express.Express {
   const app = express();
-  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   // P2-RATE-02: Configure trusted proxy behavior intentionally (1 hop reverse proxy)
   app.set('trust proxy', 1);
@@ -77,30 +94,6 @@ async function startServer() {
 
     next();
   });
-
-  // Helper to safely map internal database/system errors to safe responses without leaking internals
-  function sanitizeGatewayError(err: any, fallbackMessage: string): { statusCode: number; safeMessage: string } {
-    const msg = err?.message || '';
-    const isAuth = msg.includes('Authentication') || (msg.includes('token') && (msg.includes('missing') || msg.includes('Invalid') || msg.includes('expired')));
-    const isForbidden = msg.includes('Forbidden') || msg.includes('not authorized') || msg.includes('do not have permission');
-    const isNotFound = msg.includes('not found');
-    const isDbOrInternal =
-      msg.includes('Database') ||
-      msg.includes('Firestore') ||
-      msg.includes('temporarily unavailable') ||
-      msg.includes('Fail-Closed') ||
-      msg.includes('credentials') ||
-      msg.includes('PERMISSION_DENIED') ||
-      msg.includes('ETIMEDOUT') ||
-      msg.includes('ECONNREFUSED');
-
-    if (isForbidden) return { statusCode: 403, safeMessage: msg };
-    if (isAuth) return { statusCode: 401, safeMessage: msg };
-    if (isNotFound) return { statusCode: 404, safeMessage: msg };
-    if (isDbOrInternal) return { statusCode: 503, safeMessage: 'Service temporarily unavailable. Please try again later.' };
-
-    return { statusCode: 400, safeMessage: msg || fallbackMessage };
-  }
 
   // 1. Health check endpoint
   app.get('/api/health', (req, res) => {
@@ -192,6 +185,40 @@ async function startServer() {
     }
   });
 
+  // 5b. Trusted Refund Review Endpoint (Protected with Firebase Admin SDK - Finding 4)
+  app.post('/api/refunds/review', financialRateLimiter, async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processRefundReviewGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/refunds/review] Error:', err.message);
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to review refund request');
+      return res.status(statusCode).json({
+        success: false,
+        error: safeMessage,
+      });
+    }
+  });
+
+  // 5c. Trusted Refund Settlement Endpoint (Protected with Firebase Admin SDK - Finding 4)
+  app.post('/api/refunds/settle', financialRateLimiter, async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processRefundSettlementGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/refunds/settle] Error:', err.message);
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to settle refund request');
+      return res.status(statusCode).json({
+        success: false,
+        error: safeMessage,
+      });
+    }
+  });
+
   // 6. Authoritative Seller Financial Summary Endpoint (Single Source of Truth for Balance)
   app.get('/api/seller/financial-summary', financialRateLimiter, async (req, res) => {
     try {
@@ -213,11 +240,31 @@ async function startServer() {
   });
 
   function mapPaymentErrorToStatusCode(err: any): { statusCode: number; message: string } {
-    if (err.statusCode && typeof err.statusCode === 'number') {
-      return { statusCode: err.statusCode, message: err.message };
+    const msg = err?.message || '';
+    // First check if this is an internal infrastructure / database / stack error that must be sanitized (SUSPECT-03)
+    if (
+      (err?.statusCode && err.statusCode >= 500) ||
+      msg.includes('Database') ||
+      msg.includes('temporarily unavailable') ||
+      msg.includes('Firestore unavailable') ||
+      msg.includes('Firestore transaction failed') ||
+      msg.includes('credentials') ||
+      msg.includes('PERMISSION_DENIED') ||
+      msg.includes('Fail-Closed') ||
+      msg.includes('ECONNREFUSED') ||
+      msg.includes('ENOTFOUND') ||
+      msg.includes('DEADLINE_EXCEEDED') ||
+      msg.includes('INTERNAL') ||
+      msg.includes('serviceAccount') ||
+      msg.includes('private_key')
+    ) {
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Payment service temporarily unavailable. Please try again later.');
+      return { statusCode: statusCode >= 500 ? statusCode : 503, message: safeMessage };
     }
-    const msg = err.message || '';
-    if (msg.includes('Authentication') || msg.includes('token') && (msg.includes('missing') || msg.includes('Invalid') || msg.includes('expired'))) {
+    if (err?.statusCode && typeof err.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 500) {
+      return { statusCode: err.statusCode, message: msg };
+    }
+    if (msg.includes('Authentication') || (msg.includes('token') && (msg.includes('missing') || msg.includes('Invalid') || msg.includes('expired')))) {
       return { statusCode: 401, message: msg };
     }
     if (msg.includes('Forbidden') || msg.includes('غير مصرح') || msg.includes('privileges required') || msg.includes('لا يخصك') || msg.includes('email_verified')) {
@@ -238,18 +285,8 @@ async function startServer() {
     ) {
       return { statusCode: 409, message: msg };
     }
-    if (
-      msg.includes('Database') ||
-      msg.includes('temporarily unavailable') ||
-      msg.includes('Firestore unavailable') ||
-      msg.includes('Firestore transaction failed') ||
-      msg.includes('credentials') ||
-      msg.includes('PERMISSION_DENIED') ||
-      msg.includes('Fail-Closed')
-    ) {
-      return { statusCode: 503, message: 'Payment service temporarily unavailable. Please try again later.' };
-    }
-    return { statusCode: 400, message: msg || 'Failed to process payment request' };
+    const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to process payment request');
+    return { statusCode, message: safeMessage };
   }
 
   // 7. Authoritative Mobile Payment Reference Submission (Anti-Replay Unique Check)
@@ -295,12 +332,10 @@ async function startServer() {
       return res.status(200).json(result);
     } catch (err: any) {
       console.error('[API /api/users/update-role] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to update user role');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to update user role',
+        error: safeMessage,
       });
     }
   });
@@ -314,18 +349,16 @@ async function startServer() {
       return res.status(200).json(result);
     } catch (err: any) {
       console.error('[API /api/users/update-status] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to update user status');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to update user status',
+        error: safeMessage,
       });
     }
   });
 
   // 9c. Authoritative Binary Image Verification Gateway (Deep Magic-Byte Inspection)
-  app.post('/api/images/verify', async (req, res) => {
+  app.post('/api/images/verify', financialRateLimiter, async (req, res) => {
     try {
       const payload = req.body;
       const authHeader = req.headers.authorization;
@@ -333,18 +366,16 @@ async function startServer() {
       return res.status(200).json({ success: true, ...result });
     } catch (err: any) {
       console.error('[API /api/images/verify] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = err.statusCode || (isForbidden ? 403 : isAuth ? 401 : 400);
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Image verification failed');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Image verification failed',
+        error: safeMessage,
       });
     }
   });
 
   // 9d. Authoritative Binary Image Upload Gateway (V3-02 Remediation)
-  app.post('/api/images/upload', async (req, res) => {
+  app.post('/api/images/upload', financialRateLimiter, async (req, res) => {
     try {
       const payload = req.body;
       const authHeader = req.headers.authorization;
@@ -352,12 +383,61 @@ async function startServer() {
       return res.status(200).json(result);
     } catch (err: any) {
       console.error('[API /api/images/upload] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = err.statusCode || (isForbidden ? 403 : isAuth ? 401 : 400);
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Image upload failed');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Image upload failed',
+        error: safeMessage,
+      });
+    }
+  });
+
+  // 9d-2. Authoritative Product Creation & Plan Quota Gateway (PRODUCT-PERSIST & QUOTA Remediation)
+  app.post('/api/products/create', financialRateLimiter, async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processProductCreationGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/products/create] Error:', err.message);
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Product creation failed');
+      return res.status(statusCode).json({
+        success: false,
+        error: safeMessage,
+      });
+    }
+  });
+
+  // 9d-3. Authoritative Product Update & Moderation Gateway (PCR-13 Remediation)
+  app.post('/api/products/update', financialRateLimiter, async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processProductUpdateGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/products/update] Error:', err.message);
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Product update failed');
+      return res.status(statusCode).json({
+        success: false,
+        error: safeMessage,
+      });
+    }
+  });
+
+  // 9d-4. Authoritative Product Deletion Gateway (PCR-13 Remediation)
+  app.post('/api/products/delete', financialRateLimiter, async (req, res) => {
+    try {
+      const payload = req.body;
+      const authHeader = req.headers.authorization;
+      const result = await processProductDeleteGateway(payload, authHeader);
+      return res.status(200).json(result);
+    } catch (err: any) {
+      console.error('[API /api/products/delete] Error:', err.message);
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Product deletion failed');
+      return res.status(statusCode).json({
+        success: false,
+        error: safeMessage,
       });
     }
   });
@@ -367,16 +447,34 @@ async function startServer() {
     try {
       const authHeader = req.headers.authorization;
       const caller = await requireAuthenticatedCaller(authHeader);
-      const { serviceId, sellerId, date, time, customerName, customerPhone, notes } = req.body || {};
+      const { serviceId, sellerId, date, time, customerName, customerPhone, notes, idempotencyKey } = req.body || {};
 
-      if (!serviceId || typeof serviceId !== 'string') {
-        return res.status(400).json({ success: false, error: 'serviceId is required' });
+      if (!serviceId || typeof serviceId !== 'string' || serviceId.trim().length === 0 || serviceId.length > 128) {
+        return res.status(400).json({ success: false, error: 'Valid serviceId is required' });
       }
-      if (!date || typeof date !== 'string' || !time || typeof time !== 'string') {
-        return res.status(400).json({ success: false, error: 'date and time are required' });
+      if (!date || typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date.trim())) {
+        return res.status(400).json({ success: false, error: 'Valid date (YYYY-MM-DD) is required' });
+      }
+      if (!time || typeof time !== 'string' || time.trim().length === 0 || time.length > 32) {
+        return res.status(400).json({ success: false, error: 'Valid time slot is required' });
+      }
+      if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.trim().length < 4 || idempotencyKey.length > 128)) {
+        return res.status(400).json({ success: false, error: 'Invalid idempotencyKey format' });
       }
 
       const adminDb = getAdminDb();
+
+      // F-27: Check idempotency key if provided
+      const cleanIdempotencyKey = typeof idempotencyKey === 'string' ? idempotencyKey.trim() : '';
+      if (cleanIdempotencyKey) {
+        const idemSnap = await adminDb.collection('booking_idempotency_locks').doc(`${caller.uid}_${cleanIdempotencyKey}`).get();
+        if (idemSnap.exists) {
+          const idemData = idemSnap.data() || {};
+          if (idemData.booking) {
+            return res.status(200).json({ success: true, booking: idemData.booking, reused: true });
+          }
+        }
+      }
 
       // 1. Authoritative Service Lookup and Validation
       const serviceDoc = await adminDb.collection('products').doc(serviceId).get();
@@ -396,7 +494,16 @@ async function startServer() {
         return res.status(400).json({ success: false, error: 'Service does not belong to specified provider' });
       }
 
-      const authoritativePrice = Number(serviceData.price) || 0;
+      const rawServicePrice = serviceData.price;
+      const authoritativePrice = (rawServicePrice === null || rawServicePrice === undefined || rawServicePrice === '' || typeof rawServicePrice === 'boolean')
+        ? NaN
+        : Number(rawServicePrice);
+      if (!Number.isFinite(authoritativePrice) || isNaN(authoritativePrice) || authoritativePrice <= 0) {
+        return res.status(503).json({
+          success: false,
+          error: `Corrupted service price for service #${serviceId}. Booking aborted (Fail-Closed).`,
+        });
+      }
       const serviceTitle = serviceData.title?.ar || serviceData.title?.en || serviceData.name || 'Service';
       const slotId = `${authoritativeSellerId}_${date.replace(/[^a-zA-Z0-9]/g, '-')}_${time.replace(/[^a-zA-Z0-9]/g, '-')}`;
       const slotRef = adminDb.collection('booking_slots').doc(slotId);
@@ -449,18 +556,25 @@ async function startServer() {
         });
 
         t.set(bookingRef, bookingData);
+        if (cleanIdempotencyKey) {
+          const idemRef = adminDb.collection('booking_idempotency_locks').doc(`${caller.uid}_${cleanIdempotencyKey}`);
+          t.set(idemRef, {
+            idempotencyKey: cleanIdempotencyKey,
+            customerId: caller.uid,
+            bookingId,
+            booking: bookingData,
+            createdAt: now,
+          });
+        }
       });
 
       return res.status(200).json({ success: true, booking: bookingData });
     } catch (err: any) {
       console.error('[API /api/bookings/create] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const isConflict = err.statusCode === 409 || err.message?.includes('محجوز مسبقاً');
-      const statusCode = err.statusCode || (isConflict ? 409 : isForbidden ? 403 : isAuth ? 401 : 400);
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Booking reservation failed');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Booking reservation failed',
+        error: safeMessage,
       });
     }
   });
@@ -492,9 +606,25 @@ async function startServer() {
       }
 
       // 2. Authoritative Seller and Store Resolution (NEVER trust client-supplied sellerId/storeId)
+      const parseStrictPos = (val: any, field: string): number => {
+        if (val === null || val === undefined || val === '' || typeof val === 'boolean') {
+          const err = new Error(`Invalid or missing financial field (${field}) on order #${orderId}. Fail-Closed.`) as any;
+          err.statusCode = 503;
+          throw err;
+        }
+        const n = Number(val);
+        if (!Number.isFinite(n) || isNaN(n) || n <= 0) {
+          const err = new Error(`Corrupted financial field (${field}: ${String(val)}) on order #${orderId}. Fail-Closed.`) as any;
+          err.statusCode = 503;
+          throw err;
+        }
+        return n;
+      };
+
       let authoritativeSellerId = '';
       let authoritativeStoreId: string | null = null;
       let authoritativeSellerName = 'Merchant';
+      let authoritativeDisputedAmount = 0;
 
       if (subOrderId && Array.isArray(orderData.vendorOrders) && orderData.vendorOrders.length > 0) {
         const vo = orderData.vendorOrders.find((v: any) => v.subOrderId === subOrderId);
@@ -504,15 +634,27 @@ async function startServer() {
         authoritativeSellerId = vo.sellerId;
         authoritativeStoreId = vo.storeId || null;
         authoritativeSellerName = vo.storeName || vo.sellerName || 'Merchant';
+        const rawVoAmt = vo.sellerRevenue !== undefined && vo.sellerRevenue !== null
+          ? vo.sellerRevenue
+          : (vo.subtotal !== undefined && vo.subtotal !== null ? vo.subtotal : vo.total);
+        authoritativeDisputedAmount = parseStrictPos(rawVoAmt, `subOrder(${subOrderId}).amount`);
       } else if (Array.isArray(orderData.vendorOrders) && orderData.vendorOrders.length === 1) {
         const vo = orderData.vendorOrders[0];
         authoritativeSellerId = vo.sellerId;
         authoritativeStoreId = vo.storeId || null;
         authoritativeSellerName = vo.storeName || vo.sellerName || 'Merchant';
+        const rawVoAmt = vo.sellerRevenue !== undefined && vo.sellerRevenue !== null
+          ? vo.sellerRevenue
+          : (vo.subtotal !== undefined && vo.subtotal !== null ? vo.subtotal : (vo.total !== undefined && vo.total !== null ? vo.total : orderData.total));
+        authoritativeDisputedAmount = parseStrictPos(rawVoAmt, 'vendorOrder[0].amount');
       } else if (Array.isArray(orderData.sellerIds) && orderData.sellerIds.length === 1) {
         authoritativeSellerId = orderData.sellerIds[0];
         authoritativeStoreId = (orderData.vendorStoreIds && orderData.vendorStoreIds[0]) || null;
         authoritativeSellerName = orderData.storeName || 'Merchant';
+        const rawOrdAmt = orderData.sellerRevenue !== undefined && orderData.sellerRevenue !== null
+          ? orderData.sellerRevenue
+          : (orderData.subtotal !== undefined && orderData.subtotal !== null ? orderData.subtotal : orderData.total);
+        authoritativeDisputedAmount = parseStrictPos(rawOrdAmt, 'order.amount');
       } else if (Array.isArray(orderData.vendorOrders) && orderData.vendorOrders.length > 1) {
         // Multi-vendor order: must disambiguate seller
         if (clientSellerId) {
@@ -523,30 +665,34 @@ async function startServer() {
           authoritativeSellerId = matchingVo.sellerId;
           authoritativeStoreId = matchingVo.storeId || null;
           authoritativeSellerName = matchingVo.storeName || matchingVo.sellerName || 'Merchant';
+          const rawVoAmt = matchingVo.sellerRevenue !== undefined && matchingVo.sellerRevenue !== null
+            ? matchingVo.sellerRevenue
+            : (matchingVo.subtotal !== undefined && matchingVo.subtotal !== null ? matchingVo.subtotal : matchingVo.total);
+          authoritativeDisputedAmount = parseStrictPos(rawVoAmt, `vendorOrder(${clientSellerId}).amount`);
         } else {
           return res.status(400).json({ success: false, error: 'subOrderId or sellerId is required to identify the merchant on multi-vendor orders' });
         }
       } else {
         authoritativeSellerId = (orderData.sellerIds && orderData.sellerIds[0]) || orderData.sellerId || '';
         authoritativeStoreId = (orderData.vendorStoreIds && orderData.vendorStoreIds[0]) || orderData.storeId || null;
+        const rawOrdAmt = orderData.sellerRevenue !== undefined && orderData.sellerRevenue !== null
+          ? orderData.sellerRevenue
+          : (orderData.subtotal !== undefined && orderData.subtotal !== null ? orderData.subtotal : orderData.total);
+        authoritativeDisputedAmount = parseStrictPos(rawOrdAmt, 'order.amount');
       }
 
       if (!authoritativeSellerId) {
         return res.status(400).json({ success: false, error: 'Unable to authoritatively resolve seller for this order' });
       }
 
-      // 3. Prevent duplicate active disputes for this order
-      const existingSnap = await adminDb
-        .collection('disputes')
-        .where('orderId', '==', orderId)
-        .where('status', 'in', ['OPEN', 'SELLER_RESPONDED'])
-        .get();
-      if (!existingSnap.empty) {
-        return res.status(409).json({ success: false, error: 'There is already an active dispute open for this order' });
-      }
-
+      // 3. Atomic Dispute Creation & Active Dispute Lock (PCR-11 & NEW-06 Remediation)
+      const lockScopeKey = subOrderId ? `${orderId}_${subOrderId}` : orderId;
+      const lockRef = adminDb.collection('dispute_locks').doc(lockScopeKey);
+      const sellerPayoutLockRef = adminDb.collection('seller_payout_locks').doc(authoritativeSellerId);
       const disputeId = `disp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const disputeRef = adminDb.collection('disputes').doc(disputeId);
       const now = new Date().toISOString();
+
       const newDispute = {
         id: disputeId,
         orderId,
@@ -557,6 +703,7 @@ async function startServer() {
         sellerId: authoritativeSellerId,
         sellerName: authoritativeSellerName,
         storeId: authoritativeStoreId,
+        disputedAmount: Number(authoritativeDisputedAmount.toFixed(2)),
         reason: reason || 'other',
         description: description.trim().slice(0, 2000),
         evidenceUrls: Array.isArray(evidenceUrls) ? evidenceUrls.slice(0, 5) : [],
@@ -566,16 +713,78 @@ async function startServer() {
         updatedAt: now,
       };
 
-      await adminDb.collection('disputes').doc(disputeId).set(newDispute);
+      await adminDb.runTransaction(async (transaction) => {
+        const lockSnap = await transaction.get(lockRef);
+        const sellerLockSnap = await transaction.get(sellerPayoutLockRef);
+        if (lockSnap.exists) {
+          const lockData = lockSnap.data() || {};
+          if (lockData.activeDisputeId) {
+            const activeDispSnap = await transaction.get(adminDb.collection('disputes').doc(lockData.activeDisputeId));
+            if (activeDispSnap.exists) {
+              const activeDisp = activeDispSnap.data() || {};
+              if (['OPEN', 'SELLER_RESPONDED'].includes(activeDisp.status)) {
+                const err = new Error('There is already an active dispute open for this order') as any;
+                err.statusCode = 409;
+                throw err;
+              }
+            }
+          }
+        }
+
+        // Also check any legacy active disputes for this order inside the transaction
+        const existingSnap = await transaction.get(
+          adminDb
+            .collection('disputes')
+            .where('orderId', '==', orderId)
+            .where('status', 'in', ['OPEN', 'SELLER_RESPONDED'])
+        );
+        if (!existingSnap.empty) {
+          const hasMatchingActive = existingSnap.docs.some((d) => {
+            const dData = d.data();
+            if (subOrderId && dData.subOrderId) {
+              return dData.subOrderId === subOrderId;
+            }
+            return true;
+          });
+          if (hasMatchingActive) {
+            const err = new Error('There is already an active dispute open for this order') as any;
+            err.statusCode = 409;
+            throw err;
+          }
+        }
+
+        transaction.set(lockRef, {
+          lockId: lockScopeKey,
+          orderId,
+          subOrderId: subOrderId || null,
+          activeDisputeId: disputeId,
+          status: 'OPEN',
+          updatedAt: now,
+        });
+
+        // NEW-06: Atomically freeze disputed amount on seller_payout_locks so concurrent payout transaction serializes on lockRef
+        if (authoritativeDisputedAmount > 0) {
+          const currentDisputeFrozen = sellerLockSnap.exists
+            ? (Number(sellerLockSnap.data()?.totalDisputeFrozen) || 0)
+            : 0;
+          transaction.set(sellerPayoutLockRef, {
+            sellerId: authoritativeSellerId,
+            totalDisputeFrozen: Number((currentDisputeFrozen + authoritativeDisputedAmount).toFixed(2)),
+            lastDisputeId: disputeId,
+            updatedAt: now,
+          }, { merge: true });
+        }
+
+        transaction.set(disputeRef, newDispute);
+      });
+
       return res.status(200).json({ success: true, dispute: newDispute });
     } catch (err: any) {
       console.error('[API /api/disputes/create] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to create dispute');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to create dispute',
+        error: safeMessage,
       });
     }
   });
@@ -592,51 +801,57 @@ async function startServer() {
 
       const adminDb = getAdminDb();
       const disputeRef = adminDb.collection('disputes').doc(disputeId);
-      const disputeSnap = await disputeRef.get();
-      if (!disputeSnap.exists) {
-        return res.status(404).json({ success: false, error: 'Dispute not found' });
-      }
-      const dispute = disputeSnap.data() as any;
-
-      if (!caller.isPlatformAdmin && caller.uid !== dispute.sellerId) {
-        return res.status(403).json({ success: false, error: 'Forbidden: You can only respond to disputes against your own store' });
-      }
-
-      // Strict State Machine: Merchant can ONLY respond to OPEN disputes
-      if (['RESOLVED_REFUND', 'RESOLVED_REJECTED', 'CLOSED'].includes(dispute.status)) {
-        return res.status(409).json({
-          success: false,
-          error: `Cannot respond to dispute: dispute is already in terminal state (${dispute.status})`,
-        });
-      }
-      if (dispute.status !== 'OPEN') {
-        return res.status(409).json({
-          success: false,
-          error: `Only OPEN disputes can be responded to. Current status: ${dispute.status}`,
-        });
-      }
-
       const now = new Date().toISOString();
-      const updateData = {
-        status: 'SELLER_RESPONDED',
-        sellerResponse: {
-          message: message.trim(),
-          respondedAt: now,
-          proposedAction: proposedAction || null,
-        },
-        updatedAt: now,
-      };
 
-      await disputeRef.update(updateData);
-      return res.status(200).json({ success: true, dispute: { ...dispute, ...updateData } });
+      // Atomic Transaction for Dispute Response (PCR-12 Remediation: Prevents concurrent response race conditions)
+      const updatedDispute = await adminDb.runTransaction(async (transaction) => {
+        const disputeSnap = await transaction.get(disputeRef);
+        if (!disputeSnap.exists) {
+          const err = new Error('Dispute not found') as any;
+          err.statusCode = 404;
+          throw err;
+        }
+        const dispute = disputeSnap.data() as any;
+
+        if (!caller.isPlatformAdmin && caller.uid !== dispute.sellerId) {
+          const err = new Error('Forbidden: You can only respond to disputes against your own store') as any;
+          err.statusCode = 403;
+          throw err;
+        }
+
+        // Strict State Machine inside transaction: Merchant can ONLY respond to OPEN disputes
+        if (['RESOLVED_REFUND', 'RESOLVED_REJECTED', 'CLOSED'].includes(dispute.status)) {
+          const err = new Error(`Cannot respond to dispute: dispute is already in terminal state (${dispute.status})`) as any;
+          err.statusCode = 409;
+          throw err;
+        }
+        if (dispute.status !== 'OPEN') {
+          const err = new Error(`Only OPEN disputes can be responded to. Current status: ${dispute.status}`) as any;
+          err.statusCode = 409;
+          throw err;
+        }
+
+        const updateData = {
+          status: 'SELLER_RESPONDED',
+          sellerResponse: {
+            message: message.trim(),
+            respondedAt: now,
+            proposedAction: proposedAction || null,
+          },
+          updatedAt: now,
+        };
+
+        transaction.update(disputeRef, updateData);
+        return { ...dispute, ...updateData };
+      });
+
+      return res.status(200).json({ success: true, dispute: updatedDispute });
     } catch (err: any) {
       console.error('[API /api/disputes/respond] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to respond to dispute');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to respond to dispute',
+        error: safeMessage,
       });
     }
   });
@@ -651,19 +866,57 @@ async function startServer() {
         return res.status(400).json({ success: false, error: 'disputeId and valid actionTaken (REFUND_APPROVED or CLAIM_DISMISSED) are required' });
       }
 
+      const parsedRefundAmount = refundAmount !== undefined ? Number(refundAmount) : 0;
+      if (actionTaken === 'REFUND_APPROVED') {
+        if (!Number.isFinite(parsedRefundAmount) || isNaN(parsedRefundAmount) || parsedRefundAmount <= 0) {
+          return res.status(400).json({
+            success: false,
+            error: 'Invalid refundAmount: REFUND_APPROVED requires a positive finite refundAmount greater than zero',
+          });
+        }
+      }
+
       const adminDb = getAdminDb();
       const disputeRef = adminDb.collection('disputes').doc(disputeId);
       const now = new Date().toISOString();
       const finalStatus = actionTaken === 'REFUND_APPROVED' ? 'RESOLVED_REFUND' : 'RESOLVED_REJECTED';
-      const resolution = {
-        resolvedBy: caller.uid,
-        actionTaken,
-        resolutionNotes: (resolutionNotes || '').trim(),
-        resolvedAt: now,
-        refundAmount: Number(refundAmount) || 0,
-      };
 
-      // Atomic Transaction: Dispute resolution AND order state mutation execute atomically (Fail-Closed, zero swallowed errors)
+      // Pre-read existing refundRequests for ceiling baseline if REFUND_APPROVED
+      const disputePreSnap = await disputeRef.get();
+      if (!disputePreSnap.exists) {
+        return res.status(404).json({ success: false, error: 'Dispute not found' });
+      }
+      const disputePreData = disputePreSnap.data() as any;
+      let baselineHistoricalOrderRefunded = 0;
+      let baselineHistoricalSubOrderRefunded = 0;
+      if (actionTaken === 'REFUND_APPROVED' && disputePreData.orderId) {
+        const existingRefundsSnap = await adminDb
+          .collection('refundRequests')
+          .where('orderId', '==', disputePreData.orderId)
+          .get();
+        if (!existingRefundsSnap.empty) {
+          existingRefundsSnap.forEach((doc) => {
+            const r = doc.data();
+            if (r.status !== 'REFUND_REJECTED' && r.status !== 'REJECTED') {
+              const rawHistAmt = r.amount;
+              const histAmt = (rawHistAmt === null || rawHistAmt === undefined || rawHistAmt === '' || typeof rawHistAmt === 'boolean')
+                ? NaN
+                : Number(rawHistAmt);
+              if (!Number.isFinite(histAmt) || isNaN(histAmt) || histAmt <= 0) {
+                const corruptErr = new Error(`Corrupted historical refund record (#${doc.id}) for order #${disputePreData.orderId}. Fail-Closed.`) as any;
+                corruptErr.statusCode = 503;
+                throw corruptErr;
+              }
+              baselineHistoricalOrderRefunded += histAmt;
+              if (disputePreData.subOrderId && r.subOrderId === disputePreData.subOrderId) {
+                baselineHistoricalSubOrderRefunded += histAmt;
+              }
+            }
+          });
+        }
+      }
+
+      // Atomic Transaction: Dispute resolution, refund ceiling check, refundRequest creation, and seller lock reservation
       const updatedDispute = await adminDb.runTransaction(async (transaction) => {
         const disputeSnap = await transaction.get(disputeRef);
         if (!disputeSnap.exists) {
@@ -686,21 +939,220 @@ async function startServer() {
           throw err;
         }
 
-        // If refund approved, atomically update order state within the same transaction (NO .catch(() => {}))
+        let authoritativeRefundAmount = 0;
+        const disputeSellerId = disputeData.sellerId || '';
+        const disputeFrozenAmt = Number(disputeData.disputedAmount) || 0;
+        const sellerLockRefForDispute = disputeSellerId ? adminDb.collection('seller_payout_locks').doc(disputeSellerId) : null;
+        const sellerLockSnapForDispute = sellerLockRefForDispute ? await transaction.get(sellerLockRefForDispute) : null;
+
+        // If refund approved, enforce full financial invariants within the same transaction (P0 Finding 3)
         if (actionTaken === 'REFUND_APPROVED' && disputeData.orderId) {
           const orderRef = adminDb.collection('orders').doc(disputeData.orderId);
+          const refundLockRef = adminDb.collection('order_refund_locks').doc(disputeData.orderId);
           const orderSnap = await transaction.get(orderRef);
+          const refundLockSnap = await transaction.get(refundLockRef);
+
           if (!orderSnap.exists) {
             const err = new Error(`Associated order #${disputeData.orderId} not found in database. Resolution aborted.`) as any;
             err.statusCode = 404;
             throw err;
           }
-          transaction.update(orderRef, {
-            refundStatus: 'approved',
-            refundAmount: Number(refundAmount) || 0,
+
+          const orderData = orderSnap.data() || {};
+          const rawOrderTotalVal = orderData.total;
+          const orderTotal = (rawOrderTotalVal === null || rawOrderTotalVal === undefined || rawOrderTotalVal === '' || typeof rawOrderTotalVal === 'boolean')
+            ? NaN
+            : Number(rawOrderTotalVal);
+          if (!Number.isFinite(orderTotal) || isNaN(orderTotal) || orderTotal <= 0) {
+            const err = new Error(`Corrupted or unreadable authoritative order total for #${disputeData.orderId}. Resolution aborted (Fail-Closed).`) as any;
+            err.statusCode = 503;
+            throw err;
+          }
+          let maxAllowedCeiling = orderTotal;
+          let targetSellerId = disputeData.sellerId || orderData.sellerId || (Array.isArray(orderData.sellerIds) ? orderData.sellerIds[0] : '') || '';
+          let targetStoreId = disputeData.storeId || orderData.storeId || '';
+
+          if (disputeData.subOrderId && Array.isArray(orderData.vendorOrders)) {
+            const sub = orderData.vendorOrders.find((vo: any) => vo.subOrderId === disputeData.subOrderId);
+            if (!sub) {
+              const err = new Error(`Sub-order #${disputeData.subOrderId} not found in order #${disputeData.orderId}. Resolution aborted (Fail-Closed).`) as any;
+              err.statusCode = 400;
+              throw err;
+            }
+            const rawSubCeilingVal = sub.total !== undefined && sub.total !== null ? sub.total : sub.subtotal;
+            const subCeiling = (rawSubCeilingVal === null || rawSubCeilingVal === undefined || rawSubCeilingVal === '' || typeof rawSubCeilingVal === 'boolean')
+              ? NaN
+              : Number(rawSubCeilingVal);
+            if (!Number.isFinite(subCeiling) || isNaN(subCeiling) || subCeiling <= 0) {
+              const err = new Error(`Corrupted sub-order total for #${disputeData.subOrderId}. Resolution aborted (Fail-Closed).`) as any;
+              err.statusCode = 503;
+              throw err;
+            }
+            maxAllowedCeiling = subCeiling;
+            targetSellerId = sub.sellerId || targetSellerId;
+            targetStoreId = sub.storeId || targetStoreId;
+          }
+
+          const sellerLockRef = targetSellerId ? adminDb.collection('seller_payout_locks').doc(targetSellerId) : null;
+          const sellerLockSnap = (sellerLockRef && targetSellerId === disputeSellerId)
+            ? sellerLockSnapForDispute
+            : (sellerLockRef ? await transaction.get(sellerLockRef) : null);
+
+          let cumulativeOrderRefunded = baselineHistoricalOrderRefunded;
+          let cumulativeSubOrderRefunded = baselineHistoricalSubOrderRefunded;
+          const existingSubOrderRefundsMap: Record<string, number> = {};
+
+          if (refundLockSnap.exists) {
+            const lockData = refundLockSnap.data() || {};
+            if (lockData.cumulativeRefunded !== undefined) {
+              const lockCum = (lockData.cumulativeRefunded === null || lockData.cumulativeRefunded === '' || typeof lockData.cumulativeRefunded === 'boolean')
+                ? NaN
+                : Number(lockData.cumulativeRefunded);
+              if (!Number.isFinite(lockCum) || isNaN(lockCum) || lockCum < 0) {
+                const err = new Error(`Corrupted cumulativeRefunded in order_refund_locks for #${disputeData.orderId}. Fail-Closed.`) as any;
+                err.statusCode = 503;
+                throw err;
+              }
+              if (lockCum > cumulativeOrderRefunded) {
+                cumulativeOrderRefunded = lockCum;
+              }
+            }
+            if (lockData.subOrderRefunds && typeof lockData.subOrderRefunds === 'object') {
+              Object.assign(existingSubOrderRefundsMap, lockData.subOrderRefunds);
+              if (disputeData.subOrderId && lockData.subOrderRefunds[disputeData.subOrderId] !== undefined) {
+                const subLockCum = Number(lockData.subOrderRefunds[disputeData.subOrderId]);
+                if (Number.isFinite(subLockCum) && subLockCum > cumulativeSubOrderRefunded) {
+                  cumulativeSubOrderRefunded = subLockCum;
+                }
+              }
+            }
+          }
+
+          const remainingOrderRefundable = Math.max(0, Number((orderTotal - cumulativeOrderRefunded).toFixed(2)));
+          const remainingSubOrderRefundable = disputeData.subOrderId
+            ? Math.max(0, Number((maxAllowedCeiling - cumulativeSubOrderRefunded).toFixed(2)))
+            : remainingOrderRefundable;
+          const remainingRefundable = Math.min(remainingOrderRefundable, remainingSubOrderRefundable);
+          authoritativeRefundAmount = Number(parsedRefundAmount.toFixed(2));
+
+          if (authoritativeRefundAmount > remainingRefundable + 0.001) {
+            const err = new Error(
+              `Dispute refundAmount ($${authoritativeRefundAmount.toFixed(2)}) exceeds remaining refundable ceiling ($${remainingRefundable.toFixed(2)}) for order #${disputeData.orderId}`
+            ) as any;
+            err.statusCode = 400;
+            throw err;
+          }
+
+          const newCumulative = Number((cumulativeOrderRefunded + authoritativeRefundAmount).toFixed(2));
+          if (disputeData.subOrderId) {
+            existingSubOrderRefundsMap[disputeData.subOrderId] = Number((cumulativeSubOrderRefunded + authoritativeRefundAmount).toFixed(2));
+          }
+          const refundId = `ref_disp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+          const refundDocRef = adminDb.collection('refundRequests').doc(refundId);
+
+          // 1. Update order_refund_locks atomically
+          transaction.set(refundLockRef, {
+            orderId: disputeData.orderId,
+            maxAllowedCeiling: orderTotal,
+            cumulativeRefunded: newCumulative,
+            subOrderRefunds: existingSubOrderRefundsMap,
+            lastRefundId: refundId,
+            lastAmount: authoritativeRefundAmount,
+            updatedAt: now,
+          }, { merge: true });
+
+          // 2. Reserve refund on seller_payout_locks AND release active dispute freeze (converted to refund reservation)
+          if (sellerLockRef) {
+            const currentSellerRefundReserved = sellerLockSnap && sellerLockSnap.exists
+              ? (Number(sellerLockSnap.data()?.totalRefundReserved) || 0)
+              : 0;
+            const currentDisputeFrozen = sellerLockSnap && sellerLockSnap.exists
+              ? (Number(sellerLockSnap.data()?.totalDisputeFrozen) || 0)
+              : 0;
+            transaction.set(sellerLockRef, {
+              sellerId: targetSellerId,
+              totalRefundReserved: Number((currentSellerRefundReserved + authoritativeRefundAmount).toFixed(2)),
+              totalDisputeFrozen: Math.max(0, Number((currentDisputeFrozen - disputeFrozenAmt).toFixed(2))),
+              lastRefundAt: now,
+              lastRefundId: refundId,
+              lastOrderRefunded: disputeData.orderId,
+            }, { merge: true });
+          }
+
+          // 3. Create authoritative refundRequests document in REFUND_APPROVED status
+          transaction.set(refundDocRef, {
+            id: refundId,
+            orderId: disputeData.orderId,
+            ...(disputeData.subOrderId ? { subOrderId: disputeData.subOrderId } : {}),
+            customerId: disputeData.customerId || orderData.customerId || '',
+            customerName: disputeData.customerName || orderData.customerName || 'Customer',
+            customerPhone: disputeData.customerPhone || orderData.phone || '',
+            sellerId: targetSellerId,
+            storeId: targetStoreId,
+            amount: authoritativeRefundAmount,
+            reason: disputeData.reason || 'other',
+            notes: `Dispute #${disputeId} resolved: ${(resolutionNotes || '').trim()}`,
+            status: 'REFUND_APPROVED',
+            disputeId,
+            processedBy: caller.uid,
+            processedAt: now,
+            createdAt: now,
             updatedAt: now,
           });
+
+          // 4. Update order refundStatus and cumulative refundAmount
+          transaction.update(orderRef, {
+            refundStatus: 'approved',
+            refundAmount: newCumulative,
+            updatedAt: now,
+          });
+        } else if (actionTaken === 'CLAIM_DISMISSED' && sellerLockRefForDispute && sellerLockSnapForDispute && sellerLockSnapForDispute.exists) {
+          // Release active dispute freeze when claim is dismissed
+          const currentDisputeFrozen = Number(sellerLockSnapForDispute.data()?.totalDisputeFrozen) || 0;
+          transaction.set(sellerLockRefForDispute, {
+            totalDisputeFrozen: Math.max(0, Number((currentDisputeFrozen - disputeFrozenAmt).toFixed(2))),
+            updatedAt: now,
+          }, { merge: true });
         }
+
+        const resolution = {
+          resolvedBy: caller.uid,
+          actionTaken,
+          resolutionNotes: (resolutionNotes || '').trim(),
+          resolvedAt: now,
+          refundAmount: authoritativeRefundAmount,
+        };
+
+        // Release active dispute lock when resolved
+        const lockScopeKey = disputeData.subOrderId ? `${disputeData.orderId}_${disputeData.subOrderId}` : disputeData.orderId;
+        if (lockScopeKey) {
+          const dispLockRef = adminDb.collection('dispute_locks').doc(lockScopeKey);
+          transaction.set(dispLockRef, {
+            status: finalStatus,
+            activeDisputeId: null,
+            updatedAt: now,
+          }, { merge: true });
+        }
+
+        // Write authoritative audit log inside transaction
+        const auditRef = adminDb.collection('audit_logs').doc(`audit_disp_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`);
+        transaction.set(auditRef, {
+          id: auditRef.id,
+          actorId: caller.uid,
+          actorRole: caller.isSuperAdmin ? 'SUPER_ADMIN' : 'ADMIN',
+          actorEmail: caller.email || '',
+          action: actionTaken === 'REFUND_APPROVED' ? 'DISPUTE_RESOLVED_REFUND' : 'DISPUTE_RESOLVED_DISMISSED',
+          targetType: 'dispute',
+          targetId: disputeId,
+          targetName: `Dispute #${disputeId} (Order #${disputeData.orderId})`,
+          timestamp: now,
+          metadata: {
+            orderId: disputeData.orderId,
+            actionTaken,
+            refundAmount: authoritativeRefundAmount,
+            resolutionNotes: (resolutionNotes || '').trim(),
+          },
+        });
 
         transaction.update(disputeRef, {
           status: finalStatus,
@@ -717,12 +1169,10 @@ async function startServer() {
       });
     } catch (err: any) {
       console.error('[API /api/disputes/resolve] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = err.statusCode || (isForbidden ? 403 : isAuth ? 401 : 400);
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to resolve dispute');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to resolve dispute',
+        error: safeMessage,
       });
     }
   });
@@ -736,13 +1186,10 @@ async function startServer() {
       return res.status(200).json(result);
     } catch (err: any) {
       console.error('[API /api/payouts/review] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden') || err.message?.includes('غير مصرح');
-      const isAuth = err.message?.includes('Authentication');
-      const isConflict = err.message?.includes('terminal');
-      const statusCode = err.statusCode || (isConflict ? 409 : isForbidden ? 403 : isAuth ? 401 : 400);
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to review payout request');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to review payout request',
+        error: safeMessage,
       });
     }
   });
@@ -756,12 +1203,10 @@ async function startServer() {
       return res.status(200).json(result);
     } catch (err: any) {
       console.error('[API /api/subscriptions/review] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden') || err.message?.includes('غير مصرح');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = err.statusCode || (isForbidden ? 403 : isAuth ? 401 : 400);
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to review subscription');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to review subscription',
+        error: safeMessage,
       });
     }
   });
@@ -820,12 +1265,10 @@ async function startServer() {
       return res.status(200).json({ success: true, log: logEntry });
     } catch (err: any) {
       console.error('[API /api/audit/log] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to record audit log');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to record audit log',
+        error: safeMessage,
       });
     }
   });
@@ -879,10 +1322,13 @@ async function startServer() {
 
       const adminDb = getAdminDb();
       const eventId = `evt_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const cleanTargetId = entityId ? String(entityId).slice(0, 100) : (req.body?.targetId ? String(req.body.targetId).slice(0, 100) : null);
       const eventDoc = {
         id: eventId,
         type: trimmedType,
-        entityId: entityId ? String(entityId).slice(0, 100) : null,
+        entityId: cleanTargetId,
+        targetId: cleanTargetId,
+        targetType: req.body?.targetType ? String(req.body.targetType).slice(0, 50) : 'product',
         sellerId: sellerId ? String(sellerId).slice(0, 100) : null,
         metadata: sanitizedMetadata,
         ip: (req as any).rateLimitIdentity || 'anonymous',
@@ -893,7 +1339,8 @@ async function startServer() {
       return res.status(200).json({ success: true, eventId });
     } catch (err: any) {
       console.error('[API /api/analytics/event] Error:', err.message);
-      return res.status(400).json({ success: false, error: 'Failed to record analytics event' });
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to record analytics event');
+      return res.status(statusCode).json({ success: false, error: safeMessage });
     }
   });
 
@@ -975,13 +1422,10 @@ async function startServer() {
       }
     } catch (err: any) {
       console.error('[API /api/ai/assistant] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden') || err.message?.includes('not authorized') || err.message?.includes('not have permission');
-      const isAuth = err.message?.includes('Authentication');
-      const isNotFound = err.message?.includes('not found');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : isNotFound ? 404 : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to process AI query');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to process AI query',
+        error: safeMessage,
       });
     }
   });
@@ -1003,6 +1447,14 @@ async function startServer() {
       let caller = null;
       if ((req as any).authenticatedUser) {
         const decoded = (req as any).authenticatedUser;
+        try {
+          await assertUserAccountActive(decoded.uid);
+        } catch (suspErr: any) {
+          return res.status(403).json({
+            success: false,
+            error: suspErr.message || 'Account is suspended or disabled.',
+          });
+        }
         caller = {
           uid: decoded.uid,
           email: decoded.email,
@@ -1011,6 +1463,17 @@ async function startServer() {
           isSuperAdmin: false,
           token: decoded,
         };
+      } else if (authHeader) {
+        try {
+          caller = await requireAuthenticatedCaller(authHeader);
+        } catch (authErr: any) {
+          if (authErr?.message?.includes('suspended') || authErr?.message?.includes('banned') || authErr?.message?.includes('disabled') || authErr?.statusCode === 403) {
+            return res.status(403).json({
+              success: false,
+              error: authErr.message || 'Account is suspended or disabled.',
+            });
+          }
+        }
       }
 
       const safeLimit = limit !== undefined ? Math.min(50, Math.max(1, Number(limit) || 10)) : 10;
@@ -1024,9 +1487,10 @@ async function startServer() {
       return res.status(200).json({ success: true, ...result });
     } catch (err: any) {
       console.error('[API /api/ai/search] Error:', err.message);
-      return res.status(400).json({
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to execute smart search');
+      return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to execute smart search',
+        error: safeMessage,
       });
     }
   });
@@ -1047,12 +1511,10 @@ async function startServer() {
       return res.status(200).json({ success: true, ...result });
     } catch (err: any) {
       console.error('[API /api/ai/report] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to generate report summary');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to generate report summary',
+        error: safeMessage,
       });
     }
   });
@@ -1074,12 +1536,10 @@ async function startServer() {
       return res.status(200).json({ success: true, copy: result.response });
     } catch (err: any) {
       console.error('[API /api/ai/copywriting] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to generate product copy');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to generate product copy',
+        error: safeMessage,
       });
     }
   });
@@ -1096,15 +1556,27 @@ async function startServer() {
       }
 
       const result = await validateAndExecuteToolPolicy(toolName, args || {}, caller);
+      if (!result.allowed && result.statusCode === 429) {
+        return res.status(429).json({
+          success: false,
+          error: result.error,
+          result,
+        });
+      }
       return res.status(200).json({ success: true, result });
     } catch (err: any) {
       console.error('[API /api/ai/execute-tool] Error:', err.message);
-      const isForbidden = err.message?.includes('Forbidden');
-      const isAuth = err.message?.includes('Authentication');
-      const statusCode = isForbidden ? 403 : isAuth ? 401 : 400;
+      if (err.code === 'RATE_LIMITER_UNAVAILABLE' || err.statusCode === 503) {
+        return res.status(503).json({
+          success: false,
+          error: 'Security control failure: Rate limiter service temporarily unavailable.',
+          code: 'RATE_LIMITER_UNAVAILABLE',
+        });
+      }
+      const { statusCode, safeMessage } = sanitizeGatewayError(err, 'Failed to execute tool policy');
       return res.status(statusCode).json({
         success: false,
-        error: err.message || 'Failed to execute tool policy',
+        error: safeMessage,
       });
     }
   });
@@ -1123,6 +1595,16 @@ async function startServer() {
       error: message,
     });
   });
+
+  return app;
+}
+
+export async function startServer() {
+  if (process.env.NODE_ENV === 'production') {
+    validateBackendFirebaseConfiguration(process.env);
+  }
+  const app = createProductionApiApp();
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   // 4. Vite middleware for development / Static files for production
   if (process.env.NODE_ENV !== 'production') {
@@ -1144,7 +1626,14 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('[MarketSpace Server] Failed to start:', err);
-  process.exit(1);
-});
+const isMainEntry =
+  process.env.NODE_ENV !== 'test' &&
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === path.resolve(process.cwd(), 'server.ts');
+
+if (isMainEntry) {
+  startServer().catch((err) => {
+    console.error('[MarketSpace Server] Failed to start:', err);
+    process.exit(1);
+  });
+}

@@ -1,4 +1,4 @@
-import { collection, doc, getDocs, setDoc, updateDoc, deleteDoc, query, where } from 'firebase/firestore';
+import { collection, doc, getDocs, setDoc, updateDoc, deleteDoc, query, where, limit } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { SavedAddress } from '../types';
 
@@ -51,7 +51,8 @@ export const addressService = {
     try {
       const q = query(
         collection(db, ADDRESSES_COLLECTION),
-        where('userId', '==', userId)
+        where('userId', '==', userId),
+        limit(100)
       );
       const snapshot = await getDocs(q);
       if (!snapshot.empty) {

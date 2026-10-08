@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "tsx tests/integration_suite.ts",
+    "test": "firebase emulators:exec --only firestore,storage \"tsx tests/integration_suite.ts\"",
     "test:integration": "firebase emulators:exec --only firestore,storage \"tsx tests/integration_suite.ts\"",
     "test:security": "tsx tests/security_financial_audit.ts",
     "test:adversarial": "firebase emulators:exec --only firestore,storage \"tsx tests/security_adversarial_suite.ts\"",
@@ -19,7 +19,10 @@
     "test:image": "firebase emulators:exec --only firestore \"tsx tests/image_security_suite.ts\"",
     "test:ai": "tsx tests/ai_security_suite.ts",
     "test:gap": "tsx tests/gap_closure_suite.ts",
-    "test:v3": "tsx tests/v3_forensic_audit_suite.ts"
+    "test:v3": "tsx tests/v3_forensic_audit_suite.ts",
+    "test:remediation": "firebase emulators:exec --only firestore,storage \"tsx tests/post_closure_remediation_suite.ts\"",
+    "test:completion": "firebase emulators:exec --only firestore,storage \"tsx tests/final_completion_pass_f01_f35.ts\"",
+    "verify:all": "firebase emulators:exec --only firestore,storage \"tsx tests/aggregate_verification_report.ts\""
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

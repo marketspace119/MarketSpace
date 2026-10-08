@@ -81,13 +81,32 @@ export async function processImageVerificationGateway(
     throw err;
   }
 
-  // 4. Verify Against Declared MIME (Anti-Spoofing)
+  // 4. Verify Against Declared MIME & Filename Extension (Anti-Spoofing)
   if (declaredMime && inspection.detectedFormat) {
     const isJpegMatch = inspection.detectedFormat === 'jpeg' && (declaredMime === 'image/jpeg' || declaredMime === 'image/jpg');
     if (!declaredMime.includes(inspection.detectedFormat) && !isJpegMatch) {
       const err = new Error(`MIME type spoofing detected: Declared '${declaredMime}' does not match binary format '${inspection.detectedFormat}'`) as any;
       err.statusCode = 400;
       throw err;
+    }
+  }
+
+  if (payload.filename && inspection.detectedFormat) {
+    const extMatch = payload.filename.toLowerCase().match(/\.([a-z0-9]+)$/);
+    if (extMatch) {
+      const ext = extMatch[1];
+      const allowedExts: Record<string, string[]> = {
+        png: ['png'],
+        jpeg: ['jpg', 'jpeg'],
+        webp: ['webp'],
+        gif: ['gif'],
+      };
+      const expected = allowedExts[inspection.detectedFormat] || [];
+      if (!expected.includes(ext)) {
+        const err = new Error(`Extension spoofing detected: Filename '${payload.filename}' (.${ext}) does not match binary format '${inspection.detectedFormat}'`) as any;
+        err.statusCode = 400;
+        throw err;
+      }
     }
   }
 
@@ -165,13 +184,32 @@ export async function processImageUploadGateway(
     throw err;
   }
 
-  // 4. Anti-Spoofing check
+  // 4. Anti-Spoofing check (MIME + Filename Extension)
   if (declaredMime && inspection.detectedFormat) {
     const isJpegMatch = inspection.detectedFormat === 'jpeg' && (declaredMime === 'image/jpeg' || declaredMime === 'image/jpg');
     if (!declaredMime.includes(inspection.detectedFormat) && !isJpegMatch) {
       const err = new Error(`MIME type spoofing detected: Declared '${declaredMime}' does not match binary format '${inspection.detectedFormat}'`) as any;
       err.statusCode = 400;
       throw err;
+    }
+  }
+
+  if (payload.filename && inspection.detectedFormat) {
+    const extMatch = payload.filename.toLowerCase().match(/\.([a-z0-9]+)$/);
+    if (extMatch) {
+      const ext = extMatch[1];
+      const allowedExts: Record<string, string[]> = {
+        png: ['png'],
+        jpeg: ['jpg', 'jpeg'],
+        webp: ['webp'],
+        gif: ['gif'],
+      };
+      const expected = allowedExts[inspection.detectedFormat] || [];
+      if (!expected.includes(ext)) {
+        const err = new Error(`Extension spoofing detected: Filename '${payload.filename}' (.${ext}) does not match binary format '${inspection.detectedFormat}'`) as any;
+        err.statusCode = 400;
+        throw err;
+      }
     }
   }
 
@@ -183,7 +221,7 @@ export async function processImageUploadGateway(
     ? `sellers/${targetOwner}/${subfolder}/${timestamp}_${cleanName}`
     : `users/${targetOwner}/${timestamp}_${cleanName}`;
 
-  let downloadUrl = `data:${inspection.mimeType};base64,${base64Data}`;
+  let downloadUrl: string;
 
   try {
     const adminStorage = getAdminStorage();
@@ -200,7 +238,10 @@ export async function processImageUploadGateway(
     });
     downloadUrl = `https://storage.googleapis.com/${bucket.name}/${storagePath}`;
   } catch (err: any) {
-    console.warn('[ImageGateway:Upload] Bucket persistence notice (fallback to safe authenticated data URL):', err?.message || err);
+    console.error('[ImageGateway:Upload] Fatal Storage write failure (Fail-Closed):', err?.message || err);
+    const storageErr = new Error(`Storage upload failed (Fail-Closed): ${err?.message || 'Unable to persist image to storage bucket'}`) as any;
+    storageErr.statusCode = 503;
+    throw storageErr;
   }
 
   return {

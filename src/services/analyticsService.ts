@@ -1,4 +1,4 @@
-import { doc, getDocs, collection, setDoc } from 'firebase/firestore';
+import { doc, getDocs, collection, setDoc, query, limit } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { AnalyticsEvent, AnalyticsEventType } from '../types';
 
@@ -48,7 +48,7 @@ function persistEvents(events: AnalyticsEvent[]) {
 export const analyticsService = {
   async syncWithFirestore(): Promise<void> {
     try {
-      const snap = await getDocs(collection(db, EVENTS_COLLECTION));
+      const snap = await getDocs(query(collection(db, EVENTS_COLLECTION), limit(200)));
       if (!snap.empty) {
         const cloudEvents: AnalyticsEvent[] = [];
         snap.forEach(d => cloudEvents.push(d.data() as AnalyticsEvent));
@@ -109,6 +109,8 @@ export const analyticsService = {
       body: JSON.stringify({
         type: params.type,
         entityId: params.targetId,
+        targetId: params.targetId,
+        targetType: params.targetType,
         sellerId: params.sellerId,
         metadata: params.metadata,
       }),
@@ -130,7 +132,8 @@ export const analyticsService = {
     let views = 0;
 
     for (const e of events) {
-      if (e.targetId === targetId) {
+      const eventTargetId = e.targetId || (e as any).entityId;
+      if (eventTargetId === targetId) {
         if (e.type === 'AD_IMPRESSION' || e.type === 'PROMOTION_VIEW') impressions++;
         if (e.type === 'AD_CLICK' || e.type === 'PROMOTION_CLICK') clicks++;
         if (e.type === 'PRODUCT_VIEW' || e.type === 'STORE_VIEW') views++;

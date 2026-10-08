@@ -47,33 +47,20 @@ let memorySettings: PlatformSettings | null = null;
 
 function initSettings(): PlatformSettings {
   if (memorySettings) return memorySettings;
-  if (typeof window === 'undefined') return defaultSettings;
-  try {
-    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
-    if (!raw) {
-      localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(defaultSettings));
-      memorySettings = defaultSettings;
-      return defaultSettings;
-    }
-    memorySettings = JSON.parse(raw);
-    return memorySettings || defaultSettings;
-  } catch (err) {
-    console.error('Failed to load platform settings from storage:', err);
-    return defaultSettings;
-  }
+  // F-20: Do not read or trust localStorage for platform settings authority
+  memorySettings = { ...defaultSettings };
+  return memorySettings;
 }
 
 function persistLocal(settings: PlatformSettings) {
   memorySettings = settings;
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-  } catch (err) {
-    console.error('Failed to save settings to localStorage:', err);
-  }
+  // F-20: LocalStorage persistence removed for authoritative platform settings
 }
 
 export const platformSettingsService = {
+  resetMemoryState(): void {
+    memorySettings = null;
+  },
   async syncWithFirestore(userRole?: UserRole): Promise<PlatformSettings> {
     try {
       // P1-01: Admin reads full settings; non-admin reads operational and public documents only
@@ -210,30 +197,32 @@ export const platformSettingsService = {
     };
 
     const saveOperations = async () => {
-      const batch = writeBatch(db);
-      batch.set(doc(db, SETTINGS_COLLECTION, DEFAULT_SETTINGS_DOC), updated, { merge: true });
-      batch.set(doc(db, SETTINGS_COLLECTION, 'publicPlatformSettings'), publicData, { merge: true });
-      batch.set(doc(db, SETTINGS_COLLECTION, 'operationalSettings'), operationalData, { merge: true });
-      batch.set(doc(db, SETTINGS_COLLECTION, 'privateFinancialSettings'), privateFinancialData, { merge: true });
-      await batch.commit();
+      if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+        const batch = writeBatch(db);
+        batch.set(doc(db, SETTINGS_COLLECTION, DEFAULT_SETTINGS_DOC), updated, { merge: true });
+        batch.set(doc(db, SETTINGS_COLLECTION, 'publicPlatformSettings'), publicData, { merge: true });
+        batch.set(doc(db, SETTINGS_COLLECTION, 'operationalSettings'), operationalData, { merge: true });
+        batch.set(doc(db, SETTINGS_COLLECTION, 'privateFinancialSettings'), privateFinancialData, { merge: true });
+        await batch.commit();
+      } else {
+        const serverAdminModule = '../../server/firebaseAdmin';
+        const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+        const adminDb = getAdminDb();
+        if (!adminDb) {
+          throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable for settings persistence');
+        }
+        await adminDb.collection(SETTINGS_COLLECTION).doc(DEFAULT_SETTINGS_DOC).set(JSON.parse(JSON.stringify(updated)), { merge: true });
+        await adminDb.collection(SETTINGS_COLLECTION).doc('publicPlatformSettings').set(JSON.parse(JSON.stringify(publicData)), { merge: true });
+        await adminDb.collection(SETTINGS_COLLECTION).doc('operationalSettings').set(JSON.parse(JSON.stringify(operationalData)), { merge: true });
+        await adminDb.collection(SETTINGS_COLLECTION).doc('privateFinancialSettings').set(JSON.parse(JSON.stringify(privateFinancialData)), { merge: true });
+      }
     };
 
-    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
-      try {
-        await saveOperations();
-      } catch (err) {
-        console.error('Failed to save settings to Firestore:', err);
-        throw err;
-      }
-    } else {
-      try {
-        await Promise.race([
-          saveOperations(),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore write timeout')), 800)),
-        ]);
-      } catch (err) {
-        console.warn('Failed to save settings to Firestore (test/offline):', err);
-      }
+    // F-14: Authoritative Firestore write MUST succeed BEFORE mutating local state (Fail-Closed)
+    try {
+      await saveOperations();
+    } catch (err: any) {
+      throw new Error(`Database write failure (Fail-Closed): Unable to update platform settings in Firestore (${err?.message || err})`);
     }
 
     persistLocal(updated);

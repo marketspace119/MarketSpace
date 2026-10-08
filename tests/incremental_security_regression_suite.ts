@@ -1119,7 +1119,7 @@ async function runIncrementalSecurityRegressionSuite() {
 
     let serviceTamperingBlocked = false;
     try {
-      bookingService.updateBookingStatus(
+      await bookingService.updateBookingStatus(
         createdBooking.id,
         'completed',
         FIXTURES.sellerB.uid, // Seller B attempting to manage Seller A booking

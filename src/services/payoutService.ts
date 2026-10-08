@@ -1,4 +1,4 @@
-import { doc, getDocs, collection, setDoc, query, where } from 'firebase/firestore';
+import { doc, getDocs, collection, setDoc, query, where, limit } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType, cleanForFirestore } from '../lib/firebase';
 import { PayoutRequest, PayoutStatus, UserRole } from '../types';
 import { auditLogService } from './auditLogService';
@@ -13,40 +13,34 @@ const seedPayouts: PayoutRequest[] = [];
 
 let memoryPayouts: PayoutRequest[] = [];
 
+function isProductionEnvironment(): boolean {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'production') return true;
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.PROD) return true;
+  return false;
+}
+
 function initPayouts(): PayoutRequest[] {
   if (memoryPayouts.length > 0) return memoryPayouts;
-  if (typeof window === 'undefined') return seedPayouts;
-  try {
-    const raw = localStorage.getItem(PAYOUTS_STORAGE_KEY);
-    if (!raw) {
-      const normalizedSeeds = seedPayouts.map(normalizePayout);
-      localStorage.setItem(PAYOUTS_STORAGE_KEY, JSON.stringify(normalizedSeeds));
-      memoryPayouts = normalizedSeeds;
-      return normalizedSeeds;
-    }
-    const parsed = JSON.parse(raw);
-    memoryPayouts = Array.isArray(parsed) ? parsed.map(normalizePayout) : seedPayouts.map(normalizePayout);
-    return memoryPayouts;
-  } catch (err) {
-    console.error('Failed to parse payouts from localStorage:', err);
-    const normalizedSeeds = seedPayouts.map(normalizePayout);
-    memoryPayouts = normalizedSeeds;
-    return normalizedSeeds;
-  }
+  // F-20: Do not read or trust localStorage for payout authority
+  memoryPayouts = seedPayouts.map(normalizePayout);
+  return memoryPayouts;
 }
 
 function persistLocal(payouts: PayoutRequest[]) {
   const normalized = payouts.map(normalizePayout);
   memoryPayouts = normalized;
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(PAYOUTS_STORAGE_KEY, JSON.stringify(normalized));
-  } catch (err) {
-    console.error('Failed to save payouts to localStorage:', err);
-  }
+  // F-20: LocalStorage persistence removed for authoritative payout state
 }
 
 export const payoutService = {
+  resetMemoryState() {
+    memoryPayouts = [];
+  },
+
+  clearUserCache() {
+    this.resetMemoryState();
+  },
+
   /**
    * Seed payout requests in memory for deterministic test fixtures and audits
    */
@@ -58,9 +52,9 @@ export const payoutService = {
     try {
       let q;
       if (isAdmin) {
-        q = collection(db, PAYOUTS_COLLECTION);
+        q = query(collection(db, PAYOUTS_COLLECTION), limit(200));
       } else if (sellerId) {
-        q = query(collection(db, PAYOUTS_COLLECTION), where('sellerId', '==', sellerId));
+        q = query(collection(db, PAYOUTS_COLLECTION), where('sellerId', '==', sellerId), limit(200));
       }
 
       if (q) {
@@ -99,6 +93,25 @@ export const payoutService = {
    * FIN-01 / FIN-02: Prevents client-side balance drift and unbounded reads.
    */
   async getFinancialSummary(sellerId: string): Promise<any> {
+    if (isProductionEnvironment()) {
+      const currentUser = auth.currentUser;
+      if (!currentUser) {
+        throw new Error('Authentication required (Fail-Closed): Cannot fetch financial summary in production without authenticated session');
+      }
+      const token = await currentUser.getIdToken();
+      const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || '');
+      const res = await fetch(`${baseUrl}/api/seller/financial-summary?sellerId=${encodeURIComponent(sellerId)}`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success || !data.summary) {
+        throw new Error(data.error || 'Failed to fetch authoritative financial summary');
+      }
+      return data.summary;
+    }
+
     if (typeof window === 'undefined' && (process.env.NODE_ENV === 'test' || !process.env.API_BASE_URL)) {
       return {
         sellerId,
@@ -138,10 +151,12 @@ export const payoutService = {
       throw new Error('Account number is required');
     }
 
-    // Production / Authoritative: Delegate directly to secure server gateway with authenticated token
-    // The server calculates the balance authoritatively within its lock/transaction (FIN-01, FIN-02)
+    // F-17: In production, NEVER allow unauthenticated or in-memory fallback payout creation
     const currentUser = auth.currentUser;
     if (!currentUser) {
+      if (isProductionEnvironment()) {
+        throw new Error('UNAUTHENTICATED (Fail-Closed): Production payout creation strictly requires verified authentication and server gateway');
+      }
       if (typeof window === 'undefined' && (process.env.NODE_ENV === 'test' || !process.env.API_BASE_URL)) {
         const fallbackPayout: PayoutRequest = {
           id: `payout_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,

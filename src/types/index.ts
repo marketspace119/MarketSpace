@@ -13,7 +13,7 @@ export type UserRole =
 
 export type SellerType = 'store' | 'restaurant' | 'service' | 'classified';
 
-export type SellerStatus = 'pending' | 'approved' | 'rejected' | 'suspended';
+export type SellerStatus = 'pending' | 'pending_review' | 'approved' | 'rejected' | 'suspended';
 
 export interface User {
   id: string;

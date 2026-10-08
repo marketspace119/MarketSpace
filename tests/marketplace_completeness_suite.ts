@@ -25,9 +25,40 @@ import { commissionService } from '../src/services/commissionService';
 import { subscriptionService } from '../src/services/subscriptionService';
 import { productService } from '../src/services/productService';
 import { storeService } from '../src/services/storeService';
+import { setAdminDbForTesting } from '../server/firebaseAdmin';
 import { db } from '../src/lib/firebase';
 import { disableNetwork } from 'firebase/firestore';
 import { CartItem, Product, DeliveryAssignment } from '../src/types';
+
+if (!process.env.FIRESTORE_EMULATOR_HOST) {
+  const memCols = new Map<string, Map<string, any>>();
+  const getCol = (name: string) => {
+    if (!memCols.has(name)) memCols.set(name, new Map());
+    return memCols.get(name)!;
+  };
+  setAdminDbForTesting({
+    collection: (name: string) => ({
+      doc: (id: string) => ({
+        id,
+        get: async () => {
+          const d = getCol(name).get(id);
+          return { exists: d !== undefined, id, data: () => d };
+        },
+        set: async (data: any, opts?: any) => {
+          const prev = getCol(name).get(id) || {};
+          getCol(name).set(id, opts?.merge ? { ...prev, ...data } : data);
+        },
+        update: async (data: any) => {
+          const prev = getCol(name).get(id) || {};
+          getCol(name).set(id, { ...prev, ...data });
+        },
+        delete: async () => {
+          getCol(name).delete(id);
+        },
+      }),
+    }),
+  });
+}
 
 async function runCompletenessSuite() {
   await disableNetwork(db).catch(() => {});
@@ -266,6 +297,26 @@ async function runCompletenessSuite() {
   // TEST-FC05: End-to-End Dispute Workflow (Customer -> Seller -> Admin)
   // -------------------------------------------------------------
   try {
+    orderService.seedOrders([
+      {
+        orderId: 'ord_test_dispute_01',
+        customerId: 'cust_dispute_01',
+        customerName: 'Fatima Ali',
+        phone: '+252 61 777 8888',
+        sellerId: 'seller_alpha',
+        sellerIds: ['seller_alpha'],
+        storeId: 'store_alpha',
+        status: 'delivered',
+        paymentStatus: 'paid',
+        paymentMethod: 'cash_on_delivery',
+        items: [],
+        subtotal: 50,
+        deliveryFee: 0,
+        total: 50,
+        createdAt: new Date().toISOString(),
+      } as any,
+    ]);
+
     // 1. Customer creates dispute
     const dispute = await disputeService.createDispute({
       orderId: 'ord_test_dispute_01',

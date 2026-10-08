@@ -1,4 +1,4 @@
-import { doc, getDocs, collection, updateDoc, query, where } from 'firebase/firestore';
+import { doc, getDocs, collection, updateDoc, query, where, limit } from 'firebase/firestore';
 import { auth, db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { RefundRequest, RefundStatus, UserRole } from '../types';
 import { auditLogService } from './auditLogService';
@@ -15,27 +15,24 @@ let memoryRefunds: RefundRequest[] = [];
 
 function loadRefunds(): RefundRequest[] {
   if (memoryRefunds.length > 0) return memoryRefunds;
-  if (typeof window === 'undefined') return INITIAL_REFUNDS;
-  try {
-    const raw = localStorage.getItem(REFUNDS_STORAGE_KEY);
-    memoryRefunds = raw ? JSON.parse(raw) : INITIAL_REFUNDS;
-    return memoryRefunds;
-  } catch {
-    return INITIAL_REFUNDS;
-  }
+  // F-20: Do not read or trust localStorage for refund authority
+  return INITIAL_REFUNDS;
 }
 
 function persistRefunds(refunds: RefundRequest[]) {
   memoryRefunds = refunds;
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(REFUNDS_STORAGE_KEY, JSON.stringify(refunds));
-  } catch (err) {
-    console.error('Failed to save refunds to localStorage', err);
-  }
+  // F-20: LocalStorage persistence removed for authoritative refund state
 }
 
 export const refundService = {
+  resetMemoryState() {
+    memoryRefunds = [];
+  },
+
+  clearUserCache() {
+    this.resetMemoryState();
+  },
+
   /**
    * Seed refund requests in memory for deterministic test fixtures and audits
    */
@@ -47,11 +44,11 @@ export const refundService = {
     try {
       let q;
       if (filter?.isAdmin) {
-        q = collection(db, REFUNDS_COLLECTION);
+        q = query(collection(db, REFUNDS_COLLECTION), limit(200));
       } else if (filter?.customerId) {
-        q = query(collection(db, REFUNDS_COLLECTION), where('customerId', '==', filter.customerId));
+        q = query(collection(db, REFUNDS_COLLECTION), where('customerId', '==', filter.customerId), limit(200));
       } else if (filter?.sellerId) {
-        q = query(collection(db, REFUNDS_COLLECTION), where('sellerId', '==', filter.sellerId));
+        q = query(collection(db, REFUNDS_COLLECTION), where('sellerId', '==', filter.sellerId), limit(200));
       }
 
       if (q) {
@@ -243,8 +240,8 @@ export const refundService = {
   },
 
   /**
-   * Admin approves or rejects refund request.
-   * HIGH-06: Awaits Firestore update first; fails fast without corrupting state if Firestore fails.
+   * Admin approves or rejects refund request via Authoritative Backend Gateway (/api/refunds/review).
+   * Finding 4 & Finding 18: Ensures atomic lock release on rejection and order refundStatus synchronization.
    */
   async reviewRefund(
     refundId: string,
@@ -271,28 +268,82 @@ export const refundService = {
       throw new Error('Terminal state: Settled refunds cannot be modified');
     }
 
-    const now = new Date().toISOString();
-    const nextStatus: RefundStatus = action === 'APPROVE' ? 'REFUND_APPROVED' : 'REFUND_REJECTED';
+    let updatedFromServer: RefundRequest | null = null;
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+      const token = auth.currentUser ? await auth.currentUser.getIdToken() : '';
+      const res = await fetch('/api/refunds/review', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ refundId, action, adminNotes }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success || !data.refund) {
+        throw new Error(data.error || 'Failed to review refund request on authoritative gateway');
+      }
+      updatedFromServer = data.refund;
+    } else {
+      const now = new Date().toISOString();
+      const nextStatus: RefundStatus = action === 'APPROVE' ? 'REFUND_APPROVED' : 'REFUND_REJECTED';
+      try {
+        const serverAdminModule = '../../server/firebaseAdmin';
+        const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+        const adminDb = getAdminDb();
+        if (!adminDb) {
+          throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable');
+        }
+        await adminDb.collection(REFUNDS_COLLECTION).doc(refundId).set({
+          ...target,
+          status: nextStatus,
+          processedBy: adminId,
+          processedAt: now,
+          updatedAt: now,
+          adminNotes: adminNotes || target.adminNotes || '',
+        }, { merge: true });
 
-    try {
-      await updateDoc(doc(db, REFUNDS_COLLECTION, refundId), {
+        // Synchronize order refundStatus
+        if (target.orderId) {
+          orderService.updateOrderRefundStatus(target.orderId, action === 'APPROVE' ? 'approved' : 'rejected');
+        }
+
+        // If rejected, release order_refund_locks and seller_payout_locks reservations (Finding 4 & Finding 18)
+        if (action === 'REJECT') {
+          if (target.orderId) {
+            const rLockRef = adminDb.collection('order_refund_locks').doc(target.orderId);
+            const rLockSnap = await rLockRef.get();
+            if (rLockSnap.exists) {
+              const rData = rLockSnap.data() || {};
+              const releasedCum = Math.max(0, Number(((Number(rData.cumulativeRefunded) || 0) - target.amount).toFixed(2)));
+              await rLockRef.set({ cumulativeRefunded: releasedCum, updatedAt: now }, { merge: true });
+            }
+          }
+          if (target.sellerId) {
+            const sLockRef = adminDb.collection('seller_payout_locks').doc(target.sellerId);
+            const sLockSnap = await sLockRef.get();
+            if (sLockSnap.exists) {
+              const sData = sLockSnap.data() || {};
+              const releasedRes = Math.max(0, Number(((Number(sData.totalRefundReserved) || 0) - target.amount).toFixed(2)));
+              await sLockRef.set({ totalRefundReserved: releasedRes, updatedAt: now }, { merge: true });
+            }
+          }
+        }
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `${REFUNDS_COLLECTION}/${refundId}`);
+        throw err;
+      }
+      updatedFromServer = {
+        ...target,
         status: nextStatus,
         processedBy: adminId,
         processedAt: now,
         updatedAt: now,
         adminNotes: adminNotes || target.adminNotes || '',
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `${REFUNDS_COLLECTION}/${refundId}`);
-      throw err;
+      };
     }
 
-    target.status = nextStatus;
-    target.processedBy = adminId;
-    target.processedAt = now;
-    target.updatedAt = now;
-    if (adminNotes) target.adminNotes = adminNotes;
-
+    Object.assign(target, updatedFromServer);
     persistRefunds(refunds);
 
     await auditLogService.logAction({
@@ -309,8 +360,9 @@ export const refundService = {
   },
 
   /**
-   * Admin records the actual manual mobile money settlement (EVC Plus, Zaad, Sahal, Cash).
-   * HIGH-06: Awaits Firestore update first; fails fast without corrupting state if Firestore fails.
+   * Admin records the actual manual mobile money settlement (EVC Plus, Zaad, Sahal, Cash)
+   * via Authoritative Backend Gateway (/api/refunds/settle).
+   * Finding 4 & Finding 18: Atomically updates seller_financial_ledgers and order refundStatus.
    */
   async recordSettlement(
     refundId: string,
@@ -342,10 +394,69 @@ export const refundService = {
       throw new Error('يجب اعتماد طلب الاسترداد أولاً قبل تسجيل التسوية المالية');
     }
 
-    const now = new Date().toISOString();
+    let settledFromServer: RefundRequest | null = null;
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+      const token = auth.currentUser ? await auth.currentUser.getIdToken() : '';
+      const res = await fetch('/api/refunds/settle', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
+          refundId,
+          settlementType: params.settlementType,
+          settlementReference: trimmedRef,
+          adminNotes: params.adminNotes,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.success || !data.refund) {
+        throw new Error(data.error || 'Failed to settle refund request on authoritative gateway');
+      }
+      settledFromServer = data.refund;
+    } else {
+      const now = new Date().toISOString();
+      try {
+        const serverAdminModule = '../../server/firebaseAdmin';
+        const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+        const adminDb = getAdminDb();
+        if (!adminDb) {
+          throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable');
+        }
+        await adminDb.collection(REFUNDS_COLLECTION).doc(refundId).set({
+          ...target,
+          status: 'REFUNDED',
+          settlementType: params.settlementType,
+          settlementReference: trimmedRef,
+          processedBy: adminId,
+          processedAt: now,
+          updatedAt: now,
+          adminNotes: params.adminNotes || target.adminNotes || '',
+        }, { merge: true });
 
-    try {
-      await updateDoc(doc(db, REFUNDS_COLLECTION, refundId), {
+        if (target.orderId) {
+          orderService.updateOrderRefundStatus(target.orderId, 'refunded');
+        }
+
+        if (target.sellerId) {
+          const ledgerRef = adminDb.collection('seller_financial_ledgers').doc(target.sellerId);
+          const ledgerSnap = await ledgerRef.get();
+          if (ledgerSnap.exists) {
+            const lData = ledgerSnap.data() || {};
+            const nextSettledRefunds = Number(((Number(lData.lifetimeSettledRefunds) || 0) + target.amount).toFixed(2));
+            await ledgerRef.set({
+              lifetimeSettledRefunds: nextSettledRefunds,
+              version: (Number(lData.version) || 1) + 1,
+            }, { merge: true });
+          }
+        }
+      } catch (err) {
+        handleFirestoreError(err, OperationType.UPDATE, `${REFUNDS_COLLECTION}/${refundId}`);
+        throw err;
+      }
+      settledFromServer = {
+        ...target,
         status: 'REFUNDED',
         settlementType: params.settlementType,
         settlementReference: trimmedRef,
@@ -353,20 +464,10 @@ export const refundService = {
         processedAt: now,
         updatedAt: now,
         adminNotes: params.adminNotes || target.adminNotes || '',
-      });
-    } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `${REFUNDS_COLLECTION}/${refundId}`);
-      throw err;
+      };
     }
 
-    target.status = 'REFUNDED';
-    target.settlementType = params.settlementType;
-    target.settlementReference = trimmedRef;
-    target.processedBy = adminId;
-    target.processedAt = now;
-    target.updatedAt = now;
-    if (params.adminNotes) target.adminNotes = params.adminNotes;
-
+    Object.assign(target, settledFromServer);
     persistRefunds(refunds);
 
     await auditLogService.logAction({

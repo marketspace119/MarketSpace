@@ -381,12 +381,12 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
     setIsProductModalOpen(true);
   };
 
-  const handleSaveProduct = (e: React.FormEvent) => {
+  const handleSaveProduct = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!store || !user) return;
 
     if (editingProduct) {
-      productService.updateProduct(
+      await productService.updateProductAuthoritative(
         editingProduct.id,
         {
           title: { ar: productFormData.titleAr, en: productFormData.titleEn, so: productFormData.titleEn },
@@ -410,7 +410,7 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
         user.role
       );
     } else {
-      productService.createProduct(
+      await productService.createProductAuthoritative(
         {
           title: { ar: productFormData.titleAr, en: productFormData.titleEn, so: productFormData.titleEn },
           description: { ar: productFormData.descAr, en: productFormData.descEn, so: productFormData.descEn },
@@ -444,19 +444,19 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
     setIsProductModalOpen(false);
   };
 
-  const handleDeleteProduct = (id: string) => {
+  const handleDeleteProduct = async (id: string) => {
     if (!user) return;
     if (window.confirm('هل أنت متأكد من رغبتك في حذف هذا المنتج نهائياً؟')) {
-      productService.deleteProduct(id, user.id, user.role);
+      await productService.deleteProductAuthoritative(id, user.id, user.role);
       setProducts(products.filter(p => p.id !== id));
     }
   };
 
-  const handleQuickStockAdjust = (product: Product, delta: number) => {
+  const handleQuickStockAdjust = async (product: Product, delta: number) => {
     if (!user || !store) return;
     const current = product.stock || 0;
     const newStock = Math.max(0, current + delta);
-    productService.updateProduct(
+    await productService.updateProductAuthoritative(
       product.id,
       { stock: newStock },
       user.id,
@@ -465,10 +465,10 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
     setProducts(productService.getAllProducts({ storeId: store.id }));
   };
 
-  const handleTogglePublish = (product: Product) => {
+  const handleTogglePublish = async (product: Product) => {
     if (!user || !store) return;
     const nextStatus = product.status === 'published' ? 'hidden' : 'published';
-    productService.updateProduct(
+    await productService.updateProductAuthoritative(
       product.id,
       { status: nextStatus, isPublished: nextStatus === 'published' },
       user.id,
@@ -515,10 +515,10 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
   };
 
   // Review reply
-  const handleSendReviewReply = (reviewId: string) => {
+  const handleSendReviewReply = async (reviewId: string) => {
     if (!replyText.trim()) return;
     try {
-      const updated = reviewService.replyToReview(reviewId, replyText, user.id, store?.id);
+      const updated = await reviewService.replyToReview(reviewId, replyText, user.id, store?.id);
       setReviews(reviews.map(r => (r.id === reviewId ? updated : r)));
       setReplyingReviewId(null);
       setReplyText('');
@@ -1050,7 +1050,13 @@ export const SellerDashboardPage: React.FC<SellerDashboardPageProps> = ({ onNavi
                                     -
                                   </button>
                                   <button
-                                    onClick={() => setHistoryProduct(prod)}
+                                    onClick={async () => {
+                                      setHistoryProduct(prod);
+                                      try {
+                                        const logs = await productService.getProductInventoryHistory(prod.id);
+                                        setHistoryProduct(prev => (prev && prev.id === prod.id ? { ...prev, inventoryHistory: logs } : prev));
+                                      } catch {}
+                                    }}
                                     title="عرض سجل حركات المخزون"
                                     className="text-gray-400 hover:text-blue-600 p-1"
                                   >

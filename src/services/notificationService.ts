@@ -8,6 +8,7 @@ import {
   where,
   onSnapshot,
   writeBatch,
+  limit,
 } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType, cleanForFirestore } from '../lib/firebase';
 import { NotificationItem, NotificationEventType, LocalizedString } from '../types';
@@ -64,7 +65,8 @@ export const notificationService = {
     try {
       const q = query(
         collection(db, NOTIFICATIONS_COLLECTION),
-        where('userId', '==', userId)
+        where('userId', '==', userId),
+        limit(200)
       );
 
       const unsubscribe = onSnapshot(
@@ -115,7 +117,8 @@ export const notificationService = {
     try {
       const q = query(
         collection(db, NOTIFICATIONS_COLLECTION),
-        where('userId', '==', userId)
+        where('userId', '==', userId),
+        limit(200)
       );
       const snapshot = await getDocs(q);
       const items: NotificationItem[] = [];
@@ -165,7 +168,8 @@ export const notificationService = {
       const q = query(
         collection(db, NOTIFICATIONS_COLLECTION),
         where('userId', '==', userId),
-        where('read', '==', false)
+        where('read', '==', false),
+        limit(200)
       );
       const snapshot = await getDocs(q);
       if (!snapshot.empty) {

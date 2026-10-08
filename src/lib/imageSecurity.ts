@@ -54,32 +54,53 @@ export function sniffImageMagicBytes(
     return { isValid: false, error: 'Security violation: Executable macOS Mach-O binary detected' };
   }
 
-  // 2. Disguised Script / HTML / XML / SVG Check (Anti-XSS)
-  // Check first 256 bytes for text tags
-  const headerSlice = bytes.subarray(0, Math.min(bytes.length, 256));
-  const headerStr = Array.from(headerSlice)
-    .map(b => String.fromCharCode(b))
-    .join('')
-    .toLowerCase();
+  // 2. Disguised Script / HTML / XML / SVG & Polyglot Payload Check (Anti-XSS / SUSPECT-01)
+  // Scan up to 64KB of the binary payload for embedded PHP, HTML/JS scripts, SVG, or executable shell payloads
+  const scanLen = Math.min(bytes.length, 65536);
+  let asciiWindow = '';
+  for (let i = 0; i < scanLen; i++) {
+    const b = bytes[i];
+    asciiWindow += (b >= 32 && b <= 126) ? String.fromCharCode(b) : ' ';
+  }
+  const lowerWindow = asciiWindow.toLowerCase();
 
   if (
-    headerStr.includes('<html') ||
-    headerStr.includes('<!doctype') ||
-    headerStr.includes('<script') ||
-    headerStr.includes('<?php') ||
-    headerStr.includes('<svg') ||
-    headerStr.includes('xmlns="http://www.w3.org/2000/svg"')
+    lowerWindow.includes('<svg') ||
+    lowerWindow.includes('xmlns="http://www.w3.org/2000/svg"')
   ) {
-    if (headerStr.includes('<svg') || headerStr.includes('xmlns="http://www.w3.org/2000/svg"')) {
-      return {
-        isValid: false,
-        error: 'SVG vector graphics are prohibited. Only raster PNG, JPEG, and WebP images are permitted.',
-      };
-    }
     return {
       isValid: false,
-      error: 'Security violation: HTML/script code detected inside disguised image file',
+      error: 'SVG vector graphics are prohibited. Only raster PNG, JPEG, and WebP images are permitted.',
     };
+  }
+
+  const polyglotPatterns = [
+    '<html',
+    '<!doctype',
+    '<script',
+    '<iframe',
+    '<object',
+    '<embed',
+    '<?php',
+    '<%=',
+    'javascript:',
+    'onerror=',
+    'onload=',
+    '#!/bin/sh',
+    '#!/bin/bash',
+    'eval(',
+    'base64_decode(',
+    'system(',
+    'shell_exec(',
+  ];
+
+  for (const sig of polyglotPatterns) {
+    if (lowerWindow.includes(sig)) {
+      return {
+        isValid: false,
+        error: `Security violation: HTML/script or executable polyglot payload (${sig}) detected inside image file`,
+      };
+    }
   }
 
   // 3. PNG: 89 50 4E 47 0D 0A 1A 0A

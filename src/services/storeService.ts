@@ -1,4 +1,4 @@
-import { doc, getDoc, getDocs, collection, setDoc, updateDoc } from 'firebase/firestore';
+import { doc, getDoc, getDocs, collection, setDoc, updateDoc, query, limit } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { Store, SellerStatus, UserRole } from '../types';
 import { seedStores } from '../data/seedStores';
@@ -18,52 +18,64 @@ function isProductionEnvironment(): boolean {
 
 function initStores(): Store[] {
   if (memoryStores.length > 0) return memoryStores;
-  if (typeof window === 'undefined') {
-    return isProductionEnvironment() ? [] : seedStores;
+  if (isProductionEnvironment()) {
+    memoryStores = [];
+    return [];
   }
-  try {
-    const raw = localStorage.getItem(STORES_STORAGE_KEY);
-    if (!raw) {
-      if (isProductionEnvironment()) {
-        memoryStores = [];
-        return [];
-      }
-      localStorage.setItem(STORES_STORAGE_KEY, JSON.stringify(seedStores));
-      memoryStores = seedStores;
-      return seedStores;
-    }
-    const parsed = JSON.parse(raw);
-    if (isProductionEnvironment()) {
-      // In production, reject any stale synthetic seed stores
-      memoryStores = Array.isArray(parsed) ? parsed.filter((s: any) => !s.isSeedData) : [];
-      return memoryStores;
-    }
-    memoryStores = parsed;
-    return memoryStores;
-  } catch (err) {
-    console.error('Failed to load stores from localStorage', err);
-    memoryStores = isProductionEnvironment() ? [] : seedStores;
-    return memoryStores;
-  }
+  // F-20: Do not read or trust localStorage for store authority
+  memoryStores = [...seedStores];
+  return memoryStores;
+}
+
+function stripPrivateStoreFields<T extends Record<string, any>>(store: T): T {
+  if (!store || typeof store !== 'object') return store;
+  const copy = { ...store };
+  // F-15: Strip private financial metadata from public /stores documents
+  delete copy.commissionRate;
+  delete copy.currentPlanId;
+  delete copy.currentPlanTier;
+  return copy;
 }
 
 function persistLocal(stores: Store[]) {
   memoryStores = stores;
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(STORES_STORAGE_KEY, JSON.stringify(stores));
-  } catch (err) {
-    console.error('Failed to save stores to storage', err);
+  // F-20: LocalStorage persistence removed for authoritative store state
+}
+
+async function persistStoreToFirestore(storeId: string, payload: Record<string, any>, merge = true): Promise<void> {
+  const cleanPayload = JSON.parse(JSON.stringify(payload));
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+    await setDoc(doc(db, STORES_COLLECTION, storeId), cleanPayload, merge ? { merge: true } : {});
+  } else {
+    const serverAdminModule = '../../server/firebaseAdmin';
+    const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+    const adminDb = getAdminDb();
+    if (!adminDb) {
+      throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable for store persistence');
+    }
+    await adminDb.collection(STORES_COLLECTION).doc(storeId).set(cleanPayload, merge ? { merge: true } : {});
   }
 }
 
 export const storeService = {
+  resetMemoryState() {
+    memoryStores = [];
+  },
+
+  clearUserCache() {
+    this.resetMemoryState();
+  },
+
+  seedStores(stores: Store[]) {
+    memoryStores = [...stores];
+  },
+
   /**
    * Background sync from Firestore to keep local cache fresh with cloud database
    */
   async syncWithFirestore(): Promise<Store[]> {
     try {
-      const snap = await getDocs(collection(db, STORES_COLLECTION));
+      const snap = await getDocs(query(collection(db, STORES_COLLECTION), limit(200)));
       if (!snap.empty) {
         const cloudStores: Store[] = [];
         snap.forEach(d => cloudStores.push(d.data() as Store));
@@ -84,7 +96,11 @@ export const storeService = {
     }
     let res = stores;
     if (filter?.status) {
-      res = res.filter(s => s.status === filter.status);
+      if (filter.status === 'pending' || filter.status === 'pending_review') {
+        res = res.filter(s => s.status === 'pending' || s.status === 'pending_review');
+      } else {
+        res = res.filter(s => s.status === filter.status);
+      }
     } else {
       res = res.filter(s => s.status === 'approved');
     }
@@ -125,8 +141,8 @@ export const storeService = {
     stores.unshift(newStore);
     persistLocal(stores);
 
-    // Persist to Cloud Firestore
-    setDoc(doc(db, STORES_COLLECTION, newStore.id), newStore).catch(err => {
+    // Persist to Cloud Firestore (F-15: Strip private financial fields from public document)
+    persistStoreToFirestore(newStore.id, stripPrivateStoreFields(newStore), false).catch(err => {
       console.warn('Could not write store to Firestore immediately:', err);
     });
 
@@ -163,8 +179,8 @@ export const storeService = {
     stores[index] = updated;
     persistLocal(stores);
 
-    // Persist to Cloud Firestore
-    setDoc(doc(db, STORES_COLLECTION, id), updated, { merge: true }).catch(err => {
+    // Persist to Cloud Firestore (F-15: Strip private financial fields from public document)
+    persistStoreToFirestore(id, stripPrivateStoreFields(updated), true).catch(err => {
       handleFirestoreError(err, OperationType.UPDATE, `${STORES_COLLECTION}/${id}`);
     });
 
@@ -186,7 +202,7 @@ export const storeService = {
     persistLocal(stores);
 
     // Persist status change to Firestore
-    updateDoc(doc(db, STORES_COLLECTION, id), { status }).catch(err => {
+    persistStoreToFirestore(id, { status }, true).catch(err => {
       handleFirestoreError(err, OperationType.UPDATE, `${STORES_COLLECTION}/${id}`);
     });
 
@@ -220,7 +236,7 @@ export const storeService = {
     stores[index].isVerified = nextState;
     persistLocal(stores);
 
-    updateDoc(doc(db, STORES_COLLECTION, id), { isVerified: nextState }).catch(err => {
+    persistStoreToFirestore(id, { isVerified: nextState }, true).catch(err => {
       handleFirestoreError(err, OperationType.UPDATE, `${STORES_COLLECTION}/${id}`);
     });
 

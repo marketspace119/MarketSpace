@@ -178,6 +178,7 @@ export interface Coupon {
   discountValue: number;
   minOrderAmount: number;
   maxDiscountAmount?: number;
+  maxDiscount?: number;
   sellerId?: string; // Optional: restriction to a specific merchant
   storeId?: string;
   applicableCategory?: string; // Optional: restriction to a specific category

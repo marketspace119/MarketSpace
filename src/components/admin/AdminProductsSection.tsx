@@ -63,7 +63,7 @@ export const AdminProductsSection: React.FC<AdminProductsSectionProps> = ({
     if (!targetProduct || !actionStatus) return;
     setIsProcessing(true);
     try {
-      productService.updateProductStatus(
+      await productService.updateProductStatusAuthoritative(
         targetProduct.id,
         actionStatus,
         currentUser.id,

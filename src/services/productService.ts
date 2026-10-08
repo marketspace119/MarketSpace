@@ -1,5 +1,5 @@
 import { doc, getDocs, collection, setDoc, updateDoc, deleteDoc, query, limit, startAfter, orderBy, where } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType } from '../lib/firebase';
+import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
 import { Product, UserRole } from '../types';
 import { seedProducts } from '../data/seedProducts';
 import { auditLogService } from './auditLogService';
@@ -19,58 +19,37 @@ function isProductionEnvironment(): boolean {
 
 function initProducts(): Product[] {
   if (memoryProducts.length > 0) return memoryProducts;
-  if (typeof window === 'undefined') {
-    return isProductionEnvironment() ? [] : seedProducts.map(normalizeProduct);
+  if (isProductionEnvironment()) {
+    memoryProducts = [];
+    return [];
   }
-  try {
-    const raw = localStorage.getItem(PRODUCTS_STORAGE_KEY);
-    if (!raw) {
-      if (isProductionEnvironment()) {
-        memoryProducts = [];
-        return [];
-      }
-      const initialized = seedProducts.map((p, idx) => {
-        let storeId = 'store_cosmetics_01';
-        let sellerId = 'user_seller_01';
-        if (p.type === 'restaurants' || p.type === 'restaurant-products') {
-          storeId = 'store_restaurant_01';
-          sellerId = 'user_restaurant_01';
-        } else if (p.type === 'services') {
-          storeId = 'store_service_01';
-          sellerId = 'user_service_01';
-        } else if (p.type === 'used' || p.type === 'ads') {
-          storeId = 'store_classified_01';
-          sellerId = 'user_classified_01';
-        } else if (idx % 2 === 1) {
-          storeId = 'store_tech_02';
-          sellerId = 'user_seller_02';
-        }
-        return normalizeProduct({
-          ...p,
-          storeId,
-          sellerId,
-          isPublished: p.isPublished ?? true,
-          status: p.status ?? 'approved',
-        });
-      });
-      localStorage.setItem(PRODUCTS_STORAGE_KEY, JSON.stringify(initialized));
-      memoryProducts = initialized;
-      return initialized;
+  // F-20: Do not read or trust localStorage for product authority
+  const initialized = seedProducts.map((p, idx) => {
+    let storeId = 'store_cosmetics_01';
+    let sellerId = 'user_seller_01';
+    if (p.type === 'restaurants' || p.type === 'restaurant-products') {
+      storeId = 'store_restaurant_01';
+      sellerId = 'user_restaurant_01';
+    } else if (p.type === 'services') {
+      storeId = 'store_service_01';
+      sellerId = 'user_service_01';
+    } else if (p.type === 'used' || p.type === 'ads') {
+      storeId = 'store_classified_01';
+      sellerId = 'user_classified_01';
+    } else if (idx % 2 === 1) {
+      storeId = 'store_tech_02';
+      sellerId = 'user_seller_02';
     }
-    const parsed = JSON.parse(raw);
-    if (isProductionEnvironment()) {
-      memoryProducts = Array.isArray(parsed)
-        ? parsed.filter((p: any) => !p.isSeedData).map(normalizeProduct)
-        : [];
-      return memoryProducts;
-    }
-    memoryProducts = Array.isArray(parsed) ? parsed.map(normalizeProduct) : seedProducts.map(normalizeProduct);
-    return memoryProducts;
-  } catch (err) {
-    console.error('Failed to load products from storage', err);
-    memoryProducts = isProductionEnvironment() ? [] : seedProducts.map(normalizeProduct);
-    return memoryProducts;
-  }
+    return normalizeProduct({
+      ...p,
+      storeId,
+      sellerId,
+      isPublished: p.isPublished ?? true,
+      status: p.status ?? 'approved',
+    });
+  });
+  memoryProducts = initialized;
+  return initialized;
 }
 
 function cleanForFirestore<T extends Record<string, any>>(obj: T): any {
@@ -78,6 +57,7 @@ function cleanForFirestore<T extends Record<string, any>>(obj: T): any {
   if (Array.isArray(obj)) return obj.map(item => cleanForFirestore(item));
   const cleaned: Record<string, any> = {};
   for (const [k, v] of Object.entries(obj)) {
+    if (k === 'inventoryHistory' || k === 'salesCount') continue; // F-16: Never persist internal inventory telemetry on public product docs
     if (v !== undefined) {
       cleaned[k] = typeof v === 'object' && v !== null ? cleanForFirestore(v) : v;
     }
@@ -101,17 +81,20 @@ function notifyListeners() {
 function persistLocal(products: Product[]) {
   const normalized = products.map(normalizeProduct);
   memoryProducts = normalized;
-  if (typeof window !== 'undefined') {
-    try {
-      localStorage.setItem(PRODUCTS_STORAGE_KEY, JSON.stringify(normalized));
-    } catch (err) {
-      console.error('Failed to save products to storage', err);
-    }
-  }
+  // F-20: LocalStorage persistence removed for authoritative product state
   notifyListeners();
 }
 
 export const productService = {
+  resetMemoryState(): void {
+    memoryProducts = [];
+  },
+
+  seedProducts(products: Product[]): void {
+    memoryProducts = products.map(normalizeProduct);
+    notifyListeners();
+  },
+
   /**
    * Subscribe to live product catalog updates
    */
@@ -299,29 +282,98 @@ export const productService = {
       .slice(0, limit);
   },
 
+  /**
+   * Authoritative Server-Side Product Creation (POST /api/products/create)
+   * Enforces authentication, store ownership, atomic subscription plan quota, price/stock validation,
+   * and fail-closed Firestore persistence:
+   *  - database write succeeds -> return success
+   *  - database write fails -> throw error
+   */
+  async createProductAuthoritative(
+    productData: Omit<Product, 'id' | 'createdAt' | 'updatedAt' | 'rating' | 'reviewsCount'>,
+    currentUserId: string,
+    currentStoreId: string,
+    customAuthToken?: string
+  ): Promise<Product> {
+    const rawPrice = Number(productData.price);
+    if (!Number.isFinite(rawPrice) || isNaN(rawPrice) || rawPrice < 0) {
+      throw new Error('Invalid product price: price must be a finite non-negative number');
+    }
+    const rawStock = Number(productData.stock ?? 0);
+    if (!Number.isFinite(rawStock) || isNaN(rawStock) || rawStock < 0) {
+      throw new Error('Invalid product stock: stock must be a finite non-negative integer');
+    }
+
+    let idToken = customAuthToken;
+    if (!idToken && auth.currentUser) {
+      idToken = await auth.currentUser.getIdToken();
+    }
+    if (!idToken) {
+      throw new Error('Authentication required: Cannot create product without verified credentials');
+    }
+
+    const res = await fetch('/api/products/create', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`,
+      },
+      body: JSON.stringify({
+        ...productData,
+        sellerId: currentUserId,
+        storeId: currentStoreId,
+      }),
+    });
+
+    const data = await res.json();
+    if (!res.ok || !data.success || !data.product) {
+      throw new Error(data.error || 'Authoritative product creation failed on server');
+    }
+
+    const createdProduct = normalizeProduct(data.product);
+    const products = initProducts();
+    products.unshift(createdProduct);
+    persistLocal(products);
+    return createdProduct;
+  },
+
+  /**
+   * F-08: Local synchronous product helper is strictly disabled in production.
+   * All authoritative product creations MUST use createProductAuthoritative (/api/products/create).
+   */
   createProduct(
     productData: Omit<Product, 'id' | 'createdAt' | 'updatedAt' | 'rating' | 'reviewsCount'>,
     currentUserId: string,
     currentStoreId: string
   ): Product {
+    if (isProductionEnvironment()) {
+      throw new Error(
+        'Forbidden (Fail-Closed): Direct client-side product creation is disabled in production. Use createProductAuthoritative (/api/products/create).'
+      );
+    }
+    const rawPrice = Number(productData.price);
+    if (!Number.isFinite(rawPrice) || isNaN(rawPrice) || rawPrice < 0) {
+      throw new Error('Invalid product price: price must be a finite non-negative number');
+    }
+    const rawStock = Number(productData.stock ?? 0);
+    if (!Number.isFinite(rawStock) || isNaN(rawStock) || rawStock < 0) {
+      throw new Error('Invalid product stock: stock must be a finite non-negative integer');
+    }
+
     const products = initProducts();
 
-    // Subscription plan product quota enforcement (Phase 10 & Phase 4)
+    // Subscription plan product quota enforcement
     if (currentUserId && currentStoreId) {
-      try {
-        const activeSub = subscriptionService.getSellerActiveSubscription(currentUserId);
-        const plans = subscriptionService.getPlans();
-        const plan = (activeSub ? plans.find(p => p.id === activeSub.planId || p.tier === activeSub.planTier) : undefined) || plans.find(p => p.id === 'plan_free');
-        if (plan && plan.maxProducts) {
-          const currentCount = products.filter(p => p.storeId === currentStoreId).length;
-          if (currentCount >= plan.maxProducts) {
-            throw new Error(
-              `لقد بلغت الحد الأقصى للمنتجات المسموح بها (${plan.maxProducts}) في باقتك الحالية (${plan.name.ar || plan.name.en}). يرجى ترقية الباقة لتتمكن من إضافة المزيد من المنتجات.`
-            );
-          }
+      const activeSub = subscriptionService.getSellerActiveSubscription(currentUserId);
+      const plans = subscriptionService.getPlans();
+      const plan = (activeSub ? plans.find(p => p.id === activeSub.planId || p.tier === activeSub.planTier) : undefined) || plans.find(p => p.id === 'plan_free');
+      if (plan && plan.maxProducts) {
+        const currentCount = products.filter(p => p.storeId === currentStoreId).length;
+        if (currentCount >= plan.maxProducts) {
+          throw new Error(
+            `لقد بلغت الحد الأقصى للمنتجات المسموح بها (${plan.maxProducts}) في باقتك الحالية (${plan.name.ar || plan.name.en}). يرجى ترقية الباقة لتتمكن من إضافة المزيد من المنتجات.`
+          );
         }
-      } catch (err: any) {
-        if (err.message?.includes('الحد الأقصى')) throw err;
       }
     }
 
@@ -334,18 +386,7 @@ export const productService = {
       reviewsCount: 0,
       isPublished: productData.isPublished ?? true,
       status: productData.status || 'published',
-      stock: Math.max(0, Math.floor(Number(productData.stock) || 0)),
-      inventoryHistory: [
-        {
-          id: `inv_init_${Date.now()}`,
-          date: new Date().toISOString(),
-          previousStock: 0,
-          newStock: Math.max(0, Math.floor(Number(productData.stock) || 0)),
-          change: Math.max(0, Math.floor(Number(productData.stock) || 0)),
-          reason: 'restock',
-          actor: currentUserId,
-        },
-      ],
+      stock: Math.max(0, Math.floor(rawStock)),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
@@ -353,12 +394,159 @@ export const productService = {
     products.unshift(newProduct);
     persistLocal(products);
 
-    // Persist to Cloud Firestore
-    setDoc(doc(db, PRODUCTS_COLLECTION, newProduct.id), cleanForFirestore(newProduct)).catch(err => {
-      console.warn('Could not write product to Firestore immediately:', err);
-    });
-
     return newProduct;
+  },
+
+  /**
+   * Authoritative Product Update (PCR-13 Remediation):
+   * Persists to Server Gateway / Cloud Firestore FIRST.
+   * If Firestore/Server fails, throws immediately and does NOT mutate local state.
+   */
+  async updateProductAuthoritative(
+    id: string,
+    updates: Partial<Product>,
+    currentUserId: string,
+    userRole: string
+  ): Promise<Product> {
+    const products = initProducts();
+    const index = products.findIndex(p => p.id === id);
+    if (index === -1) throw new Error('Product not found');
+
+    const product = products[index];
+    const isAdmin = userRole === 'ADMIN' || userRole === 'SUPER_ADMIN';
+    if (!isAdmin && product.sellerId !== currentUserId) {
+      throw new Error('Forbidden: You can only edit your own products');
+    }
+
+    const safeUpdates = { ...updates };
+    if (!isAdmin) {
+      delete safeUpdates.sellerId;
+      delete safeUpdates.storeId;
+      delete safeUpdates.rating;
+      delete safeUpdates.reviewsCount;
+      if (safeUpdates.status) {
+        const allowedSellerStatuses = ['draft', 'pending_review', 'published', 'hidden'];
+        if (!allowedSellerStatuses.includes(safeUpdates.status)) {
+          delete safeUpdates.status;
+        }
+      }
+    }
+
+    if (safeUpdates.price !== undefined) {
+      safeUpdates.price = Math.max(0.01, Number(safeUpdates.price));
+    }
+
+    let nextHistory = product.inventoryHistory || [];
+    let newInventoryLogEntry: any = null;
+    if (safeUpdates.stock !== undefined) {
+      const newStock = Math.max(0, Math.floor(Number(safeUpdates.stock)));
+      const oldStock = product.stock;
+      if (newStock !== oldStock) {
+        newInventoryLogEntry = {
+          id: `inv_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+          productId: id,
+          sellerId: product.sellerId,
+          date: new Date().toISOString(),
+          previousStock: oldStock,
+          newStock,
+          change: newStock - oldStock,
+          reason: 'manual_update',
+          actor: currentUserId,
+        };
+        nextHistory = [
+          newInventoryLogEntry,
+          ...nextHistory,
+        ];
+      }
+      safeUpdates.stock = newStock;
+    }
+
+    const updated: Product = {
+      ...product,
+      ...safeUpdates,
+      inventoryHistory: nextHistory,
+      updatedAt: new Date().toISOString(),
+    };
+
+    // 1. Authoritative Server / Firestore Persistence FIRST (Fail-Closed: throw before local mutation)
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+      const token = auth.currentUser ? await auth.currentUser.getIdToken() : '';
+      const res = await fetch('/api/products/update', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ productId: id, updates: safeUpdates }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Authoritative product update failed on server');
+      }
+    } else {
+      const serverAdminModule = '../../server/firebaseAdmin';
+      const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+      const adminDb = getAdminDb();
+      if (!adminDb) {
+        throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable');
+      }
+      await adminDb.collection(PRODUCTS_COLLECTION).doc(id).set(cleanForFirestore(updated), { merge: true });
+      if (newInventoryLogEntry) {
+        await adminDb.collection('inventory_logs').doc(newInventoryLogEntry.id).set(newInventoryLogEntry);
+      }
+    }
+
+    // 2. Update local state ONLY after authoritative persistence succeeds
+    products[index] = updated;
+    persistLocal(products);
+    return updated;
+  },
+
+  async getProductInventoryHistory(productId: string): Promise<any[]> {
+    const products = initProducts();
+    const product = products.find(p => p.id === productId);
+    const localHistory = product?.inventoryHistory || [];
+    try {
+      if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+        const q = query(collection(db, 'inventory_logs'), where('productId', '==', productId), limit(200));
+        const snap = await getDocs(q);
+        if (!snap.empty) {
+          const logs: any[] = [];
+          snap.forEach(d => logs.push(d.data()));
+          logs.sort((a, b) => new Date(b.date || b.timestamp || 0).getTime() - new Date(a.date || a.timestamp || 0).getTime());
+          if (product) {
+            product.inventoryHistory = logs;
+          }
+          return logs;
+        }
+      } else {
+        const serverAdminModule = '../../server/firebaseAdmin';
+        const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+        const adminDb = getAdminDb();
+        if (adminDb && typeof adminDb.collection === 'function') {
+          const col = adminDb.collection('inventory_logs');
+          if (typeof col.where === 'function') {
+            let invQuery: any = col.where('productId', '==', productId);
+            if (typeof invQuery.limit === 'function') {
+              invQuery = invQuery.limit(200);
+            }
+            const snap = await invQuery.get();
+            if (snap && !snap.empty) {
+              const logs: any[] = [];
+              snap.forEach((d: any) => logs.push(d.data()));
+              logs.sort((a, b) => new Date(b.date || b.timestamp || 0).getTime() - new Date(a.date || a.timestamp || 0).getTime());
+              if (product) {
+                product.inventoryHistory = logs;
+              }
+              return logs;
+            }
+          }
+        }
+      }
+    } catch {
+      // Fallback to local history
+    }
+    return localHistory;
   },
 
   updateProduct(
@@ -367,6 +555,11 @@ export const productService = {
     currentUserId: string,
     userRole: string
   ): Product {
+    if (isProductionEnvironment()) {
+      throw new Error(
+        'Forbidden (Fail-Closed): Direct client-side product update is disabled in production. Use updateProductAuthoritative (/api/products/update).'
+      );
+    }
     const products = initProducts();
     const index = products.findIndex(p => p.id === id);
     if (index === -1) throw new Error('Product not found');
@@ -399,43 +592,52 @@ export const productService = {
       safeUpdates.price = Math.max(0.01, Number(safeUpdates.price));
     }
 
-    let nextHistory = product.inventoryHistory || [];
     if (safeUpdates.stock !== undefined) {
-      const newStock = Math.max(0, Math.floor(Number(safeUpdates.stock)));
-      const oldStock = product.stock;
-      if (newStock !== oldStock) {
-        nextHistory = [
-          {
-            id: `inv_${Date.now()}`,
-            date: new Date().toISOString(),
-            previousStock: oldStock,
-            newStock,
-            change: newStock - oldStock,
-            reason: 'manual_update',
-            actor: currentUserId,
-          },
-          ...nextHistory,
-        ];
-      }
-      safeUpdates.stock = newStock;
+      safeUpdates.stock = Math.max(0, Math.floor(Number(safeUpdates.stock)));
     }
 
     const updated: Product = {
       ...product,
       ...safeUpdates,
-      inventoryHistory: nextHistory,
       updatedAt: new Date().toISOString(),
     };
+    delete (updated as any).inventoryHistory;
+    delete (updated as any).salesCount;
 
     products[index] = updated;
     persistLocal(products);
 
-    // Persist to Cloud Firestore
-    setDoc(doc(db, PRODUCTS_COLLECTION, id), cleanForFirestore(updated), { merge: true }).catch(err => {
-      handleFirestoreError(err, OperationType.UPDATE, `${PRODUCTS_COLLECTION}/${id}`);
-    });
-
     return updated;
+  },
+
+  async updateProductRatingAuthoritative(productId: string, rating: number, reviewsCount: number): Promise<void> {
+    const products = initProducts();
+    const index = products.findIndex(p => p.id === productId);
+    const safeRating = Number(rating.toFixed(1));
+    const safeCount = Math.max(0, Math.floor(reviewsCount));
+    const now = new Date().toISOString();
+
+    const serverAdminModule = '../../server/firebaseAdmin';
+    const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+    const adminDb = getAdminDb();
+    if (!adminDb) {
+      throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable for rating update');
+    }
+    await adminDb.collection(PRODUCTS_COLLECTION).doc(productId).set({
+      rating: safeRating,
+      reviewsCount: safeCount,
+      updatedAt: now,
+    }, { merge: true });
+
+    if (index !== -1) {
+      products[index] = {
+        ...products[index],
+        rating: safeRating,
+        reviewsCount: safeCount,
+        updatedAt: now,
+      };
+      persistLocal(products);
+    }
   },
 
   updateProductRating(productId: string, rating: number, reviewsCount: number): void {
@@ -452,15 +654,58 @@ export const productService = {
 
     products[index] = updated;
     persistLocal(products);
+  },
 
-    setDoc(doc(db, PRODUCTS_COLLECTION, productId), {
-      rating: updated.rating,
-      reviewsCount: updated.reviewsCount,
-      updatedAt: updated.updatedAt,
-    }, { merge: true }).catch(() => {});
+  /**
+   * Authoritative Product Deletion (PCR-13 Remediation):
+   * Deletes in Server Gateway / Cloud Firestore FIRST.
+   * If Firestore/Server fails, throws immediately and does NOT remove from local state.
+   */
+  async deleteProductAuthoritative(id: string, currentUserId: string, userRole: string): Promise<boolean> {
+    const products = initProducts();
+    const product = products.find(p => p.id === id);
+    if (!product) throw new Error('Product not found');
+
+    const isAdmin = userRole === 'ADMIN' || userRole === 'SUPER_ADMIN';
+    if (!isAdmin && product.sellerId !== currentUserId) {
+      throw new Error('Forbidden: You can only delete your own products');
+    }
+
+    if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+      const token = auth.currentUser ? await auth.currentUser.getIdToken() : '';
+      const res = await fetch('/api/products/delete', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({ productId: id }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Authoritative product deletion failed on server');
+      }
+    } else {
+      const serverAdminModule = '../../server/firebaseAdmin';
+      const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+      const adminDb = getAdminDb();
+      if (!adminDb) {
+        throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable');
+      }
+      await adminDb.collection(PRODUCTS_COLLECTION).doc(id).delete();
+    }
+
+    const filtered = products.filter(p => p.id !== id);
+    persistLocal(filtered);
+    return true;
   },
 
   deleteProduct(id: string, currentUserId: string, userRole: string): boolean {
+    if (isProductionEnvironment()) {
+      throw new Error(
+        'Forbidden (Fail-Closed): Direct client-side product deletion is disabled in production. Use deleteProductAuthoritative (/api/products/delete).'
+      );
+    }
     const products = initProducts();
     const product = products.find(p => p.id === id);
     if (!product) return false;
@@ -472,16 +717,29 @@ export const productService = {
 
     const filtered = products.filter(p => p.id !== id);
     persistLocal(filtered);
-
-    // Delete in Cloud Firestore
-    deleteDoc(doc(db, PRODUCTS_COLLECTION, id)).catch(err => {
-      handleFirestoreError(err, OperationType.DELETE, `${PRODUCTS_COLLECTION}/${id}`);
-    });
-
     return true;
   },
 
+  async togglePublishAuthoritative(id: string, currentUserId: string, userRole: string): Promise<Product> {
+    const products = initProducts();
+    const index = products.findIndex(p => p.id === id);
+    if (index === -1) throw new Error('Product not found');
+    const nextPublished = !products[index].isPublished;
+    const nextStatus = nextPublished ? 'published' : 'hidden';
+    return await this.updateProductAuthoritative(
+      id,
+      { isPublished: nextPublished, status: nextStatus },
+      currentUserId,
+      userRole
+    );
+  },
+
   togglePublish(id: string, currentUserId: string, userRole: string): Product {
+    if (isProductionEnvironment()) {
+      throw new Error(
+        'Forbidden (Fail-Closed): Direct client-side product publish toggle is disabled in production. Use togglePublishAuthoritative.'
+      );
+    }
     const products = initProducts();
     const index = products.findIndex(p => p.id === id);
     if (index === -1) throw new Error('Product not found');
@@ -497,11 +755,30 @@ export const productService = {
     products[index].updatedAt = new Date().toISOString();
     persistLocal(products);
 
-    updateDoc(doc(db, PRODUCTS_COLLECTION, id), { isPublished: nextPublished, updatedAt: products[index].updatedAt }).catch(err => {
-      handleFirestoreError(err, OperationType.UPDATE, `${PRODUCTS_COLLECTION}/${id}`);
-    });
-
     return products[index];
+  },
+
+  async updateProductStatusAuthoritative(
+    id: string,
+    status: 'approved' | 'pending' | 'rejected' | 'hidden',
+    currentUserId: string,
+    userRole: string
+  ): Promise<Product> {
+    const isAdmin = userRole === 'ADMIN' || userRole === 'SUPER_ADMIN';
+    if (!isAdmin) {
+      throw new Error('Forbidden: Only platform admins can moderate product status');
+    }
+    const updated = await this.updateProductAuthoritative(id, { status }, currentUserId, userRole);
+    auditLogService.logAction({
+      actorId: currentUserId,
+      actorRole: userRole as UserRole,
+      action: `PRODUCT_${status.toUpperCase()}`,
+      targetType: 'product',
+      targetId: id,
+      targetName: updated.title?.ar || updated.title?.en || id,
+      metadata: { status, price: updated.price, sellerId: updated.sellerId },
+    });
+    return updated;
   },
 
   updateProductStatus(
@@ -510,6 +787,11 @@ export const productService = {
     currentUserId?: string,
     userRole?: string
   ): Product {
+    if (isProductionEnvironment()) {
+      throw new Error(
+        'Forbidden (Fail-Closed): Direct client-side product status update is disabled in production. Use updateProductStatusAuthoritative.'
+      );
+    }
     const isAdmin = userRole === 'ADMIN' || userRole === 'SUPER_ADMIN';
     if (!isAdmin) {
       throw new Error('Forbidden: Only platform admins can moderate product status');
@@ -523,10 +805,6 @@ export const productService = {
     products[index].status = status;
     products[index].updatedAt = new Date().toISOString();
     persistLocal(products);
-
-    updateDoc(doc(db, PRODUCTS_COLLECTION, id), { status, updatedAt: products[index].updatedAt }).catch(err => {
-      handleFirestoreError(err, OperationType.UPDATE, `${PRODUCTS_COLLECTION}/${id}`);
-    });
 
     if (currentUserId && userRole) {
       auditLogService.logAction({

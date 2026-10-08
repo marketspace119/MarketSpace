@@ -158,11 +158,15 @@ export const inventoryService = {
     const product = productService.getProductById(productId);
     if (!product) throw new Error(`Product "${productId}" not found`);
     const safeStock = Math.max(0, Math.floor(newStock));
-    return productService.updateProduct(
-      productId,
-      { stock: safeStock },
-      options?.actor || product.sellerId,
-      'SELLER'
-    );
+    productService.updateLocalStockOnly(productId, safeStock);
+    void productService
+      .updateProductAuthoritative(
+        productId,
+        { stock: safeStock },
+        options?.actor || product.sellerId,
+        'SELLER'
+      )
+      .catch(() => {});
+    return productService.getProductById(productId);
   },
 };

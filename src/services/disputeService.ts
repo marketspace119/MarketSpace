@@ -1,5 +1,5 @@
-import { doc, getDocs, collection, setDoc, updateDoc } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType, cleanForFirestore } from '../lib/firebase';
+import { doc, getDocs, collection, query, limit } from 'firebase/firestore';
+import { db, auth, cleanForFirestore } from '../lib/firebase';
 import { OrderDispute, DisputeReason, DisputeRequestedAction, UserRole } from '../types';
 import { notificationService } from './notificationService';
 import { auditLogService } from './auditLogService';
@@ -9,43 +9,60 @@ const DISPUTES_STORAGE_KEY = 'marketspace_disputes_v1';
 const DISPUTES_COLLECTION = 'disputes';
 
 let memoryDisputes: OrderDispute[] = [];
+const activeDisputeOrderLocks = new Set<string>();
 
 function initDisputes(): OrderDispute[] {
   if (memoryDisputes.length > 0) return memoryDisputes;
-  if (typeof localStorage === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(DISPUTES_STORAGE_KEY);
-    memoryDisputes = raw ? JSON.parse(raw) : [];
-    return memoryDisputes;
-  } catch (err) {
-    console.error('Failed to load disputes', err);
-    return [];
-  }
+  // F-20: Do not read or trust localStorage for dispute authority
+  return memoryDisputes;
 }
 
 function persistLocal(disputes: OrderDispute[]) {
   memoryDisputes = disputes;
-  if (typeof localStorage === 'undefined') return;
-  try {
-    localStorage.setItem(DISPUTES_STORAGE_KEY, JSON.stringify(disputes));
-  } catch (err) {
-    console.error('Failed to save disputes to localStorage', err);
-  }
+  // F-20: LocalStorage persistence removed for authoritative dispute state
 }
 
-async function executeSafePersistence(op: () => Promise<any>): Promise<void> {
+/**
+ * Authoritative Server Persistence for Disputes (PCR-10):
+ * Direct client writes to /disputes/* are strictly forbidden in firestore.rules.
+ * In browser runtime, all mutations flow through /api/disputes/* with Bearer token.
+ * In Node/test runtime, mutations persist via Firebase Admin SDK.
+ */
+async function persistDisputeAuthoritatively(
+  endpoint: '/api/disputes/create' | '/api/disputes/respond' | '/api/disputes/resolve',
+  payload: Record<string, any>,
+  adminPersistFn: (adminDb: any) => Promise<void>
+): Promise<any> {
   if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
-    await op();
+    const token = auth.currentUser ? await auth.currentUser.getIdToken() : '';
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || `Authoritative dispute mutation failed (${endpoint})`);
+    }
+    return data.dispute;
   } else {
     try {
-      await Promise.race([
-        op(),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore write timeout')), 500)),
-      ]);
+      const serverAdminModule = '../../server/firebaseAdmin';
+      const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+      const adminDb = getAdminDb();
+      if (adminDb) {
+        await Promise.race([
+          adminPersistFn(adminDb),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Admin DB write timeout')), 1500)),
+        ]);
+      }
     } catch (err: any) {
       if (process.env.NODE_ENV !== 'test') throw err;
-      console.warn('[DisputePersistence:Notice] Offline / test environment write notice:', err?.message || err);
     }
+    return null;
   }
 }
 
@@ -56,7 +73,7 @@ export const disputeService = {
 
   async syncWithFirestore(): Promise<OrderDispute[]> {
     try {
-      const snap = await getDocs(collection(db, DISPUTES_COLLECTION));
+      const snap = await getDocs(query(collection(db, DISPUTES_COLLECTION), limit(200)));
       if (!snap.empty) {
         const cloudDisputes: OrderDispute[] = [];
         snap.forEach(d => cloudDisputes.push(d.data() as OrderDispute));
@@ -110,62 +127,79 @@ export const disputeService = {
     if (!data.customerId?.trim()) throw new Error('Customer ID is required');
     if (!data.description?.trim()) throw new Error('Dispute description cannot be empty');
 
-    const disputes = initDisputes();
-
-    // Check if an open dispute already exists for this order
-    const existing = disputes.find(
-      d => d.orderId === data.orderId &&
-      (!data.subOrderId || d.subOrderId === data.subOrderId) &&
-      d.status !== 'CLOSED' && d.status !== 'RESOLVED_REJECTED'
-    );
-    if (existing) {
-      throw new Error('There is already an active dispute open for this order');
+    const lockKey = `${data.orderId.trim()}_${data.subOrderId || 'parent'}`;
+    if (activeDisputeOrderLocks.has(lockKey)) {
+      throw new Error('There is already an active dispute creation in progress for this order');
     }
+    activeDisputeOrderLocks.add(lockKey);
 
-    const now = new Date().toISOString();
-    const newDispute: OrderDispute = {
-      id: `disp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      orderId: data.orderId,
-      subOrderId: data.subOrderId,
-      customerId: data.customerId,
-      customerName: data.customerName,
-      customerPhone: data.customerPhone,
-      sellerId: data.sellerId,
-      sellerName: data.sellerName,
-      storeId: data.storeId,
-      reason: data.reason,
-      description: data.description.trim().slice(0, 2000),
-      evidenceUrls: data.evidenceUrls || [],
-      requestedAction: data.requestedAction,
-      status: 'OPEN',
-      createdAt: now,
-      updatedAt: now,
-    };
+    try {
+      const disputes = initDisputes();
 
-    // Authoritative persistence: Write to Cloud Firestore (V3-03 Server-Authoritative)
-    await executeSafePersistence(() => setDoc(doc(db, DISPUTES_COLLECTION, newDispute.id), cleanForFirestore(newDispute)));
+      // Check if an open dispute already exists for this order
+      const existing = disputes.find(
+        d => d.orderId === data.orderId &&
+        (!data.subOrderId || d.subOrderId === data.subOrderId) &&
+        d.status !== 'CLOSED' && d.status !== 'RESOLVED_REJECTED'
+      );
+      if (existing) {
+        throw new Error('There is already an active dispute open for this order');
+      }
 
-    disputes.unshift(newDispute);
-    persistLocal(disputes);
+      const now = new Date().toISOString();
+      const newDispute: OrderDispute = {
+        id: `disp_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        orderId: data.orderId,
+        subOrderId: data.subOrderId,
+        customerId: data.customerId,
+        customerName: data.customerName,
+        customerPhone: data.customerPhone,
+        sellerId: data.sellerId,
+        sellerName: data.sellerName,
+        storeId: data.storeId,
+        reason: data.reason,
+        description: data.description.trim().slice(0, 2000),
+        evidenceUrls: data.evidenceUrls || [],
+        requestedAction: data.requestedAction,
+        status: 'OPEN',
+        createdAt: now,
+        updatedAt: now,
+      };
 
-    // Notify Merchant
-    notificationService.createNotification({
-      userId: data.sellerId,
-      type: 'order',
-      title: {
-        ar: `نزاع جديد على الطلب #${data.orderId}`,
-        en: `New Dispute on Order #${data.orderId}`,
-        so: `Dacwad cusub oo ku saabsan Dalabka #${data.orderId}`,
-      },
-      message: {
-        ar: `قام العميل ${data.customerName} بفتح نزاع بسبب: ${data.reason}`,
-        en: `Customer ${data.customerName} opened a dispute. Reason: ${data.reason}`,
-        so: `Macaamiil ${data.customerName} ayaa furay dacwad. Sababta: ${data.reason}`,
-      },
-      link: `/seller/orders`,
-    }).catch(() => {});
+      // Authoritative persistence: Write via Server Gateway / Admin SDK (PCR-10 Server-Authoritative)
+      const serverDispute = await persistDisputeAuthoritatively(
+        '/api/disputes/create',
+        data,
+        async (adminDb) => {
+          await adminDb.collection(DISPUTES_COLLECTION).doc(newDispute.id).set(cleanForFirestore(newDispute));
+        }
+      );
 
-    return newDispute;
+      const finalDispute = serverDispute || newDispute;
+      disputes.unshift(finalDispute);
+      persistLocal(disputes);
+
+      // Notify Merchant
+      notificationService.createNotification({
+        userId: data.sellerId,
+        type: 'order',
+        title: {
+          ar: `نزاع جديد على الطلب #${data.orderId}`,
+          en: `New Dispute on Order #${data.orderId}`,
+          so: `Dacwad cusub oo ku saabsan Dalabka #${data.orderId}`,
+        },
+        message: {
+          ar: `قام العميل ${data.customerName} بفتح نزاع بسبب: ${data.reason}`,
+          en: `Customer ${data.customerName} opened a dispute. Reason: ${data.reason}`,
+          so: `Macaamiil ${data.customerName} ayaa furay dacwad. Sababta: ${data.reason}`,
+        },
+        link: `/seller/orders`,
+      }).catch(() => {});
+
+      return finalDispute;
+    } finally {
+      activeDisputeOrderLocks.delete(lockKey);
+    }
   },
 
   async sellerRespond(params: {
@@ -182,6 +216,12 @@ export const disputeService = {
     if (dispute.sellerId !== params.sellerId) {
       throw new Error('Forbidden: You can only respond to disputes against your own store');
     }
+    if (['RESOLVED_REFUND', 'RESOLVED_REJECTED', 'CLOSED'].includes(dispute.status)) {
+      throw new Error(`Cannot respond to dispute: dispute is already in terminal state (${dispute.status})`);
+    }
+    if (dispute.status !== 'OPEN') {
+      throw new Error(`Only OPEN disputes can be responded to. Current status: ${dispute.status}`);
+    }
 
     const now = new Date().toISOString();
     const updated: OrderDispute = {
@@ -195,12 +235,14 @@ export const disputeService = {
       updatedAt: now,
     };
 
-    // Authoritative persistence
-    await executeSafePersistence(() => updateDoc(doc(db, DISPUTES_COLLECTION, params.disputeId), cleanForFirestore({
-      status: updated.status,
-      sellerResponse: updated.sellerResponse,
-      updatedAt: now,
-    })));
+    // Authoritative persistence via Server Gateway / Admin SDK
+    await persistDisputeAuthoritatively(
+      '/api/disputes/respond',
+      params,
+      async (adminDb) => {
+        await adminDb.collection(DISPUTES_COLLECTION).doc(params.disputeId).set(cleanForFirestore(updated), { merge: true });
+      }
+    );
 
     disputes[idx] = updated;
     persistLocal(disputes);
@@ -243,75 +285,89 @@ export const disputeService = {
     if (idx === -1) throw new Error('Dispute not found');
 
     const dispute = disputes[idx];
-    const now = new Date().toISOString();
-
-    const updated: OrderDispute = {
-      ...dispute,
-      status: params.actionTaken === 'REFUND_APPROVED' ? 'RESOLVED_REFUND' : 'RESOLVED_REJECTED',
-      adminResolution: {
-        resolvedBy: params.adminId,
-        actionTaken: params.actionTaken,
-        resolutionNotes: params.resolutionNotes.trim(),
-        resolvedAt: now,
-        refundAmount: params.refundAmount,
-      },
-      updatedAt: now,
-    };
-
-    if (params.actionTaken === 'REFUND_APPROVED') {
-      try {
-        orderService.updateOrderRefundStatus(dispute.orderId, 'approved', params.refundAmount);
-      } catch (e) {
-        console.warn('Dispute refund sync notice:', e);
-      }
+    if (['RESOLVED_REFUND', 'RESOLVED_REJECTED', 'CLOSED'].includes(dispute.status)) {
+      throw new Error(`Dispute is already resolved (${dispute.status}) and cannot be re-resolved.`);
+    }
+    if (!['OPEN', 'SELLER_RESPONDED'].includes(dispute.status)) {
+      throw new Error(`Invalid dispute transition from ${dispute.status}`);
     }
 
-    // Authoritative persistence
-    await executeSafePersistence(() => updateDoc(doc(db, DISPUTES_COLLECTION, params.disputeId), cleanForFirestore({
-      status: updated.status,
-      adminResolution: updated.adminResolution,
-      updatedAt: now,
-    })));
+    if (activeDisputeOrderLocks.has(params.disputeId)) {
+      throw new Error(`Conflict: Dispute ${params.disputeId} is currently being resolved by another concurrent request.`);
+    }
+    activeDisputeOrderLocks.add(params.disputeId);
 
-    disputes[idx] = updated;
-    persistLocal(disputes);
+    try {
+      const now = new Date().toISOString();
 
-    auditLogService.logAction({
-      actorId: params.adminId,
-      actorRole: params.adminRole,
-      action: params.actionTaken === 'REFUND_APPROVED' ? 'DISPUTE_REFUND_APPROVED' : 'DISPUTE_DISMISSED',
-      targetType: 'order',
-      targetId: dispute.orderId,
-      targetName: `Dispute Resolution for Order #${dispute.orderId}`,
-      metadata: {
-        disputeId: params.disputeId,
-        customerId: dispute.customerId,
-        sellerId: dispute.sellerId,
-        actionTaken: params.actionTaken,
-      },
-    });
+      const updated: OrderDispute = {
+        ...dispute,
+        status: params.actionTaken === 'REFUND_APPROVED' ? 'RESOLVED_REFUND' : 'RESOLVED_REJECTED',
+        adminResolution: {
+          resolvedBy: params.adminId,
+          actionTaken: params.actionTaken,
+          resolutionNotes: params.resolutionNotes.trim(),
+          resolvedAt: now,
+          refundAmount: params.refundAmount,
+        },
+        updatedAt: now,
+      };
 
-    // Notify Customer
-    notificationService.createNotification({
-      userId: dispute.customerId,
-      type: 'order',
-      title: {
-        ar: `قرار النزاع للطلب #${dispute.orderId}`,
-        en: `Dispute Resolution for Order #${dispute.orderId}`,
-        so: `Go'aanka Dacwada Dalabka #${dispute.orderId}`,
-      },
-      message: {
-        ar: params.actionTaken === 'REFUND_APPROVED'
-          ? `تمت الموافقة على استرداد أموالك للطلب #${dispute.orderId}.`
-          : `تمت مراجعة النزاع وإغلاقه: ${params.resolutionNotes}`,
-        en: params.actionTaken === 'REFUND_APPROVED'
-          ? `Your refund for order #${dispute.orderId} has been approved.`
-          : `Dispute reviewed and resolved: ${params.resolutionNotes}`,
-        so: `Go'aanka dacwada dalabka #${dispute.orderId} waa la go'aamiyay.`,
-      },
-      link: `/account/orders`,
-    }).catch(() => {});
+      // Authoritative persistence via Server Gateway / Admin SDK FIRST (Fail-Closed)
+      await persistDisputeAuthoritatively(
+        '/api/disputes/resolve',
+        params,
+        async (adminDb) => {
+          await adminDb.collection(DISPUTES_COLLECTION).doc(params.disputeId).set(cleanForFirestore(updated), { merge: true });
+        }
+      );
 
-    return updated;
+      if (params.actionTaken === 'REFUND_APPROVED') {
+        orderService.updateOrderRefundStatus(dispute.orderId, 'approved', params.refundAmount);
+      }
+
+      disputes[idx] = updated;
+      persistLocal(disputes);
+
+      auditLogService.logAction({
+        actorId: params.adminId,
+        actorRole: params.adminRole,
+        action: params.actionTaken === 'REFUND_APPROVED' ? 'DISPUTE_REFUND_APPROVED' : 'DISPUTE_DISMISSED',
+        targetType: 'order',
+        targetId: dispute.orderId,
+        targetName: `Dispute Resolution for Order #${dispute.orderId}`,
+        metadata: {
+          disputeId: params.disputeId,
+          customerId: dispute.customerId,
+          sellerId: dispute.sellerId,
+          actionTaken: params.actionTaken,
+        },
+      });
+
+      // Notify Customer
+      notificationService.createNotification({
+        userId: dispute.customerId,
+        type: 'order',
+        title: {
+          ar: `قرار النزاع للطلب #${dispute.orderId}`,
+          en: `Dispute Resolution for Order #${dispute.orderId}`,
+          so: `Go'aanka Dacwada Dalabka #${dispute.orderId}`,
+        },
+        message: {
+          ar: params.actionTaken === 'REFUND_APPROVED'
+            ? `تمت الموافقة على استرداد أموالك للطلب #${dispute.orderId}.`
+            : `تمت مراجعة النزاع وإغلاقه: ${params.resolutionNotes}`,
+          en: params.actionTaken === 'REFUND_APPROVED'
+            ? `Your refund for order #${dispute.orderId} has been approved.`
+            : `Dispute reviewed and resolved: ${params.resolutionNotes}`,
+          so: `Go'aanka dacwada dalabka #${dispute.orderId} waa la go'aamiyay.`,
+        },
+        link: `/account/orders`,
+      }).catch(() => {});
+
+      return updated;
+    } finally {
+      activeDisputeOrderLocks.delete(params.disputeId);
+    }
   },
 };

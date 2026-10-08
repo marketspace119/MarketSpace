@@ -32,7 +32,7 @@ export async function processUserRoleUpdateGateway(
     throw err;
   }
 
-  const validRoles: UserRole[] = ['CUSTOMER', 'SELLER', 'RESTAURANT', 'SERVICE_PROVIDER', 'ADMIN', 'SUPER_ADMIN'];
+  const validRoles: UserRole[] = ['CUSTOMER', 'SELLER', 'RESTAURANT', 'SERVICE_PROVIDER', 'DRIVER', 'ADMIN', 'SUPER_ADMIN'];
   if (!validRoles.includes(newRole)) {
     const err = new Error(`Invalid role specified: ${newRole}`);
     (err as any).statusCode = 400;
@@ -44,7 +44,9 @@ export async function processUserRoleUpdateGateway(
 
   const result = await adminDb.runTransaction(async (transaction) => {
     const userDocRef = adminDb.collection('users').doc(targetUserId);
+    const adminDocRef = adminDb.collection('admins').doc(targetUserId);
     const userDoc = await transaction.get(userDocRef);
+    const adminDoc = await transaction.get(adminDocRef);
 
     if (!userDoc.exists) {
       const err = new Error(`User ${targetUserId} does not exist.`);
@@ -72,7 +74,6 @@ export async function processUserRoleUpdateGateway(
     });
 
     // Sync authoritative /admins collection
-    const adminDocRef = adminDb.collection('admins').doc(targetUserId);
     if (newRole === 'ADMIN' || newRole === 'SUPER_ADMIN') {
       transaction.set(adminDocRef, {
         id: targetUserId,
@@ -82,12 +83,9 @@ export async function processUserRoleUpdateGateway(
         assignedBy: caller.uid,
         assignedAt: now,
       }, { merge: true });
-    } else {
+    } else if (adminDoc.exists) {
       // If demoted from admin, remove from admins registry
-      const adminDoc = await transaction.get(adminDocRef);
-      if (adminDoc.exists) {
-        transaction.delete(adminDocRef);
-      }
+      transaction.delete(adminDocRef);
     }
 
     // Authoritative Audit Log

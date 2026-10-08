@@ -17,24 +17,78 @@ const env: Record<string, any> = typeof import.meta !== 'undefined' && (import.m
 
 const appletConfig = (typeof firebaseConfig !== 'undefined' && firebaseConfig) ? firebaseConfig : defaultFirebaseConfig;
 
-const resolvedConfig = {
-  apiKey: env.VITE_FIREBASE_API_KEY || (appletConfig as any)?.apiKey || defaultFirebaseConfig.apiKey,
-  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || (appletConfig as any)?.authDomain || defaultFirebaseConfig.authDomain,
-  projectId: env.VITE_FIREBASE_PROJECT_ID || (appletConfig as any)?.projectId || defaultFirebaseConfig.projectId,
-  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || (appletConfig as any)?.storageBucket || defaultFirebaseConfig.storageBucket,
-  messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || (appletConfig as any)?.messagingSenderId || defaultFirebaseConfig.messagingSenderId,
-  appId: env.VITE_FIREBASE_APP_ID || (appletConfig as any)?.appId || defaultFirebaseConfig.appId,
-  firestoreDatabaseId: env.VITE_FIREBASE_DATABASE_ID || (appletConfig as any)?.firestoreDatabaseId || defaultFirebaseConfig.firestoreDatabaseId,
-};
+export interface FirebaseEnvInput {
+  PROD?: boolean | string;
+  NODE_ENV?: string;
+  ALLOW_DEMO_IN_PROD?: string;
+  VITE_FIREBASE_API_KEY?: string;
+  VITE_FIREBASE_AUTH_DOMAIN?: string;
+  VITE_FIREBASE_PROJECT_ID?: string;
+  VITE_FIREBASE_STORAGE_BUCKET?: string;
+  VITE_FIREBASE_MESSAGING_SENDER_ID?: string;
+  VITE_FIREBASE_APP_ID?: string;
+  VITE_FIREBASE_DATABASE_ID?: string;
+  FIREBASE_PROJECT_ID?: string;
+  GCLOUD_PROJECT?: string;
+}
 
-// Fail-closed invariant in production: prohibit demo configuration in production environments
-if (env.PROD || env.NODE_ENV === 'production') {
-  if (resolvedConfig.projectId === 'marketspace-demo' && !env.ALLOW_DEMO_IN_PROD) {
+export function validateAndResolveClientFirebaseConfig(
+  customEnv: FirebaseEnvInput,
+  staticAppletConfig: any = firebaseConfig
+) {
+  const isProd = customEnv.PROD === true || customEnv.PROD === 'true' || customEnv.NODE_ENV === 'production';
+  const allowDemo = customEnv.ALLOW_DEMO_IN_PROD === 'true' || customEnv.ALLOW_DEMO_IN_PROD === '1';
+
+  const explicitProjectId = customEnv.VITE_FIREBASE_PROJECT_ID || staticAppletConfig?.projectId || '';
+  const explicitApiKey = customEnv.VITE_FIREBASE_API_KEY || staticAppletConfig?.apiKey || '';
+  const backendProjectId = customEnv.FIREBASE_PROJECT_ID || customEnv.GCLOUD_PROJECT || '';
+
+  if (isProd && !allowDemo) {
+    if (!explicitProjectId || !explicitApiKey) {
+      throw new Error(
+        '[FirebaseClient:Critical] Production Misconfiguration (Fail-Closed): Missing explicit VITE_FIREBASE_PROJECT_ID or VITE_FIREBASE_API_KEY in production. Refusing to fall back to default development credentials.'
+      );
+    }
+    if (
+      explicitProjectId === 'marketspace-demo' ||
+      explicitProjectId === 'marketspace-applet' ||
+      explicitProjectId.toLowerCase().includes('demo') ||
+      explicitProjectId.toLowerCase().includes('placeholder') ||
+      explicitProjectId.toLowerCase().includes('dummy') ||
+      explicitApiKey === 'AIzaSyDummyKeyForLocalDevelopmentOnly' ||
+      explicitApiKey.toLowerCase().includes('dummy') ||
+      explicitApiKey.toLowerCase().includes('placeholder') ||
+      explicitApiKey.toLowerCase().includes('demo')
+    ) {
+      throw new Error(
+        `[FirebaseClient:Critical] Production Misconfiguration (Fail-Closed): Production client cannot connect to demo/fallback Firebase project "${explicitProjectId}" or dummy API key. Configure real production credentials.`
+      );
+    }
+    if (backendProjectId && explicitProjectId !== backendProjectId) {
+      throw new Error(
+        `[FirebaseClient:Critical] Production Split-Brain Detected (Fail-Closed): Frontend project "${explicitProjectId}" does not match backend project "${backendProjectId}".`
+      );
+    }
+  } else if (customEnv.VITE_FIREBASE_PROJECT_ID && backendProjectId && customEnv.VITE_FIREBASE_PROJECT_ID !== backendProjectId) {
     throw new Error(
-      '[FirebaseClient:Critical] Production Misconfiguration (Fail-Closed): Production client cannot connect to demo Firebase project "marketspace-demo". Please set VITE_FIREBASE_PROJECT_ID.'
+      `[FirebaseClient:Critical] Split-Brain Detected (Fail-Closed): Frontend project "${customEnv.VITE_FIREBASE_PROJECT_ID}" does not match backend project "${backendProjectId}".`
     );
   }
+
+  const fb = staticAppletConfig || defaultFirebaseConfig;
+  const resolvedProjectId = explicitProjectId || defaultFirebaseConfig.projectId;
+  return {
+    apiKey: explicitApiKey || defaultFirebaseConfig.apiKey,
+    authDomain: customEnv.VITE_FIREBASE_AUTH_DOMAIN || fb?.authDomain || `${resolvedProjectId}.firebaseapp.com`,
+    projectId: resolvedProjectId,
+    storageBucket: customEnv.VITE_FIREBASE_STORAGE_BUCKET || fb?.storageBucket || `${resolvedProjectId}.appspot.com`,
+    messagingSenderId: customEnv.VITE_FIREBASE_MESSAGING_SENDER_ID || fb?.messagingSenderId || defaultFirebaseConfig.messagingSenderId,
+    appId: customEnv.VITE_FIREBASE_APP_ID || fb?.appId || defaultFirebaseConfig.appId,
+    firestoreDatabaseId: customEnv.VITE_FIREBASE_DATABASE_ID || fb?.firestoreDatabaseId || defaultFirebaseConfig.firestoreDatabaseId,
+  };
 }
+
+const resolvedConfig = validateAndResolveClientFirebaseConfig(env, firebaseConfig);
 
 const app = initializeApp(resolvedConfig);
 export const db = getFirestore(app, resolvedConfig.firestoreDatabaseId);

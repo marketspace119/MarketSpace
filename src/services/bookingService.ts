@@ -1,5 +1,5 @@
-import { doc, getDoc, getDocs, collection, setDoc, updateDoc, query, where, runTransaction } from 'firebase/firestore';
-import { db, handleFirestoreError, OperationType, cleanForFirestore } from '../lib/firebase';
+import { doc, getDoc, getDocs, collection, setDoc, updateDoc, query, where, runTransaction, limit } from 'firebase/firestore';
+import { db, auth, handleFirestoreError, OperationType, cleanForFirestore } from '../lib/firebase';
 import { ServiceBooking } from '../types';
 import { notificationService } from './notificationService';
 
@@ -7,27 +7,30 @@ const BOOKINGS_STORAGE_KEY = 'marketspace_bookings_v1';
 const BOOKINGS_COLLECTION = 'bookings';
 
 let memoryBookings: ServiceBooking[] = [];
+const activeBookingSlotLocks = new Set<string>();
 
 function initBookings(): ServiceBooking[] {
   if (memoryBookings.length > 0) return memoryBookings;
-  if (typeof localStorage === 'undefined') return [];
-  try {
-    const raw = localStorage.getItem(BOOKINGS_STORAGE_KEY);
-    memoryBookings = raw ? JSON.parse(raw) : [];
-    return memoryBookings;
-  } catch (err) {
-    console.error('Failed to load bookings', err);
-    return [];
-  }
+  // F-20: Do not read or trust localStorage for booking authority
+  return memoryBookings;
 }
 
 function persistLocal(bookings: ServiceBooking[]) {
   memoryBookings = bookings;
-  if (typeof localStorage === 'undefined') return;
-  try {
-    localStorage.setItem(BOOKINGS_STORAGE_KEY, JSON.stringify(bookings));
-  } catch (err) {
-    console.error('Failed to save bookings', err);
+  // F-20: LocalStorage persistence removed for authoritative booking state
+}
+
+async function persistBookingMutationToFirestore(bookingId: string, payload: Record<string, any>): Promise<void> {
+  if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+    await updateDoc(doc(db, BOOKINGS_COLLECTION, bookingId), cleanForFirestore(payload));
+  } else {
+    const serverAdminModule = '../../server/firebaseAdmin';
+    const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+    const adminDb = getAdminDb();
+    if (!adminDb) {
+      throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable for booking persistence');
+    }
+    await adminDb.collection(BOOKINGS_COLLECTION).doc(bookingId).set(cleanForFirestore(payload), { merge: true });
   }
 }
 
@@ -52,11 +55,11 @@ export const bookingService = {
     try {
       let q;
       if (filter?.isAdmin) {
-        q = collection(db, BOOKINGS_COLLECTION);
+        q = query(collection(db, BOOKINGS_COLLECTION), limit(200));
       } else if (filter?.customerId) {
-        q = query(collection(db, BOOKINGS_COLLECTION), where('customerId', '==', filter.customerId));
+        q = query(collection(db, BOOKINGS_COLLECTION), where('customerId', '==', filter.customerId), limit(200));
       } else if (filter?.sellerId) {
-        q = query(collection(db, BOOKINGS_COLLECTION), where('sellerId', '==', filter.sellerId));
+        q = query(collection(db, BOOKINGS_COLLECTION), where('sellerId', '==', filter.sellerId), limit(200));
       }
 
       if (q) {
@@ -75,104 +78,150 @@ export const bookingService = {
   },
 
   async createBooking(data: Omit<ServiceBooking, 'id' | 'bookingCode' | 'createdAt' | 'status'>): Promise<ServiceBooking> {
-    if (!this.isTimeslotAvailable(data.sellerId, data.date, data.time)) {
-      throw new Error(`الموعد المطلوب (${data.date} في ${data.time}) محجوز مسبقاً لدى مقدم الخدمة. يرجى اختيار موعد آخر.`);
+    const slotLockKey = `${data.sellerId}_${data.date}_${data.time}`
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .toLowerCase();
+
+    if (activeBookingSlotLocks.has(slotLockKey)) {
+      throw new Error(`الموعد المطلوب (${data.date} في ${data.time}) قيد الحجز حالياً لدى مقدم الخدمة.`);
     }
+    activeBookingSlotLocks.add(slotLockKey);
 
-    // Production / Client: Delegate directly to trusted backend gateway (/api/bookings/create)
-    // Server enforces atomic slot reservation, active service check, and authoritative pricing
-    const currentUser = auth.currentUser;
-    if (currentUser) {
-      try {
-        const idToken = await currentUser.getIdToken();
-        const res = await fetch('/api/bookings/create', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${idToken}`,
-          },
-          body: JSON.stringify({
-            serviceId: data.serviceId,
-            sellerId: data.sellerId,
-            date: data.date,
-            time: data.time,
-            customerName: data.customerName,
-            customerPhone: data.customerPhone,
-            notes: data.notes,
-          }),
-        });
-        const resData = await res.json();
-        if (!res.ok || !resData.success) {
-          throw new Error(resData.error || 'Failed to create booking');
-        }
-        const createdBooking: ServiceBooking = resData.booking;
-        const bookings = initBookings();
-        bookings.unshift(createdBooking);
-        persistLocal(bookings);
-        return createdBooking;
-      } catch (err: any) {
-        // Re-throw server errors directly
-        throw err;
-      }
-    }
-
-    const cleanDate = (data.date || '').replace(/[^a-zA-Z0-9]/g, '-');
-    const cleanTime = (data.time || '').replace(/[^a-zA-Z0-9]/g, '-');
-    const slotId = `${data.sellerId}_${cleanDate}_${cleanTime}`;
-
-    // Authoritative Service verification in local/test environment
-    let authoritativePrice = data.price;
     try {
-      const prodDoc = await getDoc(doc(db, 'products', data.serviceId));
-      if (prodDoc.exists()) {
-        const prodData = prodDoc.data();
-        if (prodData.sellerId && prodData.sellerId !== data.sellerId) {
-          throw new Error('Service does not belong to specified provider');
-        }
-        if (prodData.isPublished === false || prodData.status === 'suspended' || prodData.status === 'rejected') {
-          throw new Error('Service is not active or available for booking');
-        }
-        if (typeof prodData.price === 'number') {
-          authoritativePrice = prodData.price;
+      if (!this.isTimeslotAvailable(data.sellerId, data.date, data.time)) {
+        throw new Error(`الموعد المطلوب (${data.date} في ${data.time}) محجوز مسبقاً لدى مقدم الخدمة. يرجى اختيار موعد آخر.`);
+      }
+
+      // Production / Client: Delegate directly to trusted backend gateway (/api/bookings/create)
+      // Server enforces atomic slot reservation, active service check, and authoritative pricing
+      const currentUser = auth.currentUser;
+      if (currentUser) {
+        try {
+          const idToken = await currentUser.getIdToken();
+          const res = await fetch('/api/bookings/create', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${idToken}`,
+            },
+            body: JSON.stringify({
+              serviceId: data.serviceId,
+              sellerId: data.sellerId,
+              date: data.date,
+              time: data.time,
+              customerName: data.customerName,
+              customerPhone: data.customerPhone,
+              notes: data.notes,
+            }),
+          });
+          const resData = await res.json();
+          if (!res.ok || !resData.success) {
+            throw new Error(resData.error || 'Failed to create booking');
+          }
+          const createdBooking: ServiceBooking = resData.booking;
+          const bookings = initBookings();
+          bookings.unshift(createdBooking);
+          persistLocal(bookings);
+          return createdBooking;
+        } catch (err: any) {
+          // Re-throw server errors directly
+          throw err;
         }
       }
-    } catch (err: any) {
-      if (err.message?.includes('does not belong') || err.message?.includes('not active')) {
-        throw err;
+
+      const cleanDate = (data.date || '').replace(/[^a-zA-Z0-9]/g, '-');
+      const cleanTime = (data.time || '').replace(/[^a-zA-Z0-9]/g, '-');
+      const slotId = `${data.sellerId}_${cleanDate}_${cleanTime}`;
+
+      // Authoritative Service verification in local/test environment
+      let authoritativePrice = data.price;
+      try {
+        const prodDoc = await getDoc(doc(db, 'products', data.serviceId));
+        if (prodDoc.exists()) {
+          const prodData = prodDoc.data();
+          if (prodData.sellerId && prodData.sellerId !== data.sellerId) {
+            throw new Error('Service does not belong to specified provider');
+          }
+          if (prodData.isPublished === false || prodData.status === 'suspended' || prodData.status === 'rejected') {
+            throw new Error('Service is not active or available for booking');
+          }
+          if (typeof prodData.price === 'number') {
+            authoritativePrice = prodData.price;
+          }
+        }
+      } catch (err: any) {
+        if (err.message?.includes('does not belong') || err.message?.includes('not active')) {
+          throw err;
+        }
       }
+
+      const newBooking: ServiceBooking = {
+        ...data,
+        price: authoritativePrice,
+        id: `book_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        bookingCode: `BK-${Math.floor(10000 + Math.random() * 90000)}`,
+        status: 'requested',
+        createdAt: new Date().toISOString(),
+      };
+
+      // Authoritative persistence to Firestore BEFORE local cache update (F-09: Fail-Closed)
+      try {
+        if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+          await setDoc(doc(db, BOOKINGS_COLLECTION, newBooking.id), cleanForFirestore(newBooking));
+        } else {
+          const serverAdminModule = '../../server/firebaseAdmin';
+          const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+          const adminDb = getAdminDb();
+          if (adminDb) {
+            await adminDb.collection('booking_slots').doc(slotId).set({
+              slotId,
+              sellerId: data.sellerId,
+              date: data.date,
+              time: data.time,
+              bookingId: newBooking.id,
+              customerId: data.customerId,
+              status: 'booked',
+              createdAt: newBooking.createdAt,
+              updatedAt: newBooking.createdAt,
+            });
+            await adminDb.collection(BOOKINGS_COLLECTION).doc(newBooking.id).set(cleanForFirestore(newBooking));
+          }
+        }
+      } catch (err: any) {
+        handleFirestoreError(err, OperationType.CREATE, `${BOOKINGS_COLLECTION}/${newBooking.id}`);
+        throw new Error(`Database write failure (Fail-Closed): Unable to persist booking to Firestore (${err?.message || err})`);
+      }
+
+      const bookings = initBookings();
+      bookings.unshift(newBooking);
+      persistLocal(bookings);
+
+      // Notify Service Provider
+      notificationService.createNotification({
+        userId: data.sellerId,
+        type: 'booking',
+        title: {
+          ar: `حجز خدمة جديد #${newBooking.bookingCode}`,
+          en: `New Service Booking #${newBooking.bookingCode}`,
+          so: `Ballan adeeg cusub #${newBooking.bookingCode}`,
+        },
+        message: {
+          ar: `طلب حجز جديد من ${data.customerName} بتاريخ ${data.date} ${data.time}`,
+          en: `New booking request from ${data.customerName} for ${data.date} ${data.time}`,
+          so: `Codsiga ballanta cusub ee ${data.customerName} taariikhda ${data.date} ${data.time}`,
+        },
+        link: `/seller/bookings`,
+      }).catch(() => {});
+
+      return newBooking;
+    } finally {
+      activeBookingSlotLocks.delete(slotLockKey);
     }
+  },
 
-    const newBooking: ServiceBooking = {
-      ...data,
-      price: authoritativePrice,
-      id: `book_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-      bookingCode: `BK-${Math.floor(10000 + Math.random() * 90000)}`,
-      status: 'requested',
-      createdAt: new Date().toISOString(),
-    };
-
+  getBookingById(bookingId: string): ServiceBooking | undefined {
     const bookings = initBookings();
-    bookings.unshift(newBooking);
-    persistLocal(bookings);
-
-    // Notify Service Provider
-    notificationService.createNotification({
-      userId: data.sellerId,
-      type: 'booking',
-      title: {
-        ar: `حجز خدمة جديد #${newBooking.bookingCode}`,
-        en: `New Service Booking #${newBooking.bookingCode}`,
-        so: `Ballan adeeg cusub #${newBooking.bookingCode}`,
-      },
-      message: {
-        ar: `طلب حجز جديد من ${data.customerName} بتاريخ ${data.date} ${data.time}`,
-        en: `New booking request from ${data.customerName} for ${data.date} ${data.time}`,
-        so: `Codsiga ballanta cusub ee ${data.customerName} taariikhda ${data.date} ${data.time}`,
-      },
-      link: `/seller/bookings`,
-    }).catch(() => {});
-
-    return newBooking;
+    return bookings.find(b => b.id === bookingId);
   },
 
   getBookingsBySellerId(sellerId: string, currentUserId?: string, userRole?: string): ServiceBooking[] {
@@ -197,12 +246,12 @@ export const bookingService = {
     return [];
   },
 
-  updateBookingStatus(
+  async updateBookingStatus(
     bookingId: string,
     status: ServiceBooking['status'],
     currentUserId: string,
     userRole: string
-  ): ServiceBooking {
+  ): Promise<ServiceBooking> {
     const bookings = initBookings();
     const index = bookings.findIndex(b => b.id === bookingId);
     if (index === -1) throw new Error('Booking not found');
@@ -219,14 +268,22 @@ export const bookingService = {
       throw new Error(`Illegal booking status transition: cannot transition from "${booking.status}" to "${status}". Allowed transitions: ${allowed.join(', ') || 'none (terminal state)'}`);
     }
 
-    const previousStatus = booking.status;
-    booking.status = status;
-    bookings[index] = booking;
-    persistLocal(bookings);
+    const updatedAt = new Date().toISOString();
 
-    updateDoc(doc(db, BOOKINGS_COLLECTION, bookingId), cleanForFirestore({ status })).catch(err => {
-      console.warn('Could not update booking status in Firestore immediately:', err);
-    });
+    // F-09: Authoritative Firestore write MUST succeed BEFORE updating local state (Fail-Closed)
+    try {
+      await persistBookingMutationToFirestore(bookingId, { status, updatedAt });
+    } catch (err: any) {
+      handleFirestoreError(err, OperationType.UPDATE, `${BOOKINGS_COLLECTION}/${bookingId}`);
+      throw new Error(`Database write failure (Fail-Closed): Unable to update booking status in Firestore (${err?.message || err})`);
+    }
+
+    const updatedBooking: ServiceBooking = {
+      ...booking,
+      status,
+    };
+    bookings[index] = updatedBooking;
+    persistLocal(bookings);
 
     // Notify Customer about status change
     notificationService.createNotification({
@@ -245,7 +302,7 @@ export const bookingService = {
       link: `/account/bookings`,
     }).catch(() => {});
 
-    return { ...booking };
+    return { ...updatedBooking };
   },
 
   isTimeslotAvailable(sellerId: string, date: string, time: string): boolean {
@@ -277,14 +334,14 @@ export const bookingService = {
   },
 
   /**
-   * Cancel booking by customer, service provider, or admin
+   * Cancel booking by customer, service provider, or admin (F-09: Firestore-first)
    */
-  cancelBooking(
+  async cancelBooking(
     bookingId: string,
     actorId: string,
     actorRole: string,
     reason?: string
-  ): ServiceBooking {
+  ): Promise<ServiceBooking> {
     const bookings = initBookings();
     const index = bookings.findIndex(b => b.id === bookingId);
     if (index === -1) throw new Error('Booking not found');
@@ -302,17 +359,47 @@ export const bookingService = {
       throw new Error(`Cannot cancel booking in terminal "${booking.status}" state`);
     }
 
-    booking.status = 'cancelled';
-    booking.notes = reason ? `${booking.notes || ''} [Cancelled: ${reason}]`.trim() : booking.notes;
-    bookings[index] = booking;
-    persistLocal(bookings);
+    if (isCustomer && !isAdmin && !isProvider && !['requested', 'accepted', 'confirmed'].includes(booking.status)) {
+      throw new Error(`Customer cannot cancel booking once it is in "${booking.status}" state`);
+    }
 
-    updateDoc(doc(db, BOOKINGS_COLLECTION, bookingId), cleanForFirestore({
+    const nextNotes = reason ? `${booking.notes || ''} [Cancelled: ${reason}]`.trim() : booking.notes;
+    const updatedAt = new Date().toISOString();
+    const cleanDate = (booking.date || '').replace(/[^a-zA-Z0-9]/g, '-');
+    const cleanTime = (booking.time || '').replace(/[^a-zA-Z0-9]/g, '-');
+    const slotKey = `${booking.sellerId}_${cleanDate}_${cleanTime}`;
+
+    // F-09: Authoritative Firestore write MUST succeed BEFORE updating local state
+    try {
+      await persistBookingMutationToFirestore(bookingId, {
+        status: 'cancelled',
+        ...(nextNotes !== undefined ? { notes: nextNotes } : {}),
+        updatedAt,
+      });
+      // Release booking_slots lock in Firestore so the slot can be booked again
+      if (typeof window === 'undefined') {
+        try {
+          const serverAdminModule = '../../server/firebaseAdmin';
+          const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+          const adminDb = getAdminDb();
+          await adminDb.collection('booking_slots').doc(slotKey).set({
+            status: 'cancelled',
+            updatedAt,
+          }, { merge: true });
+        } catch {}
+      }
+    } catch (err: any) {
+      handleFirestoreError(err, OperationType.UPDATE, `${BOOKINGS_COLLECTION}/${bookingId}`);
+      throw new Error(`Database write failure (Fail-Closed): Unable to cancel booking in Firestore (${err?.message || err})`);
+    }
+
+    const updatedBooking: ServiceBooking = {
+      ...booking,
       status: 'cancelled',
-      notes: booking.notes,
-    })).catch(err => {
-      console.warn('Could not cancel booking in Firestore immediately:', err);
-    });
+      notes: nextNotes,
+    };
+    bookings[index] = updatedBooking;
+    persistLocal(bookings);
 
     const notifyRecipient = isCustomer ? booking.sellerId : booking.customerId;
     notificationService.createNotification({
@@ -331,20 +418,20 @@ export const bookingService = {
       link: isCustomer ? `/seller/bookings` : `/account/bookings`,
     }).catch(() => {});
 
-    return booking;
+    return updatedBooking;
   },
 
   /**
-   * Reschedule booking with double-booking collision protection
+   * Reschedule booking with double-booking collision protection (F-09: Firestore-first)
    */
-  rescheduleBooking(params: {
+  async rescheduleBooking(params: {
     bookingId: string;
     newDate: string;
     newTime: string;
     actorId: string;
     actorRole: string;
     reason?: string;
-  }): ServiceBooking {
+  }): Promise<ServiceBooking> {
     const bookings = initBookings();
     const index = bookings.findIndex(b => b.id === params.bookingId);
     if (index === -1) throw new Error('Booking not found');
@@ -363,63 +450,112 @@ export const bookingService = {
     }
 
     // Double-booking collision protection
-    const conflict = bookings.some(
-      b =>
-        b.id !== params.bookingId &&
-        b.sellerId === booking.sellerId &&
-        b.date === params.newDate &&
-        b.time === params.newTime &&
-        ['requested', 'accepted', 'confirmed', 'scheduled', 'in_progress'].includes(b.status)
-    );
-    if (conflict) {
-      throw new Error(`الموعد الجديد (${params.newDate} في ${params.newTime}) غير متاح ومحجوز مسبقاً.`);
+    const cleanNewDate = (params.newDate || '').replace(/[^a-zA-Z0-9]/g, '-');
+    const cleanNewTime = (params.newTime || '').replace(/[^a-zA-Z0-9]/g, '-');
+    const newSlotKey = `${booking.sellerId}_${cleanNewDate}_${cleanNewTime}`;
+    const cleanOldDate = (booking.date || '').replace(/[^a-zA-Z0-9]/g, '-');
+    const cleanOldTime = (booking.time || '').replace(/[^a-zA-Z0-9]/g, '-');
+    const oldSlotKey = `${booking.sellerId}_${cleanOldDate}_${cleanOldTime}`;
+
+    if (activeBookingSlotLocks.has(newSlotKey)) {
+      throw new Error(`الموعد الجديد (${params.newDate} في ${params.newTime}) قيد الحجز حالياً.`);
     }
+    activeBookingSlotLocks.add(newSlotKey);
 
-    booking.date = params.newDate;
-    booking.time = params.newTime;
-    booking.status = isCustomer ? 'requested' : 'scheduled';
-    booking.notes = params.reason ? `${booking.notes || ''} [Rescheduled: ${params.reason}]`.trim() : booking.notes;
+    try {
+      const conflict = bookings.some(
+        b =>
+          b.id !== params.bookingId &&
+          b.sellerId === booking.sellerId &&
+          b.date === params.newDate &&
+          b.time === params.newTime &&
+          ['requested', 'accepted', 'confirmed', 'scheduled', 'in_progress'].includes(b.status)
+      );
+      if (conflict) {
+        throw new Error(`الموعد الجديد (${params.newDate} في ${params.newTime}) غير متاح ومحجوز مسبقاً.`);
+      }
 
-    bookings[index] = booking;
-    persistLocal(bookings);
+      const nextStatus: ServiceBooking['status'] = isCustomer ? 'requested' : 'scheduled';
+      const nextNotes = params.reason ? `${booking.notes || ''} [Rescheduled: ${params.reason}]`.trim() : booking.notes;
+      const updatedAt = new Date().toISOString();
 
-    updateDoc(doc(db, BOOKINGS_COLLECTION, params.bookingId), cleanForFirestore({
-      date: params.newDate,
-      time: params.newTime,
-      status: booking.status,
-      notes: booking.notes,
-    })).catch(err => {
-      console.warn('Could not reschedule booking in Firestore immediately:', err);
-    });
+      // F-09: Authoritative Firestore write MUST succeed BEFORE updating local state
+      try {
+        await persistBookingMutationToFirestore(params.bookingId, {
+          date: params.newDate,
+          time: params.newTime,
+          status: nextStatus,
+          ...(nextNotes !== undefined ? { notes: nextNotes } : {}),
+          updatedAt,
+        });
+        if (typeof window === 'undefined' && newSlotKey !== oldSlotKey) {
+          try {
+            const serverAdminModule = '../../server/firebaseAdmin';
+            const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+            const adminDb = getAdminDb();
+            await adminDb.collection('booking_slots').doc(oldSlotKey).set({
+              status: 'cancelled',
+              updatedAt,
+            }, { merge: true });
+            await adminDb.collection('booking_slots').doc(newSlotKey).set({
+              id: newSlotKey,
+              bookingId: booking.id,
+              sellerId: booking.sellerId,
+              customerId: booking.customerId,
+              date: params.newDate,
+              time: params.newTime,
+              status: 'booked',
+              updatedAt,
+            });
+          } catch {}
+        }
+      } catch (err: any) {
+        handleFirestoreError(err, OperationType.UPDATE, `${BOOKINGS_COLLECTION}/${params.bookingId}`);
+        throw new Error(`Database write failure (Fail-Closed): Unable to reschedule booking in Firestore (${err?.message || err})`);
+      }
 
-    const notifyRecipient = isCustomer ? booking.sellerId : booking.customerId;
-    notificationService.createNotification({
-      userId: notifyRecipient,
-      type: 'booking',
-      title: {
-        ar: `تم إعادة جدولة الحجز #${booking.bookingCode}`,
-        en: `Booking #${booking.bookingCode} Rescheduled`,
-        so: `Waqtiga ballanta #${booking.bookingCode} waa la beddelay`,
-      },
-      message: {
-        ar: `تم تحديد موعد جديد: ${params.newDate} في ${params.newTime}`,
-        en: `New timeslot: ${params.newDate} at ${params.newTime}`,
-        so: `Waqti cusub: ${params.newDate} saacadda ${params.newTime}`,
-      },
-      link: isCustomer ? `/seller/bookings` : `/account/bookings`,
-    }).catch(() => {});
+      const updatedBooking: ServiceBooking = {
+        ...booking,
+        date: params.newDate,
+        time: params.newTime,
+        status: nextStatus,
+        notes: nextNotes,
+      };
 
-    return booking;
+      bookings[index] = updatedBooking;
+      persistLocal(bookings);
+
+      const notifyRecipient = isCustomer ? booking.sellerId : booking.customerId;
+      notificationService.createNotification({
+        userId: notifyRecipient,
+        type: 'booking',
+        title: {
+          ar: `تم إعادة جدولة الحجز #${booking.bookingCode}`,
+          en: `Booking #${booking.bookingCode} Rescheduled`,
+          so: `Waqtiga ballanta #${booking.bookingCode} waa la beddelay`,
+        },
+        message: {
+          ar: `تم تحديد موعد جديد: ${params.newDate} في ${params.newTime}`,
+          en: `New timeslot: ${params.newDate} at ${params.newTime}`,
+          so: `Waqti cusub: ${params.newDate} saacadda ${params.newTime}`,
+        },
+        link: isCustomer ? `/seller/bookings` : `/account/bookings`,
+      }).catch(() => {});
+
+      return updatedBooking;
+    } finally {
+      activeBookingSlotLocks.delete(newSlotKey);
+    }
   },
 
   /**
-   * Complete booking by provider or admin
+   * Complete booking by provider or admin (F-09: Firestore-first)
    */
-  completeBooking(
+  async completeBooking(
     bookingId: string,
     actorId: string,
     actorRole: string
-  ): ServiceBooking {
-    return this.updateBookingStatus(bookingId, 'completed', actorId, actorRole);
+  ): Promise<ServiceBooking> {
+    return await this.updateBookingStatus(bookingId, 'completed', actorId, actorRole);
   },
 };

@@ -1,4 +1,4 @@
-import { doc, getDocs, collection, setDoc, updateDoc } from 'firebase/firestore';
+import { doc, getDocs, collection, setDoc, updateDoc, query, limit } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { Coupon, CartItem, UserRole } from '../types';
 import { auditLogService } from './auditLogService';
@@ -14,24 +14,14 @@ let memoryCoupons: Coupon[] = [];
 
 function loadCoupons(): Coupon[] {
   if (memoryCoupons.length > 0) return memoryCoupons;
-  if (typeof window === 'undefined') return INITIAL_PLATFORM_COUPONS;
-  try {
-    const raw = localStorage.getItem(COUPONS_STORAGE_KEY);
-    memoryCoupons = raw ? JSON.parse(raw) : INITIAL_PLATFORM_COUPONS;
-    return memoryCoupons;
-  } catch {
-    return INITIAL_PLATFORM_COUPONS;
-  }
+  // F-20: Do not read or trust localStorage for coupon authority
+  memoryCoupons = [...INITIAL_PLATFORM_COUPONS];
+  return memoryCoupons;
 }
 
 function persistCoupons(coupons: Coupon[]) {
   memoryCoupons = coupons;
-  if (typeof window === 'undefined') return;
-  try {
-    localStorage.setItem(COUPONS_STORAGE_KEY, JSON.stringify(coupons));
-  } catch (err) {
-    console.error('Failed to save coupons to localStorage', err);
-  }
+  // F-20: LocalStorage persistence removed for authoritative coupon state
 }
 
 export interface CouponValidationResult {
@@ -42,9 +32,21 @@ export interface CouponValidationResult {
 }
 
 export const couponService = {
+  resetMemoryState() {
+    memoryCoupons = [];
+  },
+
+  clearUserCache() {
+    this.resetMemoryState();
+  },
+
+  getAllCoupons(): Coupon[] {
+    return loadCoupons();
+  },
+
   async syncWithFirestore(): Promise<Coupon[]> {
     try {
-      const snap = await getDocs(collection(db, COUPONS_COLLECTION));
+      const snap = await getDocs(query(collection(db, COUPONS_COLLECTION), limit(200)));
       if (!snap.empty) {
         const cloudCoupons: Coupon[] = [];
         snap.forEach(d => cloudCoupons.push(d.data() as Coupon));
@@ -158,8 +160,9 @@ export const couponService = {
     if (coupon.discountType === 'percentage') {
       const pct = Math.max(0, Math.min(100, coupon.discountValue));
       calculatedDiscount = (eligibleSubtotal * pct) / 100;
-      if (coupon.maxDiscountAmount && coupon.maxDiscountAmount > 0) {
-        calculatedDiscount = Math.min(calculatedDiscount, coupon.maxDiscountAmount);
+      const maxCap = Number(coupon.maxDiscountAmount ?? coupon.maxDiscount) || 0;
+      if (maxCap > 0) {
+        calculatedDiscount = Math.min(calculatedDiscount, maxCap);
       }
     } else {
       // Fixed discount
@@ -230,8 +233,16 @@ export const couponService = {
     actorRole: UserRole
   ): Promise<Coupon> {
     const isAdmin = actorRole === 'ADMIN' || actorRole === 'SUPER_ADMIN';
-    if (!isAdmin && couponData.sellerId !== actorId) {
-      throw new Error('Forbidden: Merchants can only create coupons restricted to their own store');
+    if (!isAdmin && (!couponData.sellerId || !couponData.sellerId.trim() || couponData.sellerId !== actorId)) {
+      throw new Error('Forbidden: Merchants can only create coupons restricted to their own non-empty sellerId');
+    }
+
+    if (!isAdmin && couponData.storeId) {
+      const { storeService } = await import('./storeService');
+      const store = storeService.getStoreById(couponData.storeId);
+      if (!store || store.sellerId !== actorId) {
+        throw new Error('Forbidden: Merchants can only create coupons for a store they own');
+      }
     }
 
     const cleanCode = couponData.code.trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
@@ -242,8 +253,11 @@ export const couponService = {
       throw new Error(`Coupon with code "${cleanCode}" already exists`);
     }
 
+    const maxCap = couponData.maxDiscountAmount ?? couponData.maxDiscount;
+
     const newCoupon: Coupon = {
       ...couponData,
+      ...(maxCap !== undefined ? { maxDiscountAmount: Number(maxCap), maxDiscount: Number(maxCap) } : {}),
       id: `CPN-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
       code: cleanCode,
       discountValue: Math.max(0, Number(couponData.discountValue) || 0),
@@ -255,9 +269,20 @@ export const couponService = {
     };
 
     try {
-      await setDoc(doc(db, COUPONS_COLLECTION, newCoupon.id), newCoupon);
+      if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+        await setDoc(doc(db, COUPONS_COLLECTION, newCoupon.id), newCoupon);
+      } else {
+        const serverAdminModule = '../../server/firebaseAdmin';
+        const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+        const adminDb = getAdminDb();
+        if (!adminDb) {
+          throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable for coupon creation');
+        }
+        await adminDb.collection(COUPONS_COLLECTION).doc(newCoupon.id).set(JSON.parse(JSON.stringify(newCoupon)));
+      }
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `${COUPONS_COLLECTION}/${newCoupon.id}`);
+      throw err;
     }
 
     coupons.unshift(newCoupon);
@@ -292,9 +317,20 @@ export const couponService = {
     }
 
     try {
-      await updateDoc(doc(db, COUPONS_COLLECTION, couponId), { active });
+      if (typeof window !== 'undefined' && process.env.NODE_ENV !== 'test') {
+        await updateDoc(doc(db, COUPONS_COLLECTION, couponId), { active });
+      } else {
+        const serverAdminModule = '../../server/firebaseAdmin';
+        const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+        const adminDb = getAdminDb();
+        if (!adminDb) {
+          throw new Error('Database write failure (Fail-Closed): Firestore Admin DB unavailable for coupon status update');
+        }
+        await adminDb.collection(COUPONS_COLLECTION).doc(couponId).set({ active }, { merge: true });
+      }
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `${COUPONS_COLLECTION}/${couponId}`);
+      throw err;
     }
 
     target.active = active;

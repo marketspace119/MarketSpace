@@ -166,8 +166,12 @@ async function runE2EForensicInvariantSuite() {
   console.log('Testing: Stock Aggregation, Stuck Locks, Entitlements, & Concurrency');
   console.log('================================================================\n');
 
-  const mockDb = new MockMemoryFirestore();
-  setAdminDbForTesting(mockDb);
+  const useEmulator = Boolean(process.env.FIRESTORE_EMULATOR_HOST);
+  const mockDb = useEmulator ? (getAdminDb() as any) : new MockMemoryFirestore();
+  if (!useEmulator) {
+    setAdminDbForTesting(mockDb);
+  }
+  console.log(`Execution Mode: ${useEmulator ? 'EMULATOR RUNTIME (' + process.env.FIRESTORE_EMULATOR_HOST + ')' : 'IN-MEMORY MOCK'}\n`);
 
   // Setup platform defaults
   await mockDb.collection('platformSettings').doc('default').set({

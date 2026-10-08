@@ -1,4 +1,4 @@
-import { collection, doc, getDoc, getDocs, setDoc, updateDoc } from 'firebase/firestore';
+import { collection, doc, getDoc, getDocs, setDoc, updateDoc, query, limit } from 'firebase/firestore';
 import { db, auth, handleFirestoreError, OperationType } from '../lib/firebase';
 import { User, UserRole } from '../types';
 import { DEMO_ACCOUNTS } from '../context/AuthContext';
@@ -9,8 +9,15 @@ const USERS_COLLECTION = 'users';
 
 let memoryUsers: User[] = [];
 
+function isProductionEnvironment(): boolean {
+  if (typeof process !== 'undefined' && process.env?.NODE_ENV === 'production') return true;
+  if (typeof import.meta !== 'undefined' && (import.meta as any).env?.PROD) return true;
+  return false;
+}
+
 function initUsers(): User[] {
   if (memoryUsers.length > 0) return memoryUsers;
+  if (isProductionEnvironment()) return [];
   if (typeof window === 'undefined') return Object.values(DEMO_ACCOUNTS);
   try {
     const raw = localStorage.getItem(USERS_STORAGE_KEY);
@@ -46,7 +53,7 @@ export const userService = {
   async syncWithFirestore(isAdmin?: boolean, currentUserId?: string): Promise<User[]> {
     try {
       if (isAdmin) {
-        const snap = await getDocs(collection(db, USERS_COLLECTION));
+        const snap = await getDocs(query(collection(db, USERS_COLLECTION), limit(200)));
         if (!snap.empty) {
           const cloudUsers: User[] = [];
           snap.forEach(d => {
@@ -57,13 +64,15 @@ export const userService = {
             });
           });
 
-          // Merge with demo users if any missing
-          const demoList = Object.values(DEMO_ACCOUNTS);
-          demoList.forEach(demo => {
-            if (!cloudUsers.some(c => c.id === demo.id || c.email === demo.email)) {
-              cloudUsers.push({ ...demo, status: 'active' });
-            }
-          });
+          // Merge with demo users if any missing (only in non-production)
+          if (!isProductionEnvironment()) {
+            const demoList = Object.values(DEMO_ACCOUNTS);
+            demoList.forEach(demo => {
+              if (!cloudUsers.some(c => c.id === demo.id || c.email === demo.email)) {
+                cloudUsers.push({ ...demo, status: 'active' });
+              }
+            });
+          }
 
           persistLocal(cloudUsers);
           return cloudUsers;
@@ -144,7 +153,14 @@ export const userService = {
       }
     } else {
       try {
-        await updateDoc(doc(db, USERS_COLLECTION, targetUserId), { status: newStatus });
+        const serverAdminModule = '../../server/firebaseAdmin';
+        const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+        const adminDb = getAdminDb();
+        if (adminDb && typeof adminDb.collection === 'function') {
+          await adminDb.collection(USERS_COLLECTION).doc(targetUserId).set({ status: newStatus }, { merge: true });
+        } else {
+          await updateDoc(doc(db, USERS_COLLECTION, targetUserId), { status: newStatus });
+        }
       } catch (err) {
         console.warn('Could not update user status in Firestore (test/offline):', err);
       }

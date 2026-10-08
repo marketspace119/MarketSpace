@@ -14,6 +14,11 @@ import { addressService } from '../services/addressService';
 import { notificationService } from '../services/notificationService';
 import { messagingService } from '../services/messagingService';
 import { paymentService } from '../services/paymentService';
+import { bookingService } from '../services/bookingService';
+import { auditLogService } from '../services/auditLogService';
+import { disputeService } from '../services/disputeService';
+import { refundService } from '../services/refundService';
+import { payoutService } from '../services/payoutService';
 
 interface AuthContextType {
   user: User | null;
@@ -142,13 +147,31 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const adminDocRef = doc(db, 'admins', fbUser.uid);
           const adminDocSnap = await getDoc(adminDocRef);
 
+          let hasSuperAdminClaim = false;
+          try {
+            const tokenResult = await fbUser.getIdTokenResult();
+            hasSuperAdminClaim =
+              tokenResult.claims.super_admin === true ||
+              tokenResult.claims.role === 'SUPER_ADMIN' ||
+              tokenResult.claims.role === 'super_admin';
+          } catch {
+            // Ignore claim lookup error
+          }
+
           if (userDocSnap.exists()) {
             const data = userDocSnap.data() as User;
-            // Elevate if verified owner or present in admin collection (F-20: Obey documented role hierarchy)
+            // F-24: Enforce suspended/banned account revocation immediately (Fail-Closed)
+            if ((data.status as string) === 'suspended' || (data.status as string) === 'banned') {
+              await signOut(auth).catch(() => {});
+              setUser(null);
+              setToken(null);
+              localStorage.removeItem(AUTH_USER_KEY);
+              setIsLoading(false);
+              return;
+            }
+            // Elevate if verified super_admin claim or present in admin collection (F-20 & F-26: No hardcoded emails)
             let effectiveRole = data.role;
-            const isVerifiedOwner = fbUser.emailVerified === true &&
-              (fbUser.email === 'spacecompanies119@gmail.com' || fbUser.email === 'marketspace119@gmail.com');
-            if (isVerifiedOwner) {
+            if (fbUser.emailVerified === true && hasSuperAdminClaim) {
               effectiveRole = 'SUPER_ADMIN';
             } else if (adminDocSnap.exists()) {
               const adminData = adminDocSnap.data();
@@ -167,9 +190,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           } else {
             // Initial user record creation in Firestore
             let initialRole: UserRole = 'CUSTOMER';
-            const isVerifiedOwner = fbUser.emailVerified === true &&
-              (fbUser.email === 'spacecompanies119@gmail.com' || fbUser.email === 'marketspace119@gmail.com');
-            if (isVerifiedOwner) {
+            if (fbUser.emailVerified === true && hasSuperAdminClaim) {
               initialRole = 'SUPER_ADMIN';
             } else if (adminDocSnap.exists()) {
               const adminData = adminDocSnap.data();
@@ -188,7 +209,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             localStorage.setItem(AUTH_USER_KEY, JSON.stringify(newUser));
           }
         } catch (err) {
-          console.warn('Firestore user fetch failed, keeping local user state:', err);
+          // F-24: Fail-Closed when Firestore profile lookup fails.
+          // Never keep stale local user state if authoritative Firestore status verification fails.
+          console.error('[AuthContext:FailClosed] Firestore user verification failed, clearing session:', err);
+          await signOut(auth).catch(() => {});
+          setUser(null);
+          setToken(null);
+          localStorage.removeItem(AUTH_USER_KEY);
         }
       } else {
         // If not authenticated in Firebase, keep user if it was a demo switch, otherwise clear
@@ -220,10 +247,39 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       try {
         const userCredential = await signInWithEmailAndPassword(auth, email.trim(), password);
         const fbUser = userCredential.user;
+
+        // F-24: Authoritative Firestore status check on login (Fail-Closed).
+        // If Firestore read fails or user is suspended/banned, immediately sign out and reject login.
+        try {
+          const userDocSnap = await getDoc(doc(db, 'users', fbUser.uid));
+          if (userDocSnap.exists()) {
+            const profileData = userDocSnap.data() as User;
+            if ((profileData.status as string) === 'suspended' || (profileData.status as string) === 'banned') {
+              await signOut(auth).catch(() => {});
+              setUser(null);
+              setToken(null);
+              localStorage.removeItem(AUTH_USER_KEY);
+              throw new Error(`Account is ${profileData.status}. Access denied.`);
+            }
+          }
+        } catch (profileErr: any) {
+          await signOut(auth).catch(() => {});
+          setUser(null);
+          setToken(null);
+          localStorage.removeItem(AUTH_USER_KEY);
+          if (profileErr?.message?.includes('Account is ')) {
+            throw profileErr;
+          }
+          throw new Error('Service Unavailable: Unable to authoritatively verify account status (Fail-Closed).');
+        }
+
         const idToken = await fbUser.getIdToken();
         setToken(idToken);
         return true;
       } catch (err: any) {
+        if (err?.message?.includes('Account is ') || err?.message?.includes('Fail-Closed')) {
+          throw err;
+        }
         console.error('Firebase Auth sign-in error:', err.message);
         const isDemo = Object.values(DEMO_ACCOUNTS).some(d => d.email.toLowerCase() === email.trim().toLowerCase());
         if (isProd || !isDemo) {
@@ -325,6 +381,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     notificationService.clearUserCache();
     messagingService.clearUserCache();
     paymentService.clearUserCache();
+    bookingService.resetMemoryState();
+    auditLogService.clearUserCache();
+    disputeService.resetMemoryState();
+    refundService.resetMemoryState();
+    payoutService.resetMemoryState();
     if (typeof localStorage !== 'undefined') {
       localStorage.removeItem('marketspace_cart');
       localStorage.removeItem('marketspace_favorites');
@@ -363,9 +424,26 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const switchDemoRole = (role: UserRole) => {
-    // Purge previous user caches before switching identities
+    // Purge previous user caches before switching identities (F-22, F-23, OPEN-21)
     orderService.clearUserCache();
     addressService.clearUserCache();
+    notificationService.clearUserCache();
+    messagingService.clearUserCache();
+    paymentService.clearUserCache();
+    bookingService.resetMemoryState();
+    auditLogService.clearUserCache();
+    disputeService.resetMemoryState();
+    refundService.resetMemoryState();
+    payoutService.resetMemoryState();
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem('marketspace_cart');
+      localStorage.removeItem('marketspace_favorites');
+      localStorage.removeItem('marketspace_recent_searches');
+      localStorage.removeItem('marketspace_recently_viewed');
+      localStorage.removeItem('marketspace_bookings_v1');
+      localStorage.removeItem('marketspace_user_addresses');
+      localStorage.removeItem('marketspace_audit_logs_v1');
+    }
 
     const targetUser = DEMO_ACCOUNTS[role];
     setUser(targetUser);

@@ -352,15 +352,15 @@ export async function runLiveProductionValidationSuite() {
       // Customer B attempting to overwrite Customer A's avatar is blocked
       await assertFails(uploadBytes(ref(custBStorage, 'users/user_cust_a/avatar.png'), validPng, { contentType: 'image/png' }));
 
-      // Admin-mediated upload succeeds
+      // Direct Admin client SDK upload is ALSO blocked (must use /api/images/upload -> Admin SDK)
       const adminStorage = adminContext.storage();
-      await assertSucceeds(uploadBytes(ref(adminStorage, 'users/user_cust_a/avatar.png'), validPng, { contentType: 'image/png' }));
+      await assertFails(uploadBytes(ref(adminStorage, 'users/user_cust_a/avatar.png'), validPng, { contentType: 'image/png' }));
 
       // Customer B attempting to delete Customer A's avatar is blocked
       await assertFails(deleteObject(ref(custBStorage, 'users/user_cust_a/avatar.png')));
 
       pass = true;
-      errCode = 'PERMISSION_DENIED: Direct client writes blocked; cross-user deletion blocked; admin upload allowed';
+      errCode = 'PERMISSION_DENIED: All direct client writes (Customer & Admin) blocked; cross-user deletion blocked';
     } catch (e: any) {
       errCode = e.message;
     }
@@ -391,15 +391,15 @@ export async function runLiveProductionValidationSuite() {
       // Seller B attempting to write to Seller A's directory is blocked
       await assertFails(uploadBytes(ref(sellerBStorage, 'sellers/user_seller_a/products/shoe.png'), validPng, { contentType: 'image/png' }));
 
-      // Admin-mediated upload succeeds
+      // Direct Admin client SDK upload is ALSO blocked (must use /api/images/upload -> Admin SDK)
       const adminStorage = adminContext.storage();
-      await assertSucceeds(uploadBytes(ref(adminStorage, 'sellers/user_seller_a/products/shoe.png'), validPng, { contentType: 'image/png' }));
+      await assertFails(uploadBytes(ref(adminStorage, 'sellers/user_seller_a/products/shoe.png'), validPng, { contentType: 'image/png' }));
 
       // Seller B attempting to delete Seller A's asset is blocked
       await assertFails(deleteObject(ref(sellerBStorage, 'sellers/user_seller_a/products/shoe.png')));
 
       pass = true;
-      errCode = 'PERMISSION_DENIED: Direct client writes blocked; cross-seller deletion blocked; admin upload allowed';
+      errCode = 'PERMISSION_DENIED: All direct client writes (Seller & Admin) blocked; cross-seller deletion blocked';
     } catch (e: any) {
       errCode = e.message;
     }

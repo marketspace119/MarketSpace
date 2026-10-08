@@ -422,16 +422,17 @@ async function runFinalClosurePass() {
     const directRef = ref(sellerStorage, `sellers/${seller1Uid}/catalog.png`);
     await assertFails(uploadBytes(directRef, Buffer.from([0x89, 0x50, 0x4E, 0x47]), { contentType: 'image/png' }));
 
-    // Admin-mediated upload succeeds
+    // Direct Admin client SDK upload is ALSO blocked (All uploads must transit /api/images/upload -> Admin SDK)
     const superAdminContext = testEnv.authenticatedContext(superAdminUid, {
       email: 'spacecompanies119@gmail.com',
       email_verified: true,
       admin: true,
       role: 'SUPER_ADMIN',
+      status: 'active',
     });
     const adminStorage = superAdminContext.storage();
     const adminUploadRef = ref(adminStorage, `sellers/${seller1Uid}/catalog.png`);
-    await assertSucceeds(uploadBytes(adminUploadRef, Buffer.from([0x89, 0x50, 0x4E, 0x47]), { contentType: 'image/png' }));
+    await assertFails(uploadBytes(adminUploadRef, Buffer.from([0x89, 0x50, 0x4E, 0x47]), { contentType: 'image/png' }));
 
     // Cross-seller directory write fails
     const badRef = ref(sellerStorage, `sellers/${seller2Uid}/stolen.png`);

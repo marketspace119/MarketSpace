@@ -134,8 +134,7 @@ export const AdminMonetizationSection: React.FC = () => {
   };
 
   const handleRejectSubscription = async (subId: string) => {
-    const reason = window.prompt(language === 'ar' ? 'سبب الرفض:' : 'Rejection reason:');
-    if (!reason) return;
+    const reason = 'Rejected by Admin';
     try {
       await subscriptionService.rejectSubscription(
         subId,
@@ -166,8 +165,7 @@ export const AdminMonetizationSection: React.FC = () => {
   };
 
   const handleRejectPromotion = async (promoId: string) => {
-    const reason = window.prompt(language === 'ar' ? 'سبب الرفض:' : 'Rejection reason:');
-    if (!reason) return;
+    const reason = 'Rejected by Admin';
     try {
       await promotionService.rejectPromotion(
         promoId,
@@ -260,7 +258,7 @@ export const AdminMonetizationSection: React.FC = () => {
 
   // Refund Actions
   const handleApproveRefund = async (refundId: string) => {
-    const note = window.prompt(language === 'ar' ? 'ملاحظة التسوية المالية:' : 'Reconciliation note:') || 'Approved by Admin';
+    const note = 'Approved by Admin';
     try {
       await refundService.approveRefund(
         refundId,
@@ -268,16 +266,34 @@ export const AdminMonetizationSection: React.FC = () => {
         user?.role || 'ADMIN',
         note
       );
-      notify('success', language === 'ar' ? 'تمت الموافقة على الاسترجاع وتسوية الذمة المالية' : 'Refund approved and ledger reconciled');
+      notify('success', language === 'ar' ? 'تمت الموافقة على الاسترجاع وحجز الذمة المالية' : 'Refund approved');
       loadData();
     } catch (err: any) {
       notify('error', err.message || 'Failed to process refund');
     }
   };
 
+  const handleSettleRefund = async (refundId: string) => {
+    try {
+      await refundService.recordSettlement(
+        refundId,
+        {
+          settlementType: 'MANUAL_MOBILE_TRANSFER',
+          settlementReference: `SETTLE-${Date.now().toString().slice(-6)}`,
+          adminNotes: 'Settled by Admin',
+        },
+        user?.id || 'admin_01',
+        user?.role || 'ADMIN'
+      );
+      notify('success', language === 'ar' ? 'تمت تسوية الاسترجاع وتحديث دفتر الأستاذ المالي' : 'Refund settled and financial ledger reconciled');
+      loadData();
+    } catch (err: any) {
+      notify('error', err.message || 'Failed to settle refund');
+    }
+  };
+
   const handleRejectRefund = async (refundId: string) => {
-    const reason = window.prompt(language === 'ar' ? 'سبب رفض الاسترجاع:' : 'Rejection reason:');
-    if (!reason) return;
+    const reason = 'Rejected by Admin';
     try {
       await refundService.rejectRefund(
         refundId,
@@ -344,13 +360,13 @@ export const AdminMonetizationSection: React.FC = () => {
             id: 'subscriptions',
             label: language === 'ar' ? 'اشتراكات البائعين' : 'Seller Subscriptions',
             icon: Award,
-            badge: subscriptions.filter(s => s.status === 'PENDING_PAYMENT').length,
+            badge: subscriptions.filter(s => s.status === 'PENDING_PAYMENT' || s.status === 'PENDING_REVIEW').length,
           },
           {
             id: 'promotions',
             label: language === 'ar' ? 'الترويج والإعلانات' : 'Promotions & Boosts',
             icon: Sparkles,
-            badge: promotions.filter(p => p.status === 'PENDING_PAYMENT').length,
+            badge: promotions.filter(p => p.status === 'PENDING_PAYMENT' || p.status === 'PENDING_REVIEW').length,
           },
           { id: 'commissions', label: language === 'ar' ? 'سياسات العمولات' : 'Commissions Engine', icon: Percent },
           { id: 'coupons', label: language === 'ar' ? 'كوبونات الخصم' : 'Coupons & Promos', icon: Tag },
@@ -358,7 +374,7 @@ export const AdminMonetizationSection: React.FC = () => {
             id: 'refunds',
             label: language === 'ar' ? 'طلبات الاسترجاع' : 'Refunds & Ledger',
             icon: ShieldCheck,
-            badge: refunds.filter(r => r.status === 'PENDING').length,
+            badge: refunds.filter(r => r.status === 'PENDING' || r.status === 'REFUND_REQUESTED').length,
           },
         ].map((tab) => {
           const Icon = tab.icon;
@@ -489,7 +505,7 @@ export const AdminMonetizationSection: React.FC = () => {
                   <Award className="w-4 h-4 text-amber-600" />
                 </div>
                 <div className="text-2xl font-black text-amber-700 dark:text-amber-400">
-                  {subscriptions.filter(s => s.status === 'PENDING_PAYMENT').length}
+                  {subscriptions.filter(s => s.status === 'PENDING_PAYMENT' || s.status === 'PENDING_REVIEW').length}
                 </div>
                 <p className="text-[11px] text-amber-800/80 dark:text-amber-300">
                   {language === 'ar' ? 'بانتظار التحقق من إشعار التحويل' : 'Awaiting mobile transfer match'}
@@ -507,7 +523,7 @@ export const AdminMonetizationSection: React.FC = () => {
                   <Sparkles className="w-4 h-4 text-blue-600" />
                 </div>
                 <div className="text-2xl font-black text-[#0E11B7] dark:text-blue-400">
-                  {promotions.filter(p => p.status === 'PENDING_PAYMENT').length}
+                  {promotions.filter(p => p.status === 'PENDING_PAYMENT' || p.status === 'PENDING_REVIEW').length}
                 </div>
                 <p className="text-[11px] text-blue-800/80 dark:text-blue-300">
                   {language === 'ar' ? 'بانتظار الموافقة والتثبيت في الواجهة' : 'Awaiting hero / category pin'}
@@ -525,7 +541,7 @@ export const AdminMonetizationSection: React.FC = () => {
                   <ShieldCheck className="w-4 h-4 text-rose-600" />
                 </div>
                 <div className="text-2xl font-black text-rose-700 dark:text-rose-400">
-                  {refunds.filter(r => r.status === 'PENDING').length}
+                  {refunds.filter(r => r.status === 'PENDING' || r.status === 'REFUND_REQUESTED').length}
                 </div>
                 <p className="text-[11px] text-rose-800/80 dark:text-rose-300">
                   {language === 'ar' ? 'تسوية مالية لذمة البائع' : 'Reconciliation with vendor balance'}
@@ -580,7 +596,7 @@ export const AdminMonetizationSection: React.FC = () => {
                           {sub.paymentReferenceNumber || '—'}
                         </td>
                         <td className="p-4">
-                          {sub.status === 'PENDING_PAYMENT' && (
+                          {(sub.status === 'PENDING_PAYMENT' || sub.status === 'PENDING_REVIEW') && (
                             <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
                               {language === 'ar' ? 'بانتظار المراجعة' : 'Pending Verification'}
                             </span>
@@ -597,7 +613,7 @@ export const AdminMonetizationSection: React.FC = () => {
                           )}
                         </td>
                         <td className="p-4 text-end">
-                          {sub.status === 'PENDING_PAYMENT' ? (
+                          {(sub.status === 'PENDING_PAYMENT' || sub.status === 'PENDING_REVIEW') ? (
                             <div className="flex items-center justify-end gap-2">
                               <button
                                 type="button"
@@ -682,7 +698,7 @@ export const AdminMonetizationSection: React.FC = () => {
                         {promo.paymentReferenceNumber || '—'}
                       </td>
                       <td className="p-4">
-                        {promo.status === 'PENDING_PAYMENT' && (
+                        {(promo.status === 'PENDING_PAYMENT' || promo.status === 'PENDING_REVIEW') && (
                           <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
                             {language === 'ar' ? 'معلق' : 'Pending'}
                           </span>
@@ -699,7 +715,7 @@ export const AdminMonetizationSection: React.FC = () => {
                         )}
                       </td>
                       <td className="p-4 text-end">
-                        {promo.status === 'PENDING_PAYMENT' ? (
+                        {(promo.status === 'PENDING_PAYMENT' || promo.status === 'PENDING_REVIEW') ? (
                           <div className="flex items-center justify-end gap-2">
                             <button
                               type="button"
@@ -1122,24 +1138,29 @@ export const AdminMonetizationSection: React.FC = () => {
                         {r.reason}
                       </td>
                       <td className="p-4">
-                        {r.status === 'PENDING' && (
+                        {(r.status === 'PENDING' || r.status === 'REFUND_REQUESTED') && (
                           <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300">
-                            {language === 'ar' ? 'معلق' : 'Pending'}
+                            {language === 'ar' ? 'معلق' : 'Requested'}
                           </span>
                         )}
-                        {r.status === 'APPROVED' && (
+                        {(r.status === 'APPROVED' || r.status === 'REFUND_APPROVED') && (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-800 dark:bg-blue-950/60 dark:text-blue-300">
+                            {language === 'ar' ? 'معتمد (بانتظار التسوية)' : 'Approved'}
+                          </span>
+                        )}
+                        {r.status === 'REFUNDED' && (
                           <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300">
-                            {language === 'ar' ? 'تمت التسوية' : 'Reconciled'}
+                            {language === 'ar' ? 'تمت التسوية' : 'Refunded'}
                           </span>
                         )}
-                        {r.status === 'REJECTED' && (
+                        {(r.status === 'REJECTED' || r.status === 'REFUND_REJECTED') && (
                           <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-800 dark:bg-rose-950/60 dark:text-rose-300">
                             {language === 'ar' ? 'مرفوض' : 'Rejected'}
                           </span>
                         )}
                       </td>
                       <td className="p-4 text-end">
-                        {r.status === 'PENDING' ? (
+                        {(r.status === 'PENDING' || r.status === 'REFUND_REQUESTED') ? (
                           <div className="flex items-center justify-end gap-2">
                             <button
                               type="button"
@@ -1147,7 +1168,7 @@ export const AdminMonetizationSection: React.FC = () => {
                               className="h-8 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-[11px] flex items-center gap-1"
                             >
                               <Check className="w-3.5 h-3.5" />
-                              <span>{language === 'ar' ? 'اعتماد التسوية' : 'Approve'}</span>
+                              <span>{language === 'ar' ? 'اعتماد' : 'Approve'}</span>
                             </button>
                             <button
                               type="button"
@@ -1155,6 +1176,17 @@ export const AdminMonetizationSection: React.FC = () => {
                               className="h-8 px-3 rounded-lg bg-rose-50 text-rose-700 hover:bg-rose-100 dark:bg-rose-950/40 dark:text-rose-300 font-bold text-[11px]"
                             >
                               {language === 'ar' ? 'رفض' : 'Reject'}
+                            </button>
+                          </div>
+                        ) : (r.status === 'APPROVED' || r.status === 'REFUND_APPROVED') ? (
+                          <div className="flex items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() => handleSettleRefund(r.id)}
+                              className="h-8 px-3 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-[11px] flex items-center gap-1"
+                            >
+                              <Check className="w-3.5 h-3.5" />
+                              <span>{language === 'ar' ? 'تأكيد التسوية المالية' : 'Settle Refund'}</span>
                             </button>
                           </div>
                         ) : (

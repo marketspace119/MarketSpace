@@ -35,6 +35,19 @@ function persistLocal(logs: AuditLog[]) {
 }
 
 export const auditLogService = {
+  clearUserCache() {
+    memoryAuditLogs = [];
+    if (typeof localStorage !== 'undefined') {
+      try {
+        localStorage.removeItem(AUDIT_LOGS_STORAGE_KEY);
+      } catch {}
+    }
+  },
+
+  resetMemoryState() {
+    this.clearUserCache();
+  },
+
   async syncWithFirestore(): Promise<AuditLog[]> {
     try {
       const q = query(collection(db, AUDIT_LOGS_COLLECTION), orderBy('timestamp', 'desc'), limit(150));
@@ -81,8 +94,19 @@ export const auditLogService = {
     logs.unshift(newLog);
     persistLocal(logs);
 
-    // P1-AUDIT-01: Authoritative write via trusted server endpoint /api/audit/log
-    if (auth?.currentUser && (entry.actorRole === 'ADMIN' || entry.actorRole === 'SUPER_ADMIN')) {
+    // P1-AUDIT-01 & F-12: Authoritative write via Admin DB in server/test or trusted server endpoint /api/audit/log in browser
+    if (typeof window === 'undefined' || process.env.NODE_ENV === 'test') {
+      try {
+        const serverAdminModule = '../../server/firebaseAdmin';
+        const { getAdminDb } = await import(/* @vite-ignore */ serverAdminModule);
+        const adminDb = getAdminDb();
+        if (adminDb) {
+          await adminDb.collection(AUDIT_LOGS_COLLECTION).doc(id).set(JSON.parse(JSON.stringify(newLog)));
+        }
+      } catch (err) {
+        console.warn('[AuditLogService] Admin DB audit write notice:', err);
+      }
+    } else if (auth?.currentUser && (entry.actorRole === 'ADMIN' || entry.actorRole === 'SUPER_ADMIN')) {
       auth.currentUser.getIdToken().then(token => {
         const baseUrl = typeof window !== 'undefined' ? '' : (process.env.API_BASE_URL || 'http://127.0.0.1:3000');
         fetch(`${baseUrl}/api/audit/log`, {

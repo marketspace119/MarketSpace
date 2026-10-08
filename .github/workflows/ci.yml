@@ -78,5 +78,14 @@ jobs:
       - name: Run V3 Forensic Audit & Regression Suite
         run: npm run test:v3
 
+      - name: Run Final Post-Closure Remediation Suite
+        run: npm run test:remediation
+
+      - name: Run Final Independent Closure Pass (F-01 to F-20)
+        run: npx firebase emulators:exec --only firestore,storage "tsx tests/final_independent_closure_pass.ts"
+
+      - name: Run Final Completion Forensic Suite (F-01 to F-35)
+        run: npm run test:completion
+
       - name: Security Sign-Off Verification
         run: echo "CI Release Gate PASSED with 0 Critical, 0 High vulnerabilities."
